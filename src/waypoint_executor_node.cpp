@@ -123,6 +123,10 @@ private:
     // 最新 AvoidanceCmd(默认值:全不约束)
     multi_uav_strike::AvoidanceCmd latest_avoidance_;
     bool has_latest_avoidance_;
+    // 垂直避让"接管 + 锁存":一旦避让开始控制高度,就锁住已到达的高度,
+    // 直到冲突彻底解除才交还给航点。避免"被抬高 → 航点又拉回 → 再抬高"的高度震荡。
+    bool   vert_takeover_ = false;
+    double avoid_hold_z_  = 0.0;   // 锁存的目标高度(NED, down 为正)
 
 // 本机状态（NED）
     double current_ned_x_;
@@ -172,6 +176,8 @@ private:
     };
     std::vector<NeighborUav> neighbors_;
     double avoidance_safe_distance_;
+    // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
+    double reverse_speed_;
 
     // 无人机编号（用于区分颜色）
     int uav_id_;
@@ -193,7 +199,7 @@ public:
         is_executing_(false),
         is_pose_received_(false),
         uav_speed_(5.0),
-        uav_vertical_speed_(1.0),
+        uav_vertical_speed_(3.0),
         arrival_threshold_(1.0),
         executor_rate_(50.0),
         flight_mode_velocity_(0),
@@ -241,6 +247,8 @@ public:
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
         nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
+        // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
+        nh_private_.param<double>("reverse_speed", reverse_speed_, 1.0);
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
@@ -759,35 +767,62 @@ public:
     /**
      * 把 AvoidanceCmd 应用到速度指令
      * 横向严禁(lateral_blocked=true)→ 强制 vx,vy = 沿段方向分量(去掉横向偏差)
-     * vertical_bias → 加到 vz
+     * vertical_bias → 向上爬升速率(正=向上,负=向下),叠加到 vz
      * speed_scale → 乘到 vx,vy(速度调整)
-     * reverse_allowed 且仍需让 → 允许 vx,vy 反向(简化:不实现)
+     * reverse_allowed → critical 冲突时沿段方向反向后退,主动拉开水平距离
      *
      * @param seg_bearing_ned 段方位角(NED),用于横向严禁时把速度投影到段方向
      */
     void applyAvoidanceCmd(double& vx, double& vy, double& vz, double seg_bearing_ned) {
         if (!has_latest_avoidance_) return;
 
-        // 1. 高度 bias(直接加)
-        vz += static_cast<double>(latest_avoidance_.vertical_bias);
+        double vbias   = static_cast<double>(latest_avoidance_.vertical_bias);
+        double scale   = static_cast<double>(latest_avoidance_.speed_scale);
+        bool   reverse = latest_avoidance_.reverse_allowed;
 
-        // 2. 速度缩放
-        double scale = static_cast<double>(latest_avoidance_.speed_scale);
+        // 是否处于"避让中"(默认 cmd 是 lateral_blocked=true/speed=1/bias=0/no-reverse,
+        // 所以用 speed<1 || bias!=0 || reverse 判定真正在避让)
+        bool avoiding = (scale < 0.999) || (std::fabs(vbias) > 1e-3) || reverse;
+
+        // ===== 垂直:避让接管 + 高度锁存(消除高度来回跳)=====
+        // vertical_bias = "向上爬升速率"(正=上,负=下);executor 内 vz 是 NED(down 正),上=负。
+        if (std::fabs(vbias) > 1e-3) {
+            // 冲突区有垂直避让指令 → 直接接管 vz 爬升/俯冲,并持续锁存当前高度
+            vz = -vbias;
+            vert_takeover_ = true;
+            avoid_hold_z_  = current_ned_z_;
+        } else if (vert_takeover_ && avoiding) {
+            // 已完成垂直分离但冲突尚未解除 → 锁定在已爬升到的高度,
+            // 不让航点把高度拉回去(P-control 保持 avoid_hold_z_)
+            vz = hold_kp_ * (avoid_hold_z_ - current_ned_z_);
+            if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+            if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+        } else {
+            // 冲突彻底解除 → 交还垂直控制给航点(vz 用调用方算好的航点跟踪值)
+            vert_takeover_ = false;
+        }
+
+        // ===== 水平:速度缩放 =====
         vx *= scale;
         vy *= scale;
 
-        // 3. 横向严禁 — L1 压航线后 vx,vy 有切向 + 横向分量,
-        //    把速度投影到段方向上,只保留切向,清除横向偏差补偿
+        double cos_b = cos(seg_bearing_ned);
+        double sin_b = sin(seg_bearing_ned);
+
+        // 横向严禁 — 把速度投影到段方向上,只保留切向,清除横向偏差补偿
         if (latest_avoidance_.lateral_blocked) {
-            double cos_b = cos(seg_bearing_ned);
-            double sin_b = sin(seg_bearing_ned);
             double v_along = vx * cos_b + vy * sin_b;
             vx = cos_b * v_along;
             vy = sin_b * v_along;
-            ROS_DEBUG_THROTTLE(5.0, "[WaypointExecutor] lateral_blocked=true (投影到段方向,横向清零)");
+            ROS_DEBUG_THROTTLE(5.0, "[WaypointExecutor] lateral_blocked=true (proj to segment, lateral cleared)");
         }
 
-        // reverse_allowed:本批次简化不实现
+        // reverse_allowed(critical 冲突):沿段方向反向后退,主动拉开水平距离
+        if (reverse) {
+            vx += -cos_b * reverse_speed_;
+            vy += -sin_b * reverse_speed_;
+            ROS_WARN_THROTTLE(1.0, "[WaypointExecutor] reverse_allowed=true -> back along segment %.1f m/s", reverse_speed_);
+        }
     }
 
     /**

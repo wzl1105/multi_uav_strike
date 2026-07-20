@@ -141,7 +141,6 @@ enum class TakeoffState {
 // 内部任务执行阶段 (独立于 WorkMode, 由 mission_manager 自己推进)
 // WorkMode 是 GS 的意图 (SEARCH_*), MissionPhase 是实际在执行什么
 // 引入原因: 地面站把"起飞+航点"打包成一个任务, 期间 WorkMode 由 SET_WORKMODE 控制,
-// 但内部需要在 HOVERING 完成后自动推进到航点跟踪; 推进过程由 phase 表达,不污染 work_mode。
 enum class MissionPhase {
     PHASE_GROUND_IDLE,       // 在地面无任务
     PHASE_TAKING_OFF,        // 正在执行 OFFBOARD+ARM+爬升

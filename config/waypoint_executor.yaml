@@ -7,8 +7,10 @@
 executor_rate: 50.0             # 执行循环频率（Hz）
 # 航点飞行专属速度上限（节点专属，不放 common.yaml）
 uav_speed: 2.0
-uav_vertical_speed: 1.0
+uav_vertical_speed: 3.0
 arrival_threshold: 1.0          # 到达阈值（米）
 use_desired_yaw_from_wp: true
 # 最后一个航点位置保持 P-controller 增益（1m 误差 → kp m/s，调小会更稳但恢复慢）
 hold_kp: 0.8
+# 避障 reverse_allowed 生效时(critical 冲突)沿段方向后退的速度（m/s）
+reverse_speed: 1.0

@@ -29,12 +29,12 @@
 -->
 <launch>
   <!-- 命令行可覆盖: 每个 UAV 独立 flow -->
-  <!-- <arg name="uav0_flow" default="multi_uav0_search" />
+  <arg name="uav0_flow" default="multi_uav0_search" />
   <arg name="uav1_flow" default="multi_uav1_search" />
-  <arg name="uav2_flow" default="multi_uav2_search" /> -->
-  <arg name="uav0_flow" default="avoid_test_uav0" />
+  <arg name="uav2_flow" default="multi_uav2_search" />
+  <!-- <arg name="uav0_flow" default="avoid_test_uav0" />
   <arg name="uav1_flow" default="avoid_test_uav1" />
-  <arg name="uav2_flow" default="avoid_test_uav2" />
+  <arg name="uav2_flow" default="avoid_test_uav2" /> -->
 
   <!-- 共享世界参考点(应 = uav0 的 PX4_HOME GPS):多机 RViz 分离靠 static TF map-><ns>/map。 -->
   <!-- world_ref_auto=false → 各机据此共享参考点算偏移;uav0=identity 在原点。 -->
@@ -64,7 +64,7 @@
     <arg name="flow"       value="$(arg uav0_flow)" />
     <arg name="device_id"  value="0" />
     <arg name="device_sn"  value="1-1" />
-    <arg name="gather_partners" value="uav0,uav1,uav2" />
+    <arg name="gather_partners" value="1-1,1-2,1-3" />
     <arg name="world_ref_auto" value="false" />
     <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
     <arg name="world_ref_lon"  value="$(arg world_ref_lon)" />
@@ -79,7 +79,7 @@
     <arg name="flow"       value="$(arg uav1_flow)" />
     <arg name="device_id"  value="1" />
     <arg name="device_sn"  value="1-2" />
-    <arg name="gather_partners" value="uav0,uav1,uav2" />
+    <arg name="gather_partners" value="1-1,1-2,1-3" />
     <arg name="world_ref_auto" value="false" />
     <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
     <arg name="world_ref_lon"  value="$(arg world_ref_lon)" />
@@ -94,7 +94,7 @@
     <arg name="flow"       value="$(arg uav2_flow)" />
     <arg name="device_id"  value="2" />
     <arg name="device_sn"  value="1-3" />
-    <arg name="gather_partners" value="uav0,uav1,uav2" />
+    <arg name="gather_partners" value="1-1,1-2,1-3" />
     <arg name="world_ref_auto" value="false" />
     <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
     <arg name="world_ref_lon"  value="$(arg world_ref_lon)" />
