@@ -22,7 +22,7 @@
  * 订阅：
  * - /mission/waypoint_cmd           - GPS 航点命令（来自 mission_manager 或地面站）
  * - /quad/pose 或 /mavros/local_position/pose - 本机位置（NED）
- * - /inter_uav/other_uav_poses     - 邻居无人机位置
+ * - /<ns>/avoidance/cmd             - 避障指令（来自 uav_avoidance_node,带优先级+cmd类型）
  *
  * 发布：
  * - /quad/setpoint_velocity/cmd_vel_unstamped 或 /mavros/... - NED 速度指令
@@ -33,7 +33,6 @@
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
-#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PointStamped.h>
 #include <nav_msgs/Path.h>
@@ -69,7 +68,6 @@ private:
     // ============== 订阅 ==============
     ros::Subscriber waypoint_cmd_sub_;       // GPS 航点命令
     ros::Subscriber self_pose_sub_;          // 本机位置（NED）
-    ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
@@ -189,12 +187,6 @@ private:
     // 航向控制选择：true=跟踪地面站发送的航点期望航向，false=计算航点指向
     bool use_desired_yaw_from_wp_;
 
-    // 邻居无人机
-    struct NeighborUav {
-        double ned_x, ned_y, ned_z;
-    };
-    std::vector<NeighborUav> neighbors_;
-    double avoidance_safe_distance_;
     // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
     double reverse_speed_;
 
@@ -227,7 +219,6 @@ public:
         ref_lon_(0.0),
         ref_alt_(0.0),
         use_sim_(true),
-        avoidance_safe_distance_(10.0),
         last_waypoint_reached_logged_(false),
         hold_kp_(0.8),
         yaw_max_rate_(1.0),
@@ -277,7 +268,6 @@ public:
         nh_private_.param<double>("final_approach_threshold", final_approach_threshold_, 2.5);
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
-        nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
         // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
         nh_private_.param<double>("reverse_speed", reverse_speed_, 1.0);
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
@@ -347,10 +337,8 @@ public:
             pose_topic_, 10,
             &WaypointExecutor::selfPoseCallback, this);
 
-        // 邻居无人机位置
-        other_uav_poses_sub_ = nh_.subscribe(
-            "inter_uav/other_uav_poses", 10,
-            &WaypointExecutor::otherUavPosesCallback, this);
+        // 邻居无人机位置由 uav_avoidance_node 通过 /avoidance/cmd 提供(已带优先级 + cmd 类型),
+        //   本节点只消费 avoidance cmd,不再单独订阅 other_uav_poses。
 
         // 控制命令（来自 mission_manager）
         control_sub_ = nh_.subscribe(
@@ -560,18 +548,6 @@ public:
         current_yaw_ned_ = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 
         is_pose_received_ = true;
-    }
-
-    void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        neighbors_.clear();
-        for (const auto& pose : msg->poses) {
-            NeighborUav neighbor;
-            // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
-            // 转换为本地 NED
-            gpsToNed(pose.position.x, pose.position.y, pose.position.z,
-                     neighbor.ned_x, neighbor.ned_y, neighbor.ned_z);
-            neighbors_.push_back(neighbor);
-        }
     }
 
     // ============== 定时器回调 ==============

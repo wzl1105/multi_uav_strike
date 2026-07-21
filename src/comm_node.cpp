@@ -3,22 +3,24 @@
  * 通信节点：机间通信(地面站通信改由 typed TaskFlow 直达 mission_manager,不再走本节点)
  *
  * 职责：
- * - 广播本机位置给其他无人机
- * - 汇总邻居无人机位置
+ * - 广播本机位置 + 心跳给其他无人机
+ * - 缓存邻居心跳供自适应调频使用
  * - 共享目标发现信息
  *
  * 订阅：
  * - /mavros/local_position/pose    - 本机位置（来自飞控）
- * - /inter_uav/other_uav_poses     - 邻居无人机位置
  * - /inter_uav/uav_status          - 邻居 UAV 心跳(Phase 7)
  * - /detection/yolo_result         - YOLO检测结果（typed YoloDetection）
  * - /target_estimated_pose         - 目标估计位置（共享给队友）
  *
  * 发布：
  * - /inter_uav/self_pose           - 本机位置
- * - /inter_uav/other_uav_poses     - 邻居无人机位置列表
  * - /inter_uav/target_info         - 目标信息
  * - /inter_uav/uav_status          - 本机状态心跳
+ *
+ * 注:曾经还订阅其他 UAV 的 /inter_uav/self_pose 汇总成 PoseArray 发布到
+ *   /inter_uav/other_uav_poses,但全代码库已无该 topic 订阅者,已删除(2026-07-21)。
+ *   邻居感知完全依赖 /inter_uav/uav_status 心跳。
  */
 
 #include <ros/ros.h>
@@ -27,7 +29,6 @@
 #include <std_msgs/Int16.h>
 #include <std_msgs/Bool.h>
 #include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/NavSatFix.h>
@@ -62,7 +63,6 @@ private:
     ros::Subscriber self_pose_sub_;          // 本机 NED 位姿(姿态用,以及 GPS 未到时 NED→GPS 兜底投影)
     ros::Subscriber gps_global_sub_;         // 本机 EKF2 GPS(mavros/global_position/global,HOME 依赖但必发)
     ros::Subscriber gps_raw_sub_;            // 本机真实 GPS(mavros/global_position/raw,不依赖 PX4 HOME)
-    ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber yolo_result_sub_;        // YOLO检测结果(typed YoloDetection)
     ros::Subscriber target_est_pose_sub_;    // 目标估计位置
     // === Phase 7: 其他 UAV 心跳 ===
@@ -73,7 +73,6 @@ private:
 
     // ============== 发布 ==============
     ros::Publisher self_pose_pub_;           // 本机位置(发给其他无人机)
-    ros::Publisher other_uav_poses_pub_;     // 邻居无人机位置列表
     ros::Publisher target_info_pub_;         // 目标信息
     // === Phase 7: 类型化心跳 ===
     ros::Publisher inter_uav_status_pub_;
@@ -82,14 +81,8 @@ private:
     geometry_msgs::PoseStamped current_self_pose_;
     bool is_self_pose_received_ = false;
 
-    // 邻居无人机列表
-    struct NeighborUav {
-        std::string name;
-        geometry_msgs::PoseStamped pose;
-        ros::Time last_update;
-    };
-    std::vector<NeighborUav> neighbors_;
-    double neighbor_timeout_;  // 邻居超时时间（秒）
+    // 邻居超时时间(秒) — 仍用于心跳清理(见 interUavStatusTimerCallback)
+    double neighbor_timeout_;
 
     // (legacy /gs/* 状态缓冲已移除,任务入口由 typed TaskFlow 直达 mission_manager)
 
@@ -105,8 +98,6 @@ private:
     double target_share_interval_;  // 目标共享间隔（秒）
     ros::Time last_target_share_time_;
 
-    // 定时器
-    ros::Timer neighbor_check_timer_; // 邻居检查定时器
     // === Phase 7: 心跳定时器(频率自适应 1/5/20Hz)===
     ros::Timer inter_uav_status_timer_;
 
@@ -210,10 +201,8 @@ public:
                 &CommNode::selfPoseCallback, this);
         }
 
-        // 订阅所有 UAV 发布的自己的位置（全局 topic）
-        other_uav_poses_sub_ = nh_.subscribe(
-            "/inter_uav/self_pose", 10,
-            &CommNode::otherUavPosesCallback, this);
+        // 旧 otherUavPosesCallback 已删除 — 不再订阅邻居 /inter_uav/self_pose,
+        //   邻居感知完全依赖 /inter_uav/uav_status 心跳(见 interUavStatusTimerCallback)。
 
         // YOLO 检测结果（目标发现）
         yolo_result_sub_ = nh_.subscribe(
@@ -259,9 +248,8 @@ public:
         self_pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "/inter_uav/self_pose", 10);
 
-        // 邻居无人机位置列表（供 waypoint_executor 订阅）
-        other_uav_poses_pub_ = nh_.advertise<geometry_msgs::PoseArray>(
-            "inter_uav/other_uav_poses", 10);
+        // 旧 other_uav_poses_pub_ 已删除 — PoseArray 汇总无订阅者,机间避让改由 uav_avoidance_node
+        //   直接订阅心跳(见 /inter_uav/uav_status)。comm_node 不再汇总邻居位置列表。
 
         // 目标信息（共享给队友）
         target_info_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
@@ -273,11 +261,6 @@ public:
     }
 
     void initTimers() {
-        // 邻居检查定时器（1Hz）
-        neighbor_check_timer_ = nh_.createTimer(
-            ros::Duration(1.0),
-            &CommNode::neighborCheckTimerCallback, this);
-
         // === Phase 7: 心跳定时器(频率自适应)===
         inter_uav_status_timer_ = nh_.createTimer(
             ros::Duration(1.0 / current_heartbeat_rate_),
@@ -383,35 +366,8 @@ public:
         (void)lat;   (void)lon;   (void)alt;
     }
 
-    void otherUavPosesCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // 忽略自己的消息
-        if (msg->header.frame_id == uav_name_) {
-            return;
-        }
-
-        // 更新或添加邻居
-        bool found = false;
-        for (auto& neighbor : neighbors_) {
-            if (neighbor.name == msg->header.frame_id) {
-                neighbor.pose = *msg;
-                neighbor.last_update = ros::Time::now();
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            NeighborUav new_neighbor;
-            new_neighbor.name = msg->header.frame_id;
-            new_neighbor.pose = *msg;
-            new_neighbor.last_update = ros::Time::now();
-            neighbors_.push_back(new_neighbor);
-            ROS_INFO("[Comm] New neighbor discovered: %s", msg->header.frame_id.c_str());
-        }
-
-        // 发布邻居列表（汇总）
-        publishOtherUavPoses();
-    }
+    // 旧 otherUavPosesCallback / neighborCheckTimerCallback / publishOtherUavPoses 已删除 —
+    //   原 PoseArray 汇总管线无订阅者(2026-07-21),机间感知全部走 /inter_uav/uav_status 心跳。
 
     void yoloResultCallback(const multi_uav_strike::YoloDetection::ConstPtr& msg) {
         // 收到 typed YoloDetection(multi_uav_strike/YoloDetection)
@@ -443,36 +399,7 @@ public:
 
     // ============== 定时器回调 ==============
 
-    void neighborCheckTimerCallback(const ros::TimerEvent&) {
-        // 清理超时的邻居
-        ros::Time now = ros::Time::now();
-        auto it = neighbors_.begin();
-        while (it != neighbors_.end()) {
-            if ((now - it->last_update).toSec() > neighbor_timeout_) {
-                ROS_WARN("[Comm] Neighbor %s timeout, removing", it->name.c_str());
-                it = neighbors_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // 更新邻居列表发布
-        publishOtherUavPoses();
-    }
-
-    // ============== 辅助函数 ==============
-
-    void publishOtherUavPoses() {
-        geometry_msgs::PoseArray pose_array;
-        pose_array.header.stamp = ros::Time::now();
-        pose_array.header.frame_id = "map";
-
-        for (const auto& neighbor : neighbors_) {
-            pose_array.poses.push_back(neighbor.pose.pose);
-        }
-
-        other_uav_poses_pub_.publish(pose_array);
-    }
+    // 旧 neighborCheckTimerCallback / publishOtherUavPoses 已删除 — 见上方注释。
 
     // ============== Phase 7: 类型化心跳 ==============
 

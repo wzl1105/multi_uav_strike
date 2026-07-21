@@ -111,6 +111,7 @@
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/guidance_control.yaml" />
+      <param name="uav_device_sn" value="$(arg device_sn)" />
     </node>
   </group>
 

@@ -3,7 +3,6 @@
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Point.h>
-#include <geometry_msgs/PoseArray.h>
 #include <std_msgs/Int16.h>
 #include <std_msgs/Float32.h>
 #include <std_msgs/Bool.h>
@@ -18,6 +17,7 @@
 #include "multi_uav_strike/guidance_strategies.h"
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
+#include "multi_uav_strike/InterUavStatus.h"  // /inter_uav/uav_status 心跳(替代 other_uav_poses)
 
 class GuidanceControlNode {
 private:
@@ -34,7 +34,7 @@ private:
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
-    ros::Subscriber other_uav_poses_sub_;  // 邻居无人机位置
+    ros::Subscriber heartbeat_sub_;        // 邻居心跳 /inter_uav/uav_status(替代原 other_uav_poses)
     ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
 
     // Publishers
@@ -152,11 +152,11 @@ private:
     bool is_approaching_;               // 是否正在接近目标
     double prev_distance_;              // 上一时刻距离
 
-    // 机间避障相关
-    struct NeighborUav {
-        double ned_x, ned_y, ned_z;
-    };
-    std::vector<NeighborUav> neighbors_;
+    // 机间避障相关 — 邻居表用 /inter_uav/uav_status 心跳替代原 PoseArray,
+    //   sn + lat/lon/alt 自带,自环过滤后直接迭代算距离(NED 转换在 applyInterUavAvoidance 内按需进行)
+    std::string uav_device_sn_;   // 自环过滤键(launch 传入 device_sn,默认回落 uav_name)
+    std::vector<multi_uav_strike::InterUavStatus::ConstPtr> heartbeats_;
+    ros::Time last_heartbeat_purge_;
     double avoidance_safe_distance_;
 
 public:
@@ -196,6 +196,9 @@ public:
     void initParams() {
         // 仿真/真机切换
         nh_private_.param<bool>("use_sim", use_sim_, true);
+
+        // device_sn(心跳 sn)用于自环过滤 — 命名约定 "1-1" / "1-2",默认回落到 uav_name
+        nh_private_.param<std::string>("uav_device_sn", uav_device_sn_, "");
 
         // GPS 参考点不再从 yaml 硬编码,而由 homePositionCallback() 从 PX4 /mavros/home_position/home 首次锁定
         // (yaml 里仍可配 ref_lat/lon/alt 作为节点启动到 home 到达之间的临时 fallback,但实际 GPS→NED 在 ref_initialized_ 后才生效)
@@ -318,10 +321,11 @@ public:
             "guidance/guidance_speed", 10,
             &GuidanceControlNode::uavSpeedCallback, this);
 
-        // 邻居无人机位置订阅（机间避障用）
-        other_uav_poses_sub_ = nh_.subscribe(
-            "inter_uav/other_uav_poses", 10,
-            &GuidanceControlNode::otherUavPosesCallback, this);
+        // 邻居心跳 /inter_uav/uav_status — 替代原 other_uav_poses(PoseArray),
+        //   心跳自带 sn + lat/lon/alt,避免重复数据源和 lat/lon→sn 反查的 hack。
+        heartbeat_sub_ = nh_.subscribe(
+            "/inter_uav/uav_status", 50,
+            &GuidanceControlNode::heartbeatCallback, this);
 
         // PX4 home 订阅（仅用于 GPS→NED 转换的参考原点）
         home_position_sub_ = nh_.subscribe(
@@ -469,21 +473,29 @@ public:
         ROS_INFO("[Guidance] uav_speed updated to %.2f m/s", speed);
     }
 
-    // 邻居无人机位置回调（机间避障用）
-    void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        neighbors_.clear();
-        for (const auto& pose : msg->poses) {
-            NeighborUav neighbor;
-            // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
-            // 转换为本地 NED
-            double ned_x, ned_y, ned_z;
-            gpsToNed(pose.position.x, pose.position.y, pose.position.z,
-                     ned_x, ned_y, ned_z);
-            neighbor.ned_x = ned_x;
-            neighbor.ned_y = ned_y;
-            neighbor.ned_z = ned_z;
-            neighbors_.push_back(neighbor);
+    // 邻居心跳回调（机间避障用）— 替代原 otherUavPosesCallback。
+    //   心跳自带 sn + lat/lon/alt,不需要反查,直接缓存 + 自环过滤 + 过期清理。
+    //   applyInterUavAvoidance 内部按需把 lat/lon/alt 转 NED。
+    void heartbeatCallback(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
+        // 自环过滤:本机 comm_node 也会发到 /inter_uav/uav_status,不剔除会把
+        //   自己算成 0m 最近邻居,applyInterUavAvoidance 拒动。
+        if (!uav_device_sn_.empty() && msg->sn == uav_device_sn_) {
+            return;
         }
+        // 周期清理过期心跳(避免断连 UAV 残留)
+        ros::Time now = ros::Time::now();
+        if ((now - last_heartbeat_purge_).toSec() > 1.0) {
+            heartbeats_.erase(
+                std::remove_if(heartbeats_.begin(), heartbeats_.end(),
+                               [&](const multi_uav_strike::InterUavStatus::ConstPtr& h) {
+                                   double age_sec = now.toSec() -
+                                                    static_cast<double>(h->timestamp_us) * 1e-6;
+                                   return age_sec > 5.0;
+                               }),
+                heartbeats_.end());
+            last_heartbeat_purge_ = now;
+        }
+        heartbeats_.push_back(msg);
     }
 
     /**
@@ -519,9 +531,11 @@ public:
         ned_z = -(alt - ref_alt_);  // 下向
     }
 
-    // 机间避障（人工势场）
+    // 机间避障（人工势场）— 数据源:心跳 cache。
+    //   直接迭代 heartbeats_ 把每条心跳的 lat/lon/alt 转 NED 算距离。
+    //   ref_initialized_=false 时(PX4 home 未到)gpsToNed 出来的 NED 无意义,直接跳过。
     void applyInterUavAvoidance(double& vx, double& vy, double& vz) {
-        if (neighbors_.empty()) {
+        if (heartbeats_.empty() || !ref_initialized_) {
             return;
         }
 
@@ -530,10 +544,12 @@ public:
 
         double fx = 0.0, fy = 0.0, fz = 0.0;
 
-        for (const auto& neighbor : neighbors_) {
-            double dx = current_uav_pose_.pose.position.x - neighbor.ned_x;
-            double dy = current_uav_pose_.pose.position.y - neighbor.ned_y;
-            double dz = current_uav_pose_.pose.position.z - neighbor.ned_z;
+        for (const auto& h : heartbeats_) {
+            double ned_x, ned_y, ned_z;
+            gpsToNed(h->lat, h->lon, h->alt, ned_x, ned_y, ned_z);
+            double dx = current_uav_pose_.pose.position.x - ned_x;
+            double dy = current_uav_pose_.pose.position.y - ned_y;
+            double dz = current_uav_pose_.pose.position.z - ned_z;
             double dist = sqrt(dx*dx + dy*dy + dz*dz);
             if (dist < min_safe_distance) {
                 if (dist < 2)

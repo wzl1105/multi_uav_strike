@@ -4,10 +4,16 @@
  * 多机机间避障决策节点(纯 ROS 内部,不动 starling_bridge)
  *
  * 职责:
- *   - 接收邻居无人机 GPS 位姿(/<ns>/inter_uav/other_uav_poses)
+ *   - 接收邻居无人机心跳(/inter_uav/uav_status — 全局 sn + 位置 + state)
  *   - 接收自身当前航段终点(/<ns>/waypoint_executor/current_target)
  *   - 基于 task_priority + uav_id 优先级判定"谁让谁"
  *   - 发布避障指令(/<ns>/avoidance/cmd,multi_uav_strike/AvoidanceCmd)
+ *
+ * 数据源说明:
+ *   心跳 InterUavStatus 已经包含所有需要的信息(sn/lat/lon/alt/work_mode/phase),
+ *   因此不再订阅 PoseArray 之类的位置冗余源,也不需要 lat/lon → sn 反查。
+ *   心跳频率由 comm_node 按距离自适应(基础/5Hz/20Hz),1Hz 下位置 1s 旧
+ *   对 5m/s 速度误差 ≈ 5m,相对 20-40m 阈值可接受。
  *
  * 策略:
  *   - 横向(lateral)严禁越线 — 压航线核心约束
@@ -21,11 +27,6 @@
 #include <ros/console.h>
 
 #include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/PoseArray.h>
-#include <geometry_msgs/Point.h>
-#include <std_msgs/String.h>
-#include <std_msgs/Bool.h>
-#include <std_msgs/Float32.h>
 #include <sensor_msgs/NavSatFix.h>
 
 #include <cmath>
@@ -78,20 +79,14 @@ public:
         self_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10,
                                        &UavAvoidance::selfPoseCb, this);
 
-        std::string neighbors_t = "inter_uav/other_uav_poses";
-        neighbor_sub_ = nh_.subscribe(neighbors_t, 10,
-                                      &UavAvoidance::neighborCb, this);
-
         std::string current_target_t = "waypoint_executor/current_target";
         current_target_sub_ = nh_.subscribe(current_target_t, 10,
                                             &UavAvoidance::currentTargetCb, this);
 
-        std::string priority_t = "inter_uav/priority_map";
-        priority_sub_ = nh_.subscribe(priority_t, 10,
-                                      &UavAvoidance::priorityMapCb, this);
-
         // 心跳是 comm_node 在全局 topic "/inter_uav/uav_status" 上发(绝对路径),
         // 这里是相对路径会落在 /<ns>/inter_uav/uav_status 上,收不到。
+        // 心跳里包含 sn + lat/lon/alt + work_mode + phase + timestamp_us,
+        // 唯一信源 — 不再订阅 PoseArray 之类的冗余位置源。
         std::string heartbeat_t = "/inter_uav/uav_status";
         heartbeat_sub_ = nh_.subscribe(heartbeat_t, 50,
                                        &UavAvoidance::heartbeatCb, this);
@@ -133,9 +128,7 @@ private:
     ros::NodeHandle nh_, nh_private_;
 
     ros::Subscriber self_pose_sub_;
-    ros::Subscriber neighbor_sub_;
     ros::Subscriber current_target_sub_;
-    ros::Subscriber priority_sub_;
     ros::Subscriber heartbeat_sub_;
     ros::Subscriber gps_global_sub_;     // /mavros/global_position/global — EKF2 估计(必发)
     ros::Subscriber gps_raw_sub_;        // /mavros/global_position/raw    — 传感器原始(HOME 无关,可能不发)
@@ -176,14 +169,8 @@ private:
     bool have_current_target_;
     geometry_msgs::PoseStamped current_target_;
 
-    // 邻居位姿(从 PoseArray 缓存)+ 对应 device_sn(由 heartbeat cache 按 lat/lon 反查)
-    struct NeighborInfo {
-        geometry_msgs::Pose pose;  // position.{x,y,z} = {lat,lon,alt}
-        std::string sn;            // 来自 heartbeat,空 = 未匹配上(对方还没推心跳)
-    };
-    std::vector<NeighborInfo> neighbors_;
-
-    // 邻居 priority + sn 表(简化存全部,找自己需要的)
+    // 邻居表(心跳 cache,已过滤 self + 过期)— tickCb 直接迭代算距离与判定 state,
+    //   sn / lat / lon / alt / work_mode / phase / timestamp_us 全部就齐
     std::vector<multi_uav_strike::InterUavStatus::ConstPtr> heartbeats_;
     ros::Time last_heartbeat_purge_;
 
@@ -354,77 +341,14 @@ private:
         }
     }
 
-    /**
-     * 从 heartbeat cache 按 sn 查对方 (work_mode, phase)。找不到返回 false。
-     */
-    bool getNeighborStateBySn(const std::string& sn, uint8_t& work_mode, uint8_t& phase) const {
-        for (const auto& h : heartbeats_) {
-            if (h->sn == sn) {
-                work_mode = h->work_mode;
-                phase     = h->phase;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void neighborCb(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        // PoseArray: position.x=lat, .y=lon, .z=alt(同 comm_node 约定)
-        if (neighbors_.empty() && !msg->poses.empty()) {
-            ROS_WARN("[UavAvoidance] first neighbor batch: %lu poses (sample: lat=%.6f lon=%.6f alt=%.1f)",
-                     msg->poses.size(),
-                     msg->poses[0].position.x, msg->poses[0].position.y, msg->poses[0].position.z);
-        }
-        neighbors_.clear();
-        neighbors_.reserve(msg->poses.size());
-        for (const auto& p : msg->poses) {
-            NeighborInfo n;
-            n.pose = p;
-            // 用 lat/lon 反查 heartbeat cache,拿到对方 device_sn
-            // heartbeat 里 sn/lat/lon 是对方的真实标识和位置,与 PoseArray 里的 lat/lon 是同一个数
-            n.sn = lookupSnByLatLon(p.position.x, p.position.y);
-            neighbors_.push_back(n);
-        }
-    }
-
-    /**
-     * 用 lat/lon 在 heartbeat cache 里找匹配的 device_sn。
-     * 找不到返回空串(对方心跳还没到,后续 tickCb 会走"sn 缺失"分支,保守不避让)。
-     */
-    std::string lookupSnByLatLon(double lat, double lon) {
-        // 容差 5e-5 deg ≈ 5.6 m,平衡"同 UAV 心跳位置漂移"与"邻机误匹配":
-        //   - 心跳频率自适应 1/5/20Hz,1Hz 心跳 + UAV 5m/s × 1s 漂移 ≈ 5m,在容差内
-        //   - 邻机 GPS 相距 >6m 时不会误匹配
-        // 注:核心 bug 是 self 心跳在缓存里(已通过 heartbeatCb 自环过滤修掉),
-        //    容差只是兜底,不需要太松。
-        constexpr double TOL = 5e-5;
-        for (const auto& h : heartbeats_) {
-            if (std::fabs(h->lat - lat) < TOL && std::fabs(h->lon - lon) < TOL) {
-                return h->sn;
-            }
-        }
-        return "";
-    }
-
-    void priorityCb(const std_msgs::String::ConstPtr& msg) {
-        // 暂未使用(留接口,完整 priority 由 heartbeat 提供)
-    }
-
-    void priorityMapCb(const std_msgs::String::ConstPtr& msg) {
-        // 同上
-        (void)msg;
-    }
-
     void heartbeatCb(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
         // 自环过滤:心跳 topic 是全局 /inter_uav/uav_status,本机 comm_node 也会发,
-        // 这里必须先过滤 self。否则 heartbeats_ 里会含本机心跳,
-        // lookupSnByLatLon 匹配邻居位置时可能命中自己,导致 sn 错位
-        // (例如 uav0 看到 NEIGHBOR[0].sn=1-1 自己,触发 tie against self,完全没法避让)。
+        // 这里必须先过滤 self。否则 heartbeats_ 里会含本机心跳,tickCb 距离计算时
+        // 会算到 0m,把自己当成"最近邻居",触发 tie against self,完全没法避让。
         if (msg->sn == uav_device_sn_) {
             return;
         }
-        // 缓存心跳用于查询 neighbor skill priority 与 sn
-        // 清理过期
+        // 心跳是 tickCb 唯一的邻居信源,周期性清理过期(避免断连 UAV 残留)
         ros::Time now = ros::Time::now();
         if ((now - last_heartbeat_purge_).toSec() > 1.0) {
             heartbeats_.erase(
@@ -440,11 +364,6 @@ private:
         heartbeats_.push_back(msg);
     }
 
-    // 邻居 SN 解析
-    int neighborUavNumberFromSn(const std::string& sn) {
-        return extractUavNumber(sn);
-    }
-
     void tickCb(const ros::TimerEvent&) {
         multi_uav_strike::AvoidanceCmd cmd;
         cmd.lateral_blocked = true;
@@ -457,7 +376,7 @@ private:
         const std::string TAG = "[AVOID " + uav_id_ + "]";
 
         // ========== 缺前置条件 → 不避让 ==========
-        if (!have_self_gps_ || !have_self_state_ || neighbors_.empty()) {
+        if (!have_self_gps_ || !have_self_state_ || heartbeats_.empty()) {
             avoidance_pub_.publish(cmd);
             return;
         }
@@ -474,14 +393,17 @@ private:
         const uint8_t self_wm_msg = translateLocalWorkModeToMsg(self_work_mode_);
         const int self_rank = computeAvoidanceRank(self_wm_msg, self_phase_);
 
-        // ========== 列出收到的所有邻居 + 各自距离 ==========
+        // ========== 列出收到的所有心跳邻居 + 各自距离 ==========
+        // 心跳是唯一信源:sn / lat / lon / alt / work_mode / phase 全部自带,
+        // 不再需要 PoseArray + lat/lon → sn 反查这种多源拼凑结构。
         double min_dist = 1e9;
         size_t min_idx = 0;
         bool found = false;
-        for (size_t i = 0; i < neighbors_.size(); ++i) {
-            const double n_lat = neighbors_[i].pose.position.x;
-            const double n_lon = neighbors_[i].pose.position.y;
-            const double n_alt = neighbors_[i].pose.position.z;
+        for (size_t i = 0; i < heartbeats_.size(); ++i) {
+            const auto& h = heartbeats_[i];
+            const double n_lat = h->lat;
+            const double n_lon = h->lon;
+            const double n_alt = h->alt;
             const double dlat = (n_lat - self_lat);
             const double dlon = (n_lon - self_lon);
             const double dalt = (n_alt - self_alt);
@@ -501,25 +423,12 @@ private:
             return;
         }
 
-        // ========== 邻居 SN 反查 ==========
-        std::string other_sn = neighbors_[min_idx].sn;
-        if (other_sn.empty()) {
-            other_sn = lookupSnByLatLon(neighbors_[min_idx].pose.position.x,
-                                        neighbors_[min_idx].pose.position.y);
-            if (!other_sn.empty()) {
-                neighbors_[min_idx].sn = other_sn;
-            } else {
-                avoidance_pub_.publish(cmd);
-                return;
-            }
-        }
-
-        // ========== 邻居心跳查 state ==========
-        uint8_t other_work_mode = 0, other_phase = 0;
-        if (!getNeighborStateBySn(other_sn, other_work_mode, other_phase)) {
-            avoidance_pub_.publish(cmd);
-            return;
-        }
+        // ========== 直接从最近心跳取 sn / state / alt ==========
+        const auto& nearest = heartbeats_[min_idx];
+        const std::string& other_sn        = nearest->sn;
+        const uint8_t      other_work_mode = nearest->work_mode;
+        const uint8_t      other_phase     = nearest->phase;
+        const double       other_alt       = nearest->alt;
 
         // ========== 优先级判定 (work_mode + phase 联合) ==========
         const uint8_t other_wm_msg = translateLocalWorkModeToMsg(other_work_mode);
@@ -564,7 +473,7 @@ private:
         }
 
         // ========== 我需要避让 ==========
-        const double dalt_with_other = neighbors_[min_idx].pose.position.z - self_alt;
+        const double dalt_with_other = other_alt - self_alt;
 
         ROS_WARN_THROTTLE(1.0, "%s AVOIDING: reason=[%s], target=sn=%s dist=%.2fm dalt=%+.2fm (thresholds coll=%.1f prox=%.1f vert_safe=%.1f)",
                           TAG.c_str(), priority_reason.c_str(), other_sn.c_str(),
