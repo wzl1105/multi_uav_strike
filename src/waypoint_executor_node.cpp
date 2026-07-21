@@ -47,11 +47,13 @@
 #include <vector>
 #include <sstream>
 #include <algorithm>
+#include <limits>
 
 // === Phase 4: 类型化消息 ===
 #include "multi_uav_strike/Skill.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/AvoidanceCmd.h"
+#include "multi_uav_strike/LidarMeasurement.h"
 
 // 安阳基准点（用于 GPS → NED 转换）
 const double ANYANG_LAT = 36.096;      // 安阳纬度
@@ -70,6 +72,7 @@ private:
     ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
+    ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
 
     // ============== 发布 ==============
     ros::Publisher setpoint_velocity_pub_;    // NED 速度指令
@@ -127,6 +130,22 @@ private:
     // 直到冲突彻底解除才交还给航点。避免"被抬高 → 航点又拉回 → 再抬高"的高度震荡。
     bool   vert_takeover_ = false;
     double avoid_hold_z_  = 0.0;   // 锁存的目标高度(NED, down 为正)
+
+    enum class BuildingAvoidanceState { CRUISE, CLIMBING, HOLD_HIGH };
+    BuildingAvoidanceState building_avoidance_state_;
+    bool lidar_building_avoidance_enabled_;
+    double lidar_climb_rate_;
+    double lidar_clear_confirm_time_;
+    double lidar_timeout_;
+    double lidar_max_relative_altitude_;
+    double lidar_slowdown_distance_;
+    double lidar_climb_trigger_distance_;
+    double lidar_stop_distance_;
+    double lidar_altitude_offset_;
+    double latest_lidar_range_;
+    uint8_t latest_lidar_hit_type_;
+    ros::Time latest_lidar_stamp_;
+    ros::Time lidar_no_hit_since_;
 
 // 本机状态（NED）
     double current_ned_x_;
@@ -223,7 +242,19 @@ public:
         seg_start_y_(0.0),
         cruise_speed_(5.0),
         task_speed_(5.0),
-        has_latest_avoidance_(false) {
+        has_latest_avoidance_(false),
+        building_avoidance_state_(BuildingAvoidanceState::CRUISE),
+        lidar_building_avoidance_enabled_(false),
+        lidar_climb_rate_(1.0),
+        lidar_clear_confirm_time_(3.0),
+        lidar_timeout_(0.5),
+        lidar_max_relative_altitude_(500.0),
+        lidar_slowdown_distance_(300.0),
+        lidar_climb_trigger_distance_(100.0),
+        lidar_stop_distance_(20.0),
+        lidar_altitude_offset_(0.0),
+        latest_lidar_range_(std::numeric_limits<double>::infinity()),
+        latest_lidar_hit_type_(multi_uav_strike::LidarMeasurement::HIT_NONE) {
 
         initParams();
         initSubscribers();
@@ -256,6 +287,17 @@ public:
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
         nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
+        nh_private_.param<bool>("lidar_building_avoidance_enabled",
+                                lidar_building_avoidance_enabled_, false);
+        nh_private_.param<double>("lidar_climb_rate", lidar_climb_rate_, 1.0);
+        nh_private_.param<double>("lidar_clear_confirm_time", lidar_clear_confirm_time_, 3.0);
+        nh_private_.param<double>("lidar_timeout", lidar_timeout_, 0.5);
+        nh_private_.param<double>("lidar_max_relative_altitude",
+                                  lidar_max_relative_altitude_, 500.0);
+        nh_private_.param<double>("lidar_slowdown_distance", lidar_slowdown_distance_, 300.0);
+        nh_private_.param<double>("lidar_climb_trigger_distance",
+                                  lidar_climb_trigger_distance_, 100.0);
+        nh_private_.param<double>("lidar_stop_distance", lidar_stop_distance_, 20.0);
 
         // 自动从命名空间获取 uav_id（如 ns="uav0" → id=0）
         std::string ns = ros::this_node::getNamespace();
@@ -320,6 +362,11 @@ public:
         mission_mode_sub_ = nh_.subscribe(
             "mission/mode", 10,
             &WaypointExecutor::missionModeCallback, this);
+
+        if (lidar_building_avoidance_enabled_) {
+            lidar_measurement_sub_ = nh_.subscribe(
+                "lidar/measurement", 10, &WaypointExecutor::lidarMeasurementCallback, this);
+        }
 
         // === Phase 4: Skill(分段航点) — mission_manager 下发 ===
         skill_sub_ = nh_.subscribe(
@@ -617,7 +664,8 @@ public:
 
         double dx_to_target = target_wp.ned_x - current_ned_x_;
         double dy_to_target = target_wp.ned_y - current_ned_y_;
-        double dz_to_target = target_wp.ned_z - current_ned_z_;
+        const double effective_target_z = target_wp.ned_z + lidar_altitude_offset_;
+        double dz_to_target = effective_target_z - current_ned_z_;
         double dist_to_target = sqrt(dx_to_target*dx_to_target +
                                      dy_to_target*dy_to_target +
                                      dz_to_target*dz_to_target);
@@ -741,6 +789,7 @@ public:
 
         // === 应用 AvoidanceCmd(横向严禁需要段方向来分解速度,清掉横向补偿)===
         applyAvoidanceCmd(vx, vy, vz, bearing);
+        applyBuildingAvoidance(vx, vy, vz, target_wp.ned_z);
 
         // === 距离判定 ===
         if (dist_to_target < arrival_threshold_) {
@@ -1240,6 +1289,88 @@ public:
     void avoidanceCmdCallback(const multi_uav_strike::AvoidanceCmd::ConstPtr& msg) {
         latest_avoidance_ = *msg;
         has_latest_avoidance_ = true;
+    }
+
+    void lidarMeasurementCallback(const multi_uav_strike::LidarMeasurement::ConstPtr& msg) {
+        latest_lidar_stamp_ = ros::Time::now();
+        latest_lidar_range_ = msg->range;
+        latest_lidar_hit_type_ = msg->hit_type;
+        const bool building_hit =
+            msg->hit_type == multi_uav_strike::LidarMeasurement::HIT_BUILDING &&
+            std::isfinite(msg->range) &&
+            msg->range >= msg->min_range && msg->range <= msg->max_range;
+        if (building_avoidance_state_ == BuildingAvoidanceState::CRUISE && building_hit &&
+            msg->range <= lidar_climb_trigger_distance_) {
+            building_avoidance_state_ = BuildingAvoidanceState::CLIMBING;
+            lidar_no_hit_since_ = ros::Time();
+            ROS_WARN("[WaypointExecutor] Building detected at %.1fm: start forward climb",
+                     msg->range);
+        } else if (building_avoidance_state_ == BuildingAvoidanceState::CLIMBING) {
+            if (building_hit) {
+                lidar_no_hit_since_ = ros::Time();
+            } else if (lidar_no_hit_since_.isZero()) {
+                lidar_no_hit_since_ = latest_lidar_stamp_;
+            }
+        }
+    }
+
+    void latchHighAltitude(double nominal_target_z, const char* reason) {
+        lidar_altitude_offset_ = current_ned_z_ - nominal_target_z;
+        building_avoidance_state_ = BuildingAvoidanceState::HOLD_HIGH;
+        ROS_WARN("[WaypointExecutor] Building cleared (%s): hold relative altitude %.1fm, offset %.1fm",
+                 reason, -current_ned_z_, lidar_altitude_offset_);
+    }
+
+    void applyBuildingAvoidance(double& vx, double& vy, double& vz,
+                                double nominal_target_z) {
+        if (!lidar_building_avoidance_enabled_) return;
+
+        const ros::Time now = ros::Time::now();
+        const bool lidar_fresh = !latest_lidar_stamp_.isZero() &&
+                                 (now - latest_lidar_stamp_).toSec() <= lidar_timeout_;
+        if (lidar_fresh &&
+            latest_lidar_hit_type_ == multi_uav_strike::LidarMeasurement::HIT_BUILDING &&
+            std::isfinite(latest_lidar_range_) &&
+            latest_lidar_range_ < lidar_slowdown_distance_) {
+            // 300m 外保持全速；300m→20m 之间线性减速；20m 内停止水平前进。
+            const double denom = std::max(1.0, lidar_slowdown_distance_ - lidar_stop_distance_);
+            const double scale = std::max(0.0, std::min(1.0,
+                (latest_lidar_range_ - lidar_stop_distance_) / denom));
+            vx *= scale;
+            vy *= scale;
+            ROS_WARN_THROTTLE(1.0,
+                "[WaypointExecutor] BUILDING SLOWDOWN: range=%.1fm horizontal_scale=%.2f",
+                latest_lidar_range_, scale);
+        }
+
+        if (building_avoidance_state_ == BuildingAvoidanceState::CRUISE) return;
+
+        if (building_avoidance_state_ == BuildingAvoidanceState::CLIMBING) {
+            if (!lidar_fresh) {
+                latchHighAltitude(nominal_target_z, "lidar timeout");
+            } else if (-current_ned_z_ >= lidar_max_relative_altitude_) {
+                latchHighAltitude(nominal_target_z, "altitude limit");
+                ROS_ERROR_THROTTLE(2.0,
+                    "[WaypointExecutor] Lidar climb stopped at %.0fm relative limit",
+                    lidar_max_relative_altitude_);
+            } else if (!lidar_no_hit_since_.isZero() &&
+                       (now - lidar_no_hit_since_).toSec() >= lidar_clear_confirm_time_) {
+                latchHighAltitude(nominal_target_z, "no return after roof");
+            } else {
+                // NED z/velocity 向下为正，因此持续爬升使用负速度。
+                vz = -std::fabs(lidar_climb_rate_);
+                ROS_WARN_THROTTLE(1.0,
+                    "[WaypointExecutor] BUILDING CLIMB: range=%.1fm alt=%.1fm vz=%.1fm/s",
+                    latest_lidar_range_, -current_ned_z_, vz);
+                return;
+            }
+        }
+
+        if (building_avoidance_state_ == BuildingAvoidanceState::HOLD_HIGH) {
+            const double hold_target_z = nominal_target_z + lidar_altitude_offset_;
+            vz = hold_kp_ * (hold_target_z - current_ned_z_);
+            vz = std::max(-uav_vertical_speed_, std::min(uav_vertical_speed_, vz));
+        }
     }
 
     /**

@@ -611,6 +611,34 @@ DEMO_FLOWS = {
     # 设计: 全部 8m × 8m 小方块,共享中心 = uav0_home,三机速度一致 → 同时刻在 12m 内
     # ============================================================================
 
+    # ---------- UAV0 前向激光雷达楼体越障演示 ----------
+    "lidar_building_uav0": {
+        "flow_id": "lidar_building_uav0_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "lidar_demo_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "lidar_demo_forward_flight",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 20.0,
+                "task_speed": 20.0,
+                "arrive_path": [],
+                "skill_area_path": [(650.0, 0.0, 30.0)],
+            },
+        ],
+    },
+
     # ---------- 避障压测 uav0:uav0_home 本机 NED 即共享坐标 ----------
     # 本机 NED(x,y) = 共享 (x, y) — uav0_home 在共享原点
     "avoid_test_uav0": {

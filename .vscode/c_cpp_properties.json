@@ -1,0 +1,26 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/c/catkin_ws/devel/include/**",
+        "/opt/ros/noetic/include/**",
+        "/home/c/catkin_ws/src/msp_ros/include/**",
+        "/home/c/catkin_ws/src/multi_uav_strike/include/**",
+        "/home/c/catkin_ws/src/multiModeQuad_ROS/include/**",
+        "/home/c/catkin_ws/src/spd1200n2_driver/include/**",
+        "/home/c/catkin_ws/src/starling_bridge/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

@@ -43,8 +43,8 @@
   <arg name="world_ref_lat" default="36.05801135" />
   <arg name="world_ref_lon" default="114.5491114" />
   <arg name="world_ref_alt" default="0.0" />
-
-  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+  <!--根据实际系统路径修改 -->
+  <env name="GEOGRAPHICLIB_DATA" value="/usr/share/GeographicLib" />
 
   <!-- 共享节点:目标运动模拟 -->
   <node name="target_motion_simulator_node"

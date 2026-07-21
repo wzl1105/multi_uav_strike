@@ -64,6 +64,22 @@ Visualization Manager:
         target_marker: true
       Queue Size: 100
       Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /sim_building_marker
+      Name: Sim Building
+      Namespaces:
+        sim_building: true
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav0/lidar/beam_marker
+      Name: UAV0 Forward Lidar
+      Namespaces:
+        forward_lidar: true
+      Queue Size: 10
+      Value: true
     - Alpha: 1
       Axes Length: 1
       Axes Radius: 0.10000000149011612

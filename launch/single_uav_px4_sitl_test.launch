@@ -39,7 +39,7 @@
   <arg name="flow" default="ground_search_track" />
 
   <!-- Set GeographicLib data path -->
-  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+  <env name="GEOGRAPHICLIB_DATA" value="/usr/share/GeographicLib" />
 
   <!-- ====================================================================== -->
   <!-- 1. MAVROS + PX4 SITL                                                  -->

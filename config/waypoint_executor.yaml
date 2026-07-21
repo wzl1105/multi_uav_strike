@@ -14,3 +14,13 @@ use_desired_yaw_from_wp: true
 hold_kp: 0.8
 # 避障 reverse_allowed 生效时(critical 冲突)沿段方向后退的速度（m/s）
 reverse_speed: 1.0
+
+# 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
+lidar_building_avoidance_enabled: false
+lidar_climb_rate: 1.0
+lidar_clear_confirm_time: 3.0
+lidar_timeout: 0.5
+lidar_max_relative_altitude: 500.0
+lidar_slowdown_distance: 300.0
+lidar_climb_trigger_distance: 100.0
+lidar_stop_distance: 20.0

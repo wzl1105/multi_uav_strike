@@ -4,6 +4,8 @@
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Bool.h>
+#include <sensor_msgs/Range.h>
+#include <visualization_msgs/Marker.h>
 #include <tf/transform_datatypes.h>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -15,11 +17,13 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <limits>
 
 #include "multi_uav_strike/YoloDetection.h"
 #include "multi_uav_strike/YoloDetections.h"
 #include "multi_uav_strike/SimTarget.h"
 #include "multi_uav_strike/SimTargets.h"
+#include "multi_uav_strike/LidarMeasurement.h"
 
 using namespace std;
 
@@ -63,8 +67,13 @@ private:
     ros::Publisher yolo_pub_;          // typed YoloDetection (单条,主目标,兼容 comm_node)
     ros::Publisher yolo_results_pub_;  // typed YoloDetections (多目标,供 target_estimator)
     ros::Publisher in_fov_pub_;        // Bool (合并自 detection_simulator)
+    ros::Publisher lidar_range_pub_;
+    ros::Publisher lidar_measurement_pub_;
+    ros::Publisher lidar_beam_pub_;
+    ros::Publisher building_marker_pub_;
 
     ros::Timer control_timer_;
+    ros::Timer lidar_timer_;
     uint32_t frame_seq_ = 0;
 
     // === FOV / 图像参数 ===
@@ -86,6 +95,14 @@ private:
     double image_noise_std_dev_;
     std::string uav_pose_topic_;
     double desired_pitch, desired_yaw;
+
+    bool lidar_enabled_;
+    double lidar_min_range_, lidar_max_range_, lidar_frequency_;
+    double building_x_, building_y_, building_z_;
+    double building_size_x_, building_size_y_, building_size_z_;
+    double ground_z_;
+    double ground_range_abs_tolerance_;
+    double ground_range_rel_tolerance_;
 
     // 固定模拟 JPEG(测试用,真实 gimbal 接入后由相机抓拍帧替换)
     std::vector<uint8_t> fake_jpeg_;
@@ -155,6 +172,21 @@ public:
         }
         nh_private_.param<bool>("use_sim", use_sim_, true);
         nh_private_.param<double>("image_noise_std_dev", image_noise_std_dev_, 0.0);
+        nh_private_.param<bool>("lidar_enabled", lidar_enabled_, false);
+        nh_private_.param<double>("lidar_min_range", lidar_min_range_, 0.2);
+        nh_private_.param<double>("lidar_max_range", lidar_max_range_, 300.0);
+        nh_private_.param<double>("lidar_frequency", lidar_frequency_, 9.0);
+        nh_private_.param<double>("building_x", building_x_, 320.0);
+        nh_private_.param<double>("building_y", building_y_, 0.0);
+        nh_private_.param<double>("building_z", building_z_, 150.0);
+        nh_private_.param<double>("building_size_x", building_size_x_, 10.0);
+        nh_private_.param<double>("building_size_y", building_size_y_, 20.0);
+        nh_private_.param<double>("building_size_z", building_size_z_, 300.0);
+        nh_private_.param<double>("ground_z", ground_z_, 0.0);
+        nh_private_.param<double>("ground_range_abs_tolerance",
+                                  ground_range_abs_tolerance_, 10);
+        nh_private_.param<double>("ground_range_rel_tolerance",
+                                  ground_range_rel_tolerance_, 0.2);
 
         // 加载固定模拟 JPEG:放到 YoloDetection.img_data 给下游(mission_manager →
         // starling_bridge → DEVICE_TARGETS 0x2001)组装上行报文;真实 gimbal 接入后
@@ -229,10 +261,21 @@ public:
         if (!ns.empty() && ns != "/") fov_t = ns + "/" + fov_t;
         if (fov_t.find("//") == 0) fov_t = fov_t.substr(1);
         in_fov_pub_ = nh_.advertise<std_msgs::Bool>(fov_t, 10);
+        if (lidar_enabled_) {
+            lidar_range_pub_ = nh_.advertise<sensor_msgs::Range>("lidar/range", 10);
+            lidar_measurement_pub_ = nh_.advertise<multi_uav_strike::LidarMeasurement>(
+                "lidar/measurement", 10);
+            lidar_beam_pub_ = nh_.advertise<visualization_msgs::Marker>("lidar/beam_marker", 1, true);
+            building_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("/sim_building_marker", 1, true);
+        }
 
         // 100Hz 主循环
         control_timer_ = nh_.createTimer(ros::Duration(1.0 / loop_freq_),
                                          &GimbalSimulator::controlLoopCallback, this);
+        if (lidar_enabled_ && lidar_frequency_ > 0.0) {
+            lidar_timer_ = nh_.createTimer(ros::Duration(1.0 / lidar_frequency_),
+                                           &GimbalSimulator::lidarTimerCallback, this);
+        }
 
         ROS_INFO("[GimbalSim] image=%dx%d fov=(%.1fh x %.1fv deg) focal=(%.1f, %.1f)",
                  image_width_, image_height_, fov_h_deg_,
@@ -331,6 +374,156 @@ public:
         publishGimbalPose();                  // gimbal_pose (RViz)
         publishCameraPose();                  // camera/pose (用缓存的 q_cam_world_)
         publishYoloDetections();              // YoloDetections(全部可见目标) + 单条 YoloDetection(主目标)
+    }
+
+    double rayBuildingDistance(double ox, double oy, double oz,
+                               double dx, double dy, double dz) const {
+        const double mins[3] = {
+            building_x_ - building_size_x_ * 0.5,
+            building_y_ - building_size_y_ * 0.5,
+            building_z_ - building_size_z_ * 0.5};
+        const double maxs[3] = {
+            building_x_ + building_size_x_ * 0.5,
+            building_y_ + building_size_y_ * 0.5,
+            building_z_ + building_size_z_ * 0.5};
+        const double origin[3] = {ox, oy, oz};
+        const double dir[3] = {dx, dy, dz};
+        double t_min = 0.0;
+        double t_max = lidar_max_range_;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (std::fabs(dir[axis]) < 1e-9) {
+                if (origin[axis] < mins[axis] || origin[axis] > maxs[axis]) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                continue;
+            }
+            double t1 = (mins[axis] - origin[axis]) / dir[axis];
+            double t2 = (maxs[axis] - origin[axis]) / dir[axis];
+            if (t1 > t2) std::swap(t1, t2);
+            t_min = std::max(t_min, t1);
+            t_max = std::min(t_max, t2);
+            if (t_min > t_max) return std::numeric_limits<double>::infinity();
+        }
+        if (t_min < lidar_min_range_ || t_min > lidar_max_range_) {
+            return std::numeric_limits<double>::infinity();
+        }
+        return t_min;
+    }
+
+    double rayGroundDistance(double oz, double dz) const {
+        if (dz >= -1e-9 || oz <= ground_z_) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const double t = (ground_z_ - oz) / dz;
+        if (t < lidar_min_range_ || t > lidar_max_range_) {
+            return std::numeric_limits<double>::infinity();
+        }
+        return t;
+    }
+
+    void publishBuildingMarker() {
+        visualization_msgs::Marker marker;
+        marker.header.frame_id = viz_frame_;
+        marker.header.stamp = ros::Time::now();
+        marker.ns = "sim_building";
+        marker.id = 0;
+        marker.type = visualization_msgs::Marker::CUBE;
+        marker.action = visualization_msgs::Marker::ADD;
+        marker.pose.position.x = building_x_;
+        marker.pose.position.y = building_y_;
+        marker.pose.position.z = building_z_;
+        marker.pose.orientation.w = 1.0;
+        marker.scale.x = building_size_x_;
+        marker.scale.y = building_size_y_;
+        marker.scale.z = building_size_z_;
+        marker.color.r = 0.45f;
+        marker.color.g = 0.48f;
+        marker.color.b = 0.52f;
+        marker.color.a = 0.9f;
+        marker.lifetime = ros::Duration(0.0);
+        building_marker_pub_.publish(marker);
+    }
+
+    void lidarTimerCallback(const ros::TimerEvent&) {
+        if (!lidar_enabled_ || !is_uav_pose_received_) return;
+        const ros::Time now = ros::Time::now();
+
+        const geometry_msgs::Point& p = current_uav_pose_.pose.position;
+        const auto& oq = current_uav_pose_.pose.orientation;
+        Eigen::Quaterniond q_body_world(oq.w, oq.x, oq.y, oq.z);
+        if (q_body_world.norm() < 1e-9) q_body_world = Eigen::Quaterniond::Identity();
+        q_body_world.normalize();
+        const Eigen::Vector3d ray_dir = q_body_world * Eigen::Vector3d::UnitX();
+        // 阶段1：场景只生成一个原始距离，不把命中的物体类型传给分类器。
+        const double building_range = rayBuildingDistance(
+            p.x, p.y, p.z, ray_dir.x(), ray_dir.y(), ray_dir.z());
+        const double ground_range = rayGroundDistance(p.z, ray_dir.z());
+        const double range = std::min(building_range, ground_range);
+
+        // 阶段2：只根据高度、射线方向和原始距离反算是否为地面回波。
+        // HIT_BUILDING 在此表示“有限的非地面障碍回波”，不使用楼体真值分类。
+        uint8_t hit_type = multi_uav_strike::LidarMeasurement::HIT_NONE;
+        if (std::isfinite(range)) {
+            const double tolerance = std::max(
+                ground_range_abs_tolerance_,
+                ground_range_rel_tolerance_ * ground_range);
+            if (std::isfinite(ground_range) &&
+                std::fabs(range - ground_range) <= tolerance) {
+                hit_type = multi_uav_strike::LidarMeasurement::HIT_GROUND;
+            } else {
+                hit_type = multi_uav_strike::LidarMeasurement::HIT_BUILDING;
+            }
+        }
+
+        sensor_msgs::Range msg;
+        msg.header.stamp = now;
+        msg.header.frame_id = viz_frame_;
+        msg.radiation_type = sensor_msgs::Range::INFRARED;
+        msg.field_of_view = 0.01;
+        msg.min_range = lidar_min_range_;
+        msg.max_range = lidar_max_range_;
+        msg.range = range;
+        lidar_range_pub_.publish(msg);
+
+        multi_uav_strike::LidarMeasurement detailed;
+        detailed.header = msg.header;
+        detailed.range = range;
+        detailed.min_range = lidar_min_range_;
+        detailed.max_range = lidar_max_range_;
+        detailed.hit_type = hit_type;
+        if (std::isfinite(range)) {
+            detailed.hit_point.x = p.x + ray_dir.x() * range;
+            detailed.hit_point.y = p.y + ray_dir.y() * range;
+            detailed.hit_point.z = p.z + ray_dir.z() * range;
+        } else {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            detailed.hit_point.x = nan;
+            detailed.hit_point.y = nan;
+            detailed.hit_point.z = nan;
+        }
+        lidar_measurement_pub_.publish(detailed);
+
+        const double draw_range = std::isfinite(range) ? range : lidar_max_range_;
+        visualization_msgs::Marker beam;
+        beam.header = msg.header;
+        beam.ns = "forward_lidar";
+        beam.id = 0;
+        beam.type = visualization_msgs::Marker::LINE_LIST;
+        beam.action = visualization_msgs::Marker::ADD;
+        beam.scale.x = 0.25;
+        beam.color.r = hit_type == multi_uav_strike::LidarMeasurement::HIT_BUILDING ? 1.0f : 0.1f;
+        beam.color.g = hit_type == multi_uav_strike::LidarMeasurement::HIT_NONE ? 0.8f : 0.1f;
+        beam.color.b = hit_type == multi_uav_strike::LidarMeasurement::HIT_GROUND ? 1.0f : 0.1f;
+        beam.color.a = 0.9f;
+        geometry_msgs::Point end;
+        end.x = p.x + ray_dir.x() * draw_range;
+        end.y = p.y + ray_dir.y() * draw_range;
+        end.z = p.z + ray_dir.z() * draw_range;
+        beam.points.push_back(p);
+        beam.points.push_back(end);
+        beam.lifetime = ros::Duration(2.0 / lidar_frequency_);
+        lidar_beam_pub_.publish(beam);
+        publishBuildingMarker();
     }
 
     size_t countVisible() const {

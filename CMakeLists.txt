@@ -41,6 +41,7 @@ add_message_files(
   WaypointStatus.msg
   InterUavStatus.msg
   AvoidanceCmd.msg
+  LidarMeasurement.msg
   UavGatherStatus.msg
   ClusterEvent.msg
   ClusterTarget.msg
@@ -53,6 +54,7 @@ generate_messages(
   DEPENDENCIES
   std_msgs
   geometry_msgs
+  sensor_msgs
   nav_msgs
 )
 

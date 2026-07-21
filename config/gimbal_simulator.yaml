@@ -34,3 +34,18 @@ image_noise_std_dev: 0.0   # 图像噪声标准差
 #   45  = 45° 俯角 (目标丢失默认)
 #   90  = 垂直下视
 default_pitch_deg: 45.0  # 目标从 FOV 中丢失时,云台回退到此角度
+
+# 前向单束激光雷达/楼体默认关闭，由专用演示 launch 显式开启。
+lidar_enabled: false
+lidar_min_range: 0.2
+lidar_max_range: 300.0
+lidar_frequency: 9.0
+building_x: 320.0
+building_y: 0.0
+building_z: 150.0
+building_size_x: 10.0
+building_size_y: 20.0
+building_size_z: 300.0
+ground_z: 0.0
+ground_range_abs_tolerance: 1.0
+ground_range_rel_tolerance: 0.02

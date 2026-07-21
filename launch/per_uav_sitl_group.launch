@@ -50,9 +50,10 @@
   <arg name="world_ref_lat"  default="36.058" />
   <arg name="world_ref_lon"  default="114.549" />
   <arg name="world_ref_alt"  default="75.0" />
+  <arg name="lidar_building_demo" default="false" />
 
   <!-- Set GeographicLib data path (PX4 GPS 转换需要) -->
-  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+  <env name="GEOGRAPHICLIB_DATA" value="/usr/share/GeographicLib" />
 
   <!-- ====================================================================== -->
   <!-- 1. MAVROS + PX4 SITL                                                   -->
@@ -77,6 +78,7 @@
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/gimbal_simulator.yaml" />
+      <param name="lidar_enabled" value="$(arg lidar_building_demo)" />
     </node>
   </group>
 
@@ -125,6 +127,7 @@
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/waypoint_executor.yaml" />
+      <param name="lidar_building_avoidance_enabled" value="$(arg lidar_building_demo)" />
     </node>
   </group>
 
