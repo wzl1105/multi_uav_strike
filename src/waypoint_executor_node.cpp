@@ -161,6 +161,8 @@ private:
 
     // 航向控制(P-controller 输出角速度用)
     double yaw_max_rate_;       // 最大角速度 rad/s(由 ~yaw_max_rate 配置)
+    double yaw_speed_gate_;     // 水平速度门控:m/s,低于此值时冻结 yaw 角速度输出
+                                // (避免 CRITICAL stop+reverse 时 UAV 几乎不动但 yaw 仍追 bearing → 原地打转)
 
     // ============== 参数 ==============
     double executor_rate_;
@@ -274,6 +276,13 @@ public:
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
+        // 水平速度门控(m/s):低于此值冻结 yaw 角速度输出,避免 CRITICAL 避让
+        //   时身体几乎不动但 yaw 仍死追 bearing → 原地打转。默认 0.5 m/s,
+        //   - PROXIMITY 边界(40m): scale=1.0 → v≈5 m/s > 0.5 → 正常跟踪
+        //   - PROXIMITY→COLLISION 边界(20m): scale=0.3 → v≈1.5 m/s > 0.5 → 仍跟踪
+        //   - COLLISION: scale=0.2 → v≈1 m/s > 0.5 → 仍跟踪
+        //   - CRITICAL: scale=0.0 → v≈0 < 0.5 → **冻结 yaw**
+        nh_private_.param<double>("yaw_speed_gate", yaw_speed_gate_, 0.5);
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
         nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
@@ -941,11 +950,14 @@ public:
         // 角度环绕到 [-π, π](避免 ±180° 边界时选错方向)
         while (yaw_error_ned >  M_PI) yaw_error_ned -= 2.0 * M_PI;
         while (yaw_error_ned < -M_PI) yaw_error_ned += 2.0 * M_PI;
-        // P 控制 + 死区 + 限幅
+        // P 控制 + 死区 + 速度门控 + 限幅
         const double yaw_kp       = 2.0;   // 比例增益(典型 1.0~3.0)
         const double yaw_deadband = 0.05;  // ~3° 死区,避免小幅抖动
         double yaw_rate_ned = 0.0;
-        if (fabs(yaw_error_ned) > yaw_deadband) {
+        // 水平速度门控:水平速度过低(典型场景:CRITICAL 避让中 vx≈vy≈0)时冻结 yaw,
+        //   否则身体几乎不动但 yaw 仍死追 L1 bearing → 看起来"原地自由旋转"。
+        const double v_horiz = sqrt(vx*vx + vy*vy);
+        if (v_horiz > yaw_speed_gate_ && fabs(yaw_error_ned) > yaw_deadband) {
             yaw_rate_ned = yaw_kp * yaw_error_ned;
             if (yaw_rate_ned >  yaw_max_rate_) yaw_rate_ned =  yaw_max_rate_;
             if (yaw_rate_ned < -yaw_max_rate_) yaw_rate_ned = -yaw_max_rate_;
