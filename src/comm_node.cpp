@@ -3,22 +3,24 @@
  * 通信节点：机间通信(地面站通信改由 typed TaskFlow 直达 mission_manager,不再走本节点)
  *
  * 职责：
- * - 广播本机位置给其他无人机
- * - 汇总邻居无人机位置
+ * - 广播本机位置 + 心跳给其他无人机
+ * - 缓存邻居心跳供自适应调频使用
  * - 共享目标发现信息
  *
  * 订阅：
  * - /mavros/local_position/pose    - 本机位置（来自飞控）
- * - /inter_uav/other_uav_poses     - 邻居无人机位置
  * - /inter_uav/uav_status          - 邻居 UAV 心跳(Phase 7)
  * - /detection/yolo_result         - YOLO检测结果（typed YoloDetection）
  * - /target_estimated_pose         - 目标估计位置（共享给队友）
  *
  * 发布：
  * - /inter_uav/self_pose           - 本机位置
- * - /inter_uav/other_uav_poses     - 邻居无人机位置列表
  * - /inter_uav/target_info         - 目标信息
  * - /inter_uav/uav_status          - 本机状态心跳
+ *
+ * 注:曾经还订阅其他 UAV 的 /inter_uav/self_pose 汇总成 PoseArray 发布到
+ *   /inter_uav/other_uav_poses,但全代码库已无该 topic 订阅者,已删除(2026-07-21)。
+ *   邻居感知完全依赖 /inter_uav/uav_status 心跳。
  */
 
 #include <ros/ros.h>
@@ -27,11 +29,9 @@
 #include <std_msgs/Int16.h>
 #include <std_msgs/Bool.h>
 #include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/NavSatFix.h>
-#include <mavros_msgs/HomePosition.h>
 
 // 自定义消息：目标信息
 // 后续可扩展为 custom_msgs/TargetInfo
@@ -47,6 +47,12 @@
 #include "multi_uav_strike/MissionState.h"   // 用于把当前 skill_type/skill_id 灌进 InterUavStatus
 #include "multi_uav_strike/WorkMode.h"       // 用于把当前 work_mode 灌进 InterUavStatus
 
+// 注:本节点原本用 NED + 每机 mavros/home_position/home 投影 GPS。
+// 多机 SITL 时 PX4 各自的 HOME 可能不同(取决于 PX4 启动参数),会导致
+// 算出的 GPS 各自偏移,机间心跳拿到的位置不在同一坐标系,距离算错。
+// 现改为订阅 mavros/global_position/raw(HOME 无关的真实 GPS)直接用。
+// world_ref_* 仅用于 RViz TF 视觉对齐,不做任何距离/坐标计算。
+
 class CommNode {
 private:
     // ROS 句柄
@@ -54,8 +60,9 @@ private:
     ros::NodeHandle nh_private_;
 
     // ============== 订阅 ==============
-    ros::Subscriber self_pose_sub_;          // 本机位置（来自飞控）
-    ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
+    ros::Subscriber self_pose_sub_;          // 本机 NED 位姿(姿态用,以及 GPS 未到时 NED→GPS 兜底投影)
+    ros::Subscriber gps_global_sub_;         // 本机 EKF2 GPS(mavros/global_position/global,HOME 依赖但必发)
+    ros::Subscriber gps_raw_sub_;            // 本机真实 GPS(mavros/global_position/raw,不依赖 PX4 HOME)
     ros::Subscriber yolo_result_sub_;        // YOLO检测结果(typed YoloDetection)
     ros::Subscriber target_est_pose_sub_;    // 目标估计位置
     // === Phase 7: 其他 UAV 心跳 ===
@@ -63,12 +70,9 @@ private:
     // === Phase 7: 本机 mission_state 订阅(把 skill_type/skill_id 灌进 InterUavStatus)===
     ros::Subscriber mission_state_sub_;
     ros::Subscriber work_mode_state_sub_;
-    // === PX4 home 自动加载 ===
-    ros::Subscriber home_position_sub_;
 
     // ============== 发布 ==============
     ros::Publisher self_pose_pub_;           // 本机位置(发给其他无人机)
-    ros::Publisher other_uav_poses_pub_;     // 邻居无人机位置列表
     ros::Publisher target_info_pub_;         // 目标信息
     // === Phase 7: 类型化心跳 ===
     ros::Publisher inter_uav_status_pub_;
@@ -77,14 +81,8 @@ private:
     geometry_msgs::PoseStamped current_self_pose_;
     bool is_self_pose_received_ = false;
 
-    // 邻居无人机列表
-    struct NeighborUav {
-        std::string name;
-        geometry_msgs::PoseStamped pose;
-        ros::Time last_update;
-    };
-    std::vector<NeighborUav> neighbors_;
-    double neighbor_timeout_;  // 邻居超时时间（秒）
+    // 邻居超时时间(秒) — 仍用于心跳清理(见 interUavStatusTimerCallback)
+    double neighbor_timeout_;
 
     // (legacy /gs/* 状态缓冲已移除,任务入口由 typed TaskFlow 直达 mission_manager)
 
@@ -100,8 +98,6 @@ private:
     double target_share_interval_;  // 目标共享间隔（秒）
     ros::Time last_target_share_time_;
 
-    // 定时器
-    ros::Timer neighbor_check_timer_; // 邻居检查定时器
     // === Phase 7: 心跳定时器(频率自适应 1/5/20Hz)===
     ros::Timer inter_uav_status_timer_;
 
@@ -115,6 +111,7 @@ private:
     uint8_t current_typed_work_mode_;   // 来自 mission_manager 的 typed mode(占位)
     int32_t current_skill_type_;        // 当前 skill_type(占位)
     std::string current_skill_id_;      // 当前 skill_id(占位)
+    uint8_t current_phase_;             // 来自 mission_manager 的 MissionState.phase(uav_avoidance 仲裁用)
 
     // 邻居心跳缓存(用于调频 + 集结判断)
     struct NeighborHeartbeat {
@@ -131,13 +128,23 @@ private:
     std::string uav_device_sn_;
     bool use_sim_;        // 仿真/真机切换
 
-    // GPS 参考点（NED <-> GPS 转换用）。默认初始化为 0/0/0:
-    // 启动后由 homePositionCallback() 自动从 /<ns>/mavros/home_position/home 拉取 PX4 当前 home,
-    // 不再依赖 yaml 硬编码 (用户最新指示: 不应该硬编码 ref_*)。
-    double ref_lat_ = 0.0;      // 参考纬度（度）
-    double ref_lon_ = 0.0;      // 参考经度（度）
-    double ref_alt_ = 0.0;      // 参考高度（米）
-    bool ref_initialized_ = false;  // 是否已收到 PX4 home
+    // raw GPS 是否已收到(mavros/global_position/raw 回调里置 true)
+    // 之前的 NED+HOME 投影逻辑已删除,这里只判断 raw 是否到
+    bool is_gps_received_ = false;
+    // raw vs global 跟踪,用于决定 gpsGlobalCallback 是否仍要覆盖
+    bool is_raw_gps_received_ = false;
+    // (2026-07-20) NED→GPS 兜底投影是否启用。
+    // 当 raw/global 都还没到、但 self_pose 已到时,先发基于 NED 的"近似 GPS"心跳,
+    // 让 uav_avoidance 至少有数据流;距离计算在多机 SITL 各自 HOME 相同时近似准。
+    // 注:仅当 ROS 参数 ~ned_to_gps_fallback=true 时启用(默认 false,保持
+    //   之前 "GPS 没到就不发心跳" 的保守行为)。如果上游 launch 设了共享 HOME
+    //   (如 multi_uav_px4_sitl_test_3.launch 里 mavros 启动参数),可开 true。
+    bool ned_to_gps_fallback_ = false;
+    // NED→GPS 参考点(兜底投影用)。如 PX4 HOME 已在多机间对齐(launch 注入)用 HOME,
+    // 否则用 launch 私有 ~ned_ref_lat/lon/alt(单位:度 / 米 AMSL)。
+    double ned_ref_lat_  = 36.05801135;
+    double ned_ref_lon_  = 114.5491114;
+    double ned_ref_alt_  = 0.0;
 
 public:
     CommNode() : nh_private_("~"),
@@ -170,10 +177,15 @@ public:
         current_heartbeat_rate_ = heartbeat_base_rate_;
         current_typed_work_mode_ = 0;
         current_skill_type_ = 0;
-        // GPS 参考点不再从 yaml 硬编码,而由 PX4 /mavros/home_position/home 自动填充
-        nh_private_.param<double>("ref_lat", ref_lat_, ref_lat_);
-        nh_private_.param<double>("ref_lon", ref_lon_, ref_lon_);
-        nh_private_.param<double>("ref_alt", ref_alt_, ref_alt_);
+        current_phase_ = 0;  // GROUND_IDLE
+        // GPS 改用 mavros/global_position/raw,不再需要 ref_lat/lon/alt 投影
+
+        // === (2026-07-20) NED→GPS 兜底投影配置 ===
+        //   默认关闭(0/false)。launch 显式传 ~ned_to_gps_fallback:=true 时启用。
+        nh_private_.param<bool>("ned_to_gps_fallback", ned_to_gps_fallback_, false);
+        nh_private_.param<double>("ned_ref_lat", ned_ref_lat_, 36.05801135);
+        nh_private_.param<double>("ned_ref_lon", ned_ref_lon_, 114.5491114);
+        nh_private_.param<double>("ned_ref_alt", ned_ref_alt_, 0.0);
     }
 
     void initSubscribers() {
@@ -189,10 +201,8 @@ public:
                 &CommNode::selfPoseCallback, this);
         }
 
-        // 订阅所有 UAV 发布的自己的位置（全局 topic）
-        other_uav_poses_sub_ = nh_.subscribe(
-            "/inter_uav/self_pose", 10,
-            &CommNode::otherUavPosesCallback, this);
+        // 旧 otherUavPosesCallback 已删除 — 不再订阅邻居 /inter_uav/self_pose,
+        //   邻居感知完全依赖 /inter_uav/uav_status 心跳(见 interUavStatusTimerCallback)。
 
         // YOLO 检测结果（目标发现）
         yolo_result_sub_ = nh_.subscribe(
@@ -210,19 +220,27 @@ public:
             &CommNode::interUavStatusCallback, this);
 
         // === Phase 7: 本机 mission_state(1Hz,来自 mission_manager)===
-        //   用来把 current_skill_type_/skill_id_/work_mode_ 灌进 InterUavStatus,
+        //   用来把 current_skill_type_/skill_id_/phase_ 灌进 InterUavStatus,
         //   否则心跳里 skill_type 永远是 0(占位),多机 gather 同步无法判别伙伴当前阶段。
         mission_state_sub_ = nh_.subscribe(
             "mission/mission_state", 10,
             &CommNode::missionStateCallback, this);
         work_mode_state_sub_ = nh_.subscribe(
-            "mission/work_mode_state", 10,
+            "mission/current_work_mode", 10,
             &CommNode::workModeStateCallback, this);
 
-        // === PX4 home 自动加载(ref_lat/lon/alt 的唯一来源,不再硬编码)===
-        home_position_sub_ = nh_.subscribe(
-            "mavros/home_position/home", 10,
-            &CommNode::homePositionCallback, this);
+        // === mavros GPS 双源(2026-07-20 改造)===
+        //   /mavros/global_position/global = EKF2 估计,HOME 依赖,但 mavros 默认必发
+        //   /mavros/global_position/raw    = 传感器原始,HOME 无关,但部分配置不发
+        // 双订阅:/global 永远填进 current_self_pose_(保证邻居持续有数据流),
+        //        /raw 一旦到达就覆盖,得到 HOME 无关的真值。
+        // 注:之前只有 /raw,某些 SITL 配置下 raw 不发 → comm 不发心跳 → 邻居全空。
+        gps_global_sub_ = nh_.subscribe(
+            "mavros/global_position/global", 10,
+            &CommNode::gpsGlobalCallback, this);
+        gps_raw_sub_ = nh_.subscribe(
+            "mavros/global_position/raw", 10,
+            &CommNode::gpsRawCallback, this);
     }
 
     void initPublishers() {
@@ -230,9 +248,8 @@ public:
         self_pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "/inter_uav/self_pose", 10);
 
-        // 邻居无人机位置列表（供 waypoint_executor 订阅）
-        other_uav_poses_pub_ = nh_.advertise<geometry_msgs::PoseArray>(
-            "inter_uav/other_uav_poses", 10);
+        // 旧 other_uav_poses_pub_ 已删除 — PoseArray 汇总无订阅者,机间避让改由 uav_avoidance_node
+        //   直接订阅心跳(见 /inter_uav/uav_status)。comm_node 不再汇总邻居位置列表。
 
         // 目标信息（共享给队友）
         target_info_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
@@ -244,11 +261,6 @@ public:
     }
 
     void initTimers() {
-        // 邻居检查定时器（1Hz）
-        neighbor_check_timer_ = nh_.createTimer(
-            ros::Duration(1.0),
-            &CommNode::neighborCheckTimerCallback, this);
-
         // === Phase 7: 心跳定时器(频率自适应)===
         inter_uav_status_timer_ = nh_.createTimer(
             ros::Duration(1.0 / current_heartbeat_rate_),
@@ -258,105 +270,104 @@ public:
     // ============== 回调函数 ==============
 
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // 先把输入转为统一 NED（本地坐标系）
-        double ned_x, ned_y, ned_z;
-        if (use_sim_) {
-            // 仿真输入是 NED 坐标系
-            ned_x = msg->pose.position.x;
-            ned_y = msg->pose.position.y;
-            ned_z = msg->pose.position.z;
-        } else {
-            // Mavros 输入是 ENU 坐标系
-            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
-            ned_x = msg->pose.position.y;
-            ned_y = msg->pose.position.x;
-            ned_z = -msg->pose.position.z;
-        }
-
-        // 转换 NED -> GPS（WGS84）用于机间共享
-        double lat, lon, alt;
-        nedToGps(ned_x, ned_y, ned_z, lat, lon, alt);
-
-        // 存为 GPS pose: position.x=lat, position.y=lon, position.z=alt
-        current_self_pose_.pose.position.x = lat;
-        current_self_pose_.pose.position.y = lon;
-        current_self_pose_.pose.position.z = alt;
+        // NED 位置用作 GPS 兜底投影(当 ned_to_gps_fallback=true 且 /global + /raw 都没到)。
+        // 姿态信息也保留,给需要朝向的下游。
         current_self_pose_.pose.orientation = msg->pose.orientation;
         current_self_pose_.header = msg->header;
-        is_self_pose_received_ = true;
-
-        // 设置 frame_id 为本机名，订阅方通过此过滤自己的消息
         current_self_pose_.header.frame_id = uav_name_;
+        // 如果 GPS 还没到,这里用 NED→GPS 投影兜底填一下,避免 self_pose 不发导致邻居全空
+        // (2026-07-20 修复:之前这里条件 if(is_gps_received_) 直接 return,
+        //  某些 SITL 配置 raw/global 都不发时邻居 = 0)
+        if (!is_gps_received_ && ned_to_gps_fallback_) {
+            double gx, gy, gz;
+            nedToGpsFallback(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
+                             gx, gy, gz);
+            current_self_pose_.pose.position.x = gx;
+            current_self_pose_.pose.position.y = gy;
+            current_self_pose_.pose.position.z = gz;
+        }
+        // GPS 由 gpsRawCallback / gpsGlobalCallback 写入。
+        if (is_gps_received_ || (ned_to_gps_fallback_ && is_self_pose_received_)) {
+            self_pose_pub_.publish(current_self_pose_);
+        }
+        is_self_pose_received_ = true;
+    }
 
-        // 广播本机 GPS 位置给其他无人机（全局 topic）
+    /**
+     * mavros/global_position/global 回调 — EKF2 估计,HOME 依赖,但 mavros 默认必发。
+     * 作为 primary,保证 /inter_uav/self_pose 持续有数据流。
+     * 一旦收到 /raw,这里就不再覆盖(避免 /global 把 /raw 真值覆盖回去)。
+     */
+    void gpsGlobalCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        if (is_raw_gps_received_) {
+            return;  // /raw 真值已生效,不再被 /global 覆盖
+        }
+        current_self_pose_.pose.position.x = msg->latitude;
+        current_self_pose_.pose.position.y = msg->longitude;
+        current_self_pose_.pose.position.z = msg->altitude;
+        current_self_pose_.header = msg->header;
+        current_self_pose_.header.frame_id = uav_name_;
+        if (!is_gps_received_) {
+            is_gps_received_ = true;
+            ROS_WARN("[Comm] >>>> First GPS received (/global, EKF2 HOME-dep): lat=%.7f lon=%.7f alt=%.2f",
+                     msg->latitude, msg->longitude, msg->altitude);
+        }
+        is_self_pose_received_ = true;
         self_pose_pub_.publish(current_self_pose_);
     }
 
     /**
-     * NED -> GPS 转换（使用参考点的小范围近似）
-     * 输入：ned_x (北), ned_y (东), ned_z (下)
-     * 输出：lat (度), lon (度), alt (米)
+     * mavros/global_position/raw 回调 — 真实 GPS,不依赖 PX4 HOME。
+     * 多机 SITL 各自 PX4 HOME 不同时,只有这个 topic 能保证所有 UAV 在同一坐标系。
+     * 标记 is_raw_gps_received_=true,后续 /global 不再覆盖。
      */
-    void nedToGps(double ned_x, double ned_y, double ned_z,
-                  double& lat, double& lon, double& alt) {
-        const double EARTH_R = 6378137.0;
-        double d_lat = ned_x / EARTH_R * 180.0 / M_PI;
-        double d_lon = ned_y / (EARTH_R * cos(ref_lat_ * M_PI / 180.0)) * 180.0 / M_PI;
-        lat = ref_lat_ + d_lat;
-        lon = ref_lon_ + d_lon;
-        alt = ref_alt_ - ned_z;  // NED: z 向下 -> alt: 海拔向上
+    void gpsRawCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        current_self_pose_.pose.position.x = msg->latitude;
+        current_self_pose_.pose.position.y = msg->longitude;
+        current_self_pose_.pose.position.z = msg->altitude;
+        current_self_pose_.header = msg->header;
+        current_self_pose_.header.frame_id = uav_name_;
+        if (!is_raw_gps_received_) {
+            is_raw_gps_received_ = true;
+            ROS_WARN("[Comm] >>>> First raw GPS received (HOME-indep, overrides /global): lat=%.7f lon=%.7f alt=%.2f",
+                     msg->latitude, msg->longitude, msg->altitude);
+        }
+        if (!is_gps_received_) {
+            is_gps_received_ = true;
+        }
+        is_self_pose_received_ = true;
+        self_pose_pub_.publish(current_self_pose_);
     }
 
     /**
-     * PX4 home 回调 — 锁一次
-     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
-     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
-     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
-     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
+     * NED→GPS 兜底投影(本地 NED 用 ned_ref_* 转 WGS84)
+     * 仅在 ned_to_gps_fallback=true 时由 selfPoseCallback 调用。
+     * 精度依赖 ned_ref_* 与 PX4 HOME 的一致性;若各机 HOME 不同则不要启用。
      */
-    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
-        if (ref_initialized_) return;  // 锁一次
-        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
-            // PX4 在 home 未稳定前可能发 0/0,忽略
-            return;
-        }
-        ROS_WARN("[Comm] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
-                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
-        ref_lat_ = msg->geo.latitude;
-        ref_lon_ = msg->geo.longitude;
-        ref_alt_ = msg->geo.altitude;
-        ref_initialized_ = true;
+    void nedToGpsFallback(double ned_x, double ned_y, double ned_z,
+                          double& lat, double& lon, double& alt) {
+        const double EARTH_R = 6378137.0;
+        const double DEG_PER_RAD = 180.0 / M_PI;
+        lat = ned_ref_lat_ + (ned_x / EARTH_R) * DEG_PER_RAD;
+        double cos_lat = std::cos(ned_ref_lat_ * M_PI / 180.0);
+        if (cos_lat < 1e-6) cos_lat = 1e-6;
+        lon = ned_ref_lon_ + (ned_y / (EARTH_R * cos_lat)) * DEG_PER_RAD;
+        alt = ned_ref_alt_ - ned_z;  // NED z 下向 → AMSL 上向
     }
 
-    void otherUavPosesCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // 忽略自己的消息
-        if (msg->header.frame_id == uav_name_) {
-            return;
-        }
-
-        // 更新或添加邻居
-        bool found = false;
-        for (auto& neighbor : neighbors_) {
-            if (neighbor.name == msg->header.frame_id) {
-                neighbor.pose = *msg;
-                neighbor.last_update = ros::Time::now();
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) {
-            NeighborUav new_neighbor;
-            new_neighbor.name = msg->header.frame_id;
-            new_neighbor.pose = *msg;
-            new_neighbor.last_update = ros::Time::now();
-            neighbors_.push_back(new_neighbor);
-            ROS_INFO("[Comm] New neighbor discovered: %s", msg->header.frame_id.c_str());
-        }
-
-        // 发布邻居列表（汇总）
-        publishOtherUavPoses();
+    /**
+     * (deprecated) 原 NED -> GPS 投影 — 已删除,改用 gpsRawCallback。
+     * 旧代码用每机 PX4 home 做参考,多机 SITL 时各自 HOME 不同会算错距离。
+     * 如果未来需要回退,在 launch 显式传 ref_lat/lon/alt 即可重建此函数。
+     */
+    void nedToGps_DELETED(double ned_x, double ned_y, double ned_z,
+                           double& lat, double& lon, double& alt) {
+        (void)ned_x; (void)ned_y; (void)ned_z;
+        (void)lat;   (void)lon;   (void)alt;
     }
+
+    // 旧 otherUavPosesCallback / neighborCheckTimerCallback / publishOtherUavPoses 已删除 —
+    //   原 PoseArray 汇总管线无订阅者(2026-07-21),机间感知全部走 /inter_uav/uav_status 心跳。
 
     void yoloResultCallback(const multi_uav_strike::YoloDetection::ConstPtr& msg) {
         // 收到 typed YoloDetection(multi_uav_strike/YoloDetection)
@@ -388,36 +399,7 @@ public:
 
     // ============== 定时器回调 ==============
 
-    void neighborCheckTimerCallback(const ros::TimerEvent&) {
-        // 清理超时的邻居
-        ros::Time now = ros::Time::now();
-        auto it = neighbors_.begin();
-        while (it != neighbors_.end()) {
-            if ((now - it->last_update).toSec() > neighbor_timeout_) {
-                ROS_WARN("[Comm] Neighbor %s timeout, removing", it->name.c_str());
-                it = neighbors_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // 更新邻居列表发布
-        publishOtherUavPoses();
-    }
-
-    // ============== 辅助函数 ==============
-
-    void publishOtherUavPoses() {
-        geometry_msgs::PoseArray pose_array;
-        pose_array.header.stamp = ros::Time::now();
-        pose_array.header.frame_id = "map";
-
-        for (const auto& neighbor : neighbors_) {
-            pose_array.poses.push_back(neighbor.pose.pose);
-        }
-
-        other_uav_poses_pub_.publish(pose_array);
-    }
+    // 旧 neighborCheckTimerCallback / publishOtherUavPoses 已删除 — 见上方注释。
 
     // ============== Phase 7: 类型化心跳 ==============
 
@@ -462,6 +444,7 @@ public:
         hs.work_mode     = current_typed_work_mode_;
         hs.skill_type    = current_skill_type_;
         hs.skill_id      = current_skill_id_;
+        hs.phase         = current_phase_;
         hs.timestamp_us  = ros::Time::now().toNSec() / 1000;
         hs.lat           = current_self_pose_.pose.position.x;
         hs.lon           = current_self_pose_.pose.position.y;
@@ -504,6 +487,8 @@ public:
     void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
         current_skill_type_ = msg->skill_type;  // 可能是 -1(无 active skill)
         current_skill_id_   = msg->skill_id;
+        // phase 字段也灌进心跳,uav_avoidance 用 (work_mode, phase) 联合判定优先级
+        current_phase_      = msg->phase;
     }
 
     /**

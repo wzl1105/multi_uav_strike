@@ -4,10 +4,16 @@
  * 多机机间避障决策节点(纯 ROS 内部,不动 starling_bridge)
  *
  * 职责:
- *   - 接收邻居无人机 GPS 位姿(/<ns>/inter_uav/other_uav_poses)
+ *   - 接收邻居无人机心跳(/inter_uav/uav_status — 全局 sn + 位置 + state)
  *   - 接收自身当前航段终点(/<ns>/waypoint_executor/current_target)
  *   - 基于 task_priority + uav_id 优先级判定"谁让谁"
  *   - 发布避障指令(/<ns>/avoidance/cmd,multi_uav_strike/AvoidanceCmd)
+ *
+ * 数据源说明:
+ *   心跳 InterUavStatus 已经包含所有需要的信息(sn/lat/lon/alt/work_mode/phase),
+ *   因此不再订阅 PoseArray 之类的位置冗余源,也不需要 lat/lon → sn 反查。
+ *   心跳频率由 comm_node 按距离自适应(基础/5Hz/20Hz),1Hz 下位置 1s 旧
+ *   对 5m/s 速度误差 ≈ 5m,相对 20-40m 阈值可接受。
  *
  * 策略:
  *   - 横向(lateral)严禁越线 — 压航线核心约束
@@ -21,11 +27,7 @@
 #include <ros/console.h>
 
 #include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/PoseArray.h>
-#include <geometry_msgs/Point.h>
-#include <std_msgs/String.h>
-#include <std_msgs/Bool.h>
-#include <std_msgs/Float32.h>
+#include <sensor_msgs/NavSatFix.h>
 
 #include <cmath>
 #include <string>
@@ -35,7 +37,8 @@
 
 #include "multi_uav_strike/AvoidanceCmd.h"
 #include "multi_uav_strike/InterUavStatus.h"
-#include "mavros_msgs/HomePosition.h"
+#include "multi_uav_strike/WorkMode.h"
+#include "multi_uav_strike/MissionState.h"
 
 class UavAvoidance {
 public:
@@ -49,48 +52,65 @@ public:
         // uav_device_sn:本机 device_sn;空 → 回落到 uav_id("uav0")
         // 与 comm_node 的 ~uav_device_sn 一致,这样心跳的 sn 和这里的 sn 是同一字符串
         nh_private_.param<std::string>("uav_device_sn", uav_device_sn_, uav_id_);
-        nh_private_.param<int>("uav_sn_priority_offset", uav_sn_priority_offset_, 0);
-        nh_private_.param<int>("self_task_priority", self_task_priority_, 100);
         nh_private_.param<double>("collision_threshold", collision_threshold_, 8.0);
-        nh_private_.param<double>("proximity_threshold", proximity_threshold_, 15.0);
+        nh_private_.param<double>("proximity_threshold", proximity_threshold_, 30.0);
         nh_private_.param<double>("vertical_safe", vertical_safe_, 5.0);
+        // 垂直避让方向 buffer(m):dalt = other_alt - self_alt(正 = 对方在我上方)。
+        //   dalt <  vertical_buffer_(我与对方等高 / 更高 / 仅略低)→ 向上爬升避让
+        //   dalt >= vertical_buffer_(我明显在对方下方)         → 向下俯冲避让
+        nh_private_.param<double>("vertical_buffer", vertical_buffer_, 2.0);
+        // 垂直避让速率(m/s,正值):强(冲突区)/ 弱(接近区),方向由 buffer 规则决定
+        nh_private_.param<double>("vertical_avoid_strong", vertical_avoid_strong_, 2.5);
+        nh_private_.param<double>("vertical_avoid_mild", vertical_avoid_mild_, 1.5);
+        // max_avoid_distance:超过此距离直接判定"无需避障",原硬编码 50m
+        nh_private_.param<double>("max_avoid_distance", max_avoid_distance_, 100.0);
         nh_private_.param<double>("loop_freq", loop_freq_, 20.0);
 
         // 从 uav_id 提取数字(旧 tiebreaker 路径,保留向后兼容)
         self_uav_num_ = extractUavNumber(uav_id_);
         // device_sn 用于 tiebreaker(字典序,"1-1" 优先于 "1-2")
 
-        ROS_INFO("[UavAvoidance] self_id=%s device_sn=%s num=%d priority_offset=%d self_task_prio=%d",
-                 uav_id_.c_str(), uav_device_sn_.c_str(),
-                 self_uav_num_, uav_sn_priority_offset_, self_task_priority_);
+        ROS_INFO("[UavAvoidance] self_id=%s device_sn=%s num=%d thresholds(coll=%.1f/prox=%.1f/vert_safe=%.1f/max_dist=%.1f) [gps=%s]",
+                 uav_id_.c_str(), uav_device_sn_.c_str(), self_uav_num_,
+                 collision_threshold_, proximity_threshold_, vertical_safe_, max_avoid_distance_,
+                 have_raw_gps_ ? "raw(HOME-indep)" : "global(EKF2,HOME-dep)");
 
         // ========== 订阅 ==========
         self_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10,
                                        &UavAvoidance::selfPoseCb, this);
 
-        std::string neighbors_t = "inter_uav/other_uav_poses";
-        neighbor_sub_ = nh_.subscribe(neighbors_t, 10,
-                                      &UavAvoidance::neighborCb, this);
-
         std::string current_target_t = "waypoint_executor/current_target";
         current_target_sub_ = nh_.subscribe(current_target_t, 10,
                                             &UavAvoidance::currentTargetCb, this);
 
-        std::string priority_t = "inter_uav/priority_map";
-        priority_sub_ = nh_.subscribe(priority_t, 10,
-                                      &UavAvoidance::priorityMapCb, this);
-
         // 心跳是 comm_node 在全局 topic "/inter_uav/uav_status" 上发(绝对路径),
         // 这里是相对路径会落在 /<ns>/inter_uav/uav_status 上,收不到。
+        // 心跳里包含 sn + lat/lon/alt + work_mode + phase + timestamp_us,
+        // 唯一信源 — 不再订阅 PoseArray 之类的冗余位置源。
         std::string heartbeat_t = "/inter_uav/uav_status";
         heartbeat_sub_ = nh_.subscribe(heartbeat_t, 50,
                                        &UavAvoidance::heartbeatCb, this);
 
-        // 订阅 PX4 home — self_pose 是 NED(米),neighbors 是 GPS(度),距离公式需要同一坐标空间。
-        // 用 home 把 self_pose NED → GPS,后续 distance 用 lat/lon 公式才对。
-        home_sub_ = nh_.subscribe("mavros/home_position/home", 1,
-                                  &UavAvoidance::homeCb, this);
-        have_home_ = false;
+        // 订阅 mavros GPS — 双源策略
+        //   1) /mavros/global_position/global(EKF2 估计,几乎一定存在)— 作为 primary
+        //   2) /mavros/global_position/raw(传感器原始读数,HOME 无关)— 作为 override
+        // 背景:多机 SITL 各自 PX4 HOME 不同时,NED+HOME 投影会让算出的 GPS 偏移,
+        //       同一对邻居会算出 1m vs 43m 的距离。raw GPS 是真值,但不是所有 mavros
+        //       配置都开这个 topic(某些版本/PX4 固件不发)。所以双订阅:
+        //       - /global 一到就先填上,保证避障不空转
+        //       - /raw 一到就覆盖,拿到 HOME 无关的真值
+        gps_global_sub_ = nh_.subscribe("mavros/global_position/global", 10,
+                                        &UavAvoidance::gpsGlobalCallback, this);
+        gps_raw_sub_ = nh_.subscribe("mavros/global_position/raw", 10,
+                                     &UavAvoidance::gpsRawCallback, this);
+        have_self_gps_ = false;
+        have_raw_gps_ = false;
+
+        // 订阅本机当前 work_mode + mission_state,用于本地 (work_mode, phase) 联合优先级判定
+        self_work_mode_sub_ = nh_.subscribe("mission/current_work_mode", 10,
+                                            &UavAvoidance::selfWorkModeCb, this);
+        self_mission_state_sub_ = nh_.subscribe("mission/mission_state", 10,
+                                                &UavAvoidance::selfMissionStateCb, this);
 
         // ========== 发布 ==========
         std::string out_t = "avoidance/cmd";
@@ -108,11 +128,12 @@ private:
     ros::NodeHandle nh_, nh_private_;
 
     ros::Subscriber self_pose_sub_;
-    ros::Subscriber neighbor_sub_;
     ros::Subscriber current_target_sub_;
-    ros::Subscriber priority_sub_;
     ros::Subscriber heartbeat_sub_;
-    ros::Subscriber home_sub_;
+    ros::Subscriber gps_global_sub_;     // /mavros/global_position/global — EKF2 估计(必发)
+    ros::Subscriber gps_raw_sub_;        // /mavros/global_position/raw    — 传感器原始(HOME 无关,可能不发)
+    ros::Subscriber self_work_mode_sub_;
+    ros::Subscriber self_mission_state_sub_;
     ros::Publisher  avoidance_pub_;
     ros::Timer      timer_;
 
@@ -122,36 +143,41 @@ private:
     // 自身 device_sn(命名约定 "1-1" / "1-2"...),默认回落到 uav_id
     // 用作心跳里 sn 的查找键,以及优先级相同时的 tiebreaker(字典序)
     std::string uav_device_sn_;
-    int uav_sn_priority_offset_;
-    int self_task_priority_;
     double collision_threshold_;
     double proximity_threshold_;
     double vertical_safe_;
+    double vertical_buffer_;        // 垂直避让方向 buffer(见构造函数注释)
+    double vertical_avoid_strong_;  // 冲突区垂直避让速率 (m/s)
+    double vertical_avoid_mild_;    // 接近区垂直避让速率 (m/s)
+    double max_avoid_distance_;   // > 此距离直接判定"无需避障"
     double loop_freq_;
     int self_uav_num_;
 
-    // 自位置
+    // 自位置(NED,日志/调试用)
     bool have_self_pose_;
     geometry_msgs::PoseStamped self_pose_;
 
-    // PX4 home (用于 NED→GPS 转换,见 tickCb)
-    bool have_home_;
-    double home_lat_, home_lon_, home_alt_;
+    // 自位置 GPS(直接来自 mavros/global_position/raw,不依赖 PX4 HOME)
+    // 多机 SITL 即使各自 PX4 HOME 不同,raw GPS 仍是世界坐标系下的真实 GPS
+    // → 机间避障距离计算必须用这个,不能用 NED+HOME 投影(会算错,见 [AVOID] SELF log)
+    bool have_self_gps_;
+    sensor_msgs::NavSatFix self_gps_;
+    // 是否收到过 /raw(用于日志统计;raw 真值会覆盖 global)
+    bool have_raw_gps_;
 
     // 当前航段终点
     bool have_current_target_;
     geometry_msgs::PoseStamped current_target_;
 
-    // 邻居位姿(从 PoseArray 缓存)+ 对应 device_sn(由 heartbeat cache 按 lat/lon 反查)
-    struct NeighborInfo {
-        geometry_msgs::Pose pose;  // position.{x,y,z} = {lat,lon,alt}
-        std::string sn;            // 来自 heartbeat,空 = 未匹配上(对方还没推心跳)
-    };
-    std::vector<NeighborInfo> neighbors_;
-
-    // 邻居 priority + sn 表(简化存全部,找自己需要的)
+    // 邻居表(心跳 cache,已过滤 self + 过期)— tickCb 直接迭代算距离与判定 state,
+    //   sn / lat / lon / alt / work_mode / phase / timestamp_us 全部就齐
     std::vector<multi_uav_strike::InterUavStatus::ConstPtr> heartbeats_;
     ros::Time last_heartbeat_purge_;
+
+    // 本机当前 work_mode + phase(供 (work_mode,phase) 联合优先级判定用)
+    uint8_t self_work_mode_ = 0;   // 默认 IDLE,后续会收到 mission/current_work_mode
+    uint8_t self_phase_      = 0;  // 默认 GROUND_IDLE,后续会收到 mission/mission_state
+    bool    have_self_state_ = false;
 
     int extractUavNumber(const std::string& id) {
         // "uav0" → 0, "uav12" → 12
@@ -170,18 +196,36 @@ private:
         have_self_pose_ = true;
     }
 
-    void homeCb(const mavros_msgs::HomePosition::ConstPtr& msg) {
-        // PX4 home 一次性锁定 — 用于把 self_pose NED(m) 投影到 GPS(deg),与邻居同坐标空间
-        if (have_home_) return;
-        const double lat = msg->geo.latitude;
-        const double lon = msg->geo.longitude;
-        if (std::fabs(lat) < 1e-6 && std::fabs(lon) < 1e-6) return;
-        home_lat_ = lat;
-        home_lon_ = lon;
-        home_alt_ = msg->geo.altitude;
-        have_home_ = true;
-        ROS_WARN("[UavAvoidance] home locked: lat=%.7f lon=%.7f alt=%.2f",
-                 home_lat_, home_lon_, home_alt_);
+    void gpsGlobalCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        // mavros/global_position/global = EKF2 估计。HOME 依赖(EKF2 origin = HOME),
+        //   但 mavros 默认必发。先填这个保证避障不空转。
+        // 仅在尚未收到 /raw 时填充,避免 /raw 真值被 /global 覆盖回去
+        if (have_raw_gps_) {
+            return;
+        }
+        self_gps_ = *msg;
+        if (!have_self_gps_) {
+            ROS_WARN("[UavAvoidance] first GPS received (/global, EKF2 HOME-dep): lat=%.7f lon=%.7f alt=%.2f",
+                     msg->latitude, msg->longitude, msg->altitude);
+        }
+        have_self_gps_ = true;
+    }
+
+    void gpsRawCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        // mavros/global_position/raw = PX4 GPS 传感器原始读数,不依赖 PX4 HOME。
+        // 多机 SITL 即使各自 PX4 HOME 不同,raw GPS 仍是世界坐标系下的真实 GPS
+        // → 机间避障距离计算必须用这个,不能用 NED+HOME 投影
+        //   (之前每机 HOME 差十几米,NED→GPS 投影错位 → 同一对邻居算出 1m vs 43m)
+        self_gps_ = *msg;
+        if (!have_raw_gps_) {
+            ROS_WARN("[UavAvoidance] first raw GPS received (HOME-indep, overrides /global): lat=%.7f lon=%.7f alt=%.2f",
+                     msg->latitude, msg->longitude, msg->altitude);
+            have_raw_gps_ = true;
+        }
+        // 首次拿到任意 GPS 才标记 have_self_gps_(可能比 gpsGlobalCallback 更早到)
+        if (!have_self_gps_) {
+            have_self_gps_ = true;
+        }
     }
 
     void currentTargetCb(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -189,52 +233,122 @@ private:
         have_current_target_ = true;
     }
 
-    void neighborCb(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        // PoseArray: position.x=lat, .y=lon, .z=alt(同 comm_node 约定)
-        if (neighbors_.empty() && !msg->poses.empty()) {
-            ROS_WARN("[UavAvoidance] first neighbor batch: %lu poses (sample: lat=%.6f lon=%.6f alt=%.1f)",
-                     msg->poses.size(),
-                     msg->poses[0].position.x, msg->poses[0].position.y, msg->poses[0].position.z);
-        }
-        neighbors_.clear();
-        neighbors_.reserve(msg->poses.size());
-        for (const auto& p : msg->poses) {
-            NeighborInfo n;
-            n.pose = p;
-            // 用 lat/lon 反查 heartbeat cache,拿到对方 device_sn
-            // heartbeat 里 sn/lat/lon 是对方的真实标识和位置,与 PoseArray 里的 lat/lon 是同一个数
-            n.sn = lookupSnByLatLon(p.position.x, p.position.y);
-            neighbors_.push_back(n);
+    void selfWorkModeCb(const multi_uav_strike::WorkMode::ConstPtr& msg) {
+        self_work_mode_ = msg->mode;
+        have_self_state_ = true;
+    }
+
+    void selfMissionStateCb(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        self_phase_ = msg->phase;
+        have_self_state_ = true;
+    }
+
+    /**
+     * 将 mission_manager 本地 WorkMode 枚举值映射到 WorkMode.msg 值。
+     *
+     * mission_manager_node.cpp 内部定义了一份 `enum class WorkMode`
+     *   IDLE=0, SEARCH_ONLY=1, SEARCH_TRACK=2, SEARCH_STRIKE=3, DENIED_ENV_FLIGHT=4
+     * 与 WorkMode.msg
+     *   IDLE=0, TAKEOFF=1, GATHER=2, SEARCH_ONLY=3, SEARCH_TRACK=4, SEARCH_STRIKE=5, ..., DENIED_ENV_FLIGHT=8
+     * 数值不一致。mission_manager 在 publishCurrentWorkMode() 里直接
+     * `static_cast<uint8_t>(current_work_mode_)` 把本地枚举投成 uint8 发出,
+     * 因此 InterUavStatus.work_mode 拿到的是 LOCAL 值,不是 msg 值。
+     * 这里做一次翻译,让 computeAvoidanceRank 能按 msg 语义分支。
+     */
+    static uint8_t translateLocalWorkModeToMsg(uint8_t local_wm) {
+        switch (local_wm) {
+            case 1:  return 3;  // local SEARCH_ONLY       → msg SEARCH_ONLY
+            case 2:  return 4;  // local SEARCH_TRACK      → msg SEARCH_TRACK
+            case 3:  return 5;  // local SEARCH_STRIKE     → msg SEARCH_STRIKE
+            case 4:  return 8;  // local DENIED_ENV_FLIGHT → msg DENIED_ENV_FLIGHT
+            case 0:  // IDLE — msg 同样为 0,直接返回
+            default: // 未知:透传(可能是 msg 直接发的,或新加的值)
+                return local_wm;
         }
     }
 
     /**
-     * 用 lat/lon 在 heartbeat cache 里找匹配的 device_sn。
-     * 找不到返回空串(对方心跳还没到,后续 tickCb 会走"sn 缺失"分支,保守不避让)。
+     * 联合 (work_mode, phase) 优先级数值,数值越小优先级越高。
+     *
+     * 设计(参考 WorkMode.msg 注释 + 用户规则):
+     *   group 1 (100): phase=5 GUIDANCE_STRIKE — 最高,正在打击,其他 UAV 一律让出
+     *   group 2 (200): phase=4 GUIDANCE_TRACK  — 正在跟踪,其他 UAV 让出射界
+     *   group 3 (300+): phase=3 WAYPOINT_FOLLOW (搜索/航点跟踪),按 work_mode 细分:
+     *                   300 = SEARCH_STRIKE, 301 = SEARCH_TRACK,
+     *                   302 = SEARCH_ONLY,   303 = DENIED_ENV_FLIGHT,
+     *                   304 = 其它未知 work_mode 但仍在搜索
+     *   group 4 (900): 其它阶段 (TAKING_OFF/HOVERING/RETURNING/GROUND_IDLE/
+     *                   COMPLETE/FAILED/HOLDING/IDLE) — 让出给活跃 UAV
+     *
+     * 入参 work_mode 期望是 WorkMode.msg 值空间(translateLocalWorkModeToMsg 翻译后)。
+     * 同 rank 时由 caller 用 device_sn 字典序 tiebreak(sn 小的赢)。
      */
-    std::string lookupSnByLatLon(double lat, double lon) {
-        // 1° lat ≈ 111000 m → 10m 容差 ≈ 9e-5 deg,够区分相邻 UAV
-        constexpr double TOL = 1e-4;
-        for (const auto& h : heartbeats_) {
-            if (std::fabs(h->lat - lat) < TOL && std::fabs(h->lon - lon) < TOL) {
-                return h->sn;
+    static int computeAvoidanceRank(uint8_t work_mode_msg, uint8_t phase) {
+        if (phase == 5 /* GUIDANCE_STRIKE */) return 100;
+        if (phase == 4 /* GUIDANCE_TRACK  */) return 200;
+        if (phase == 3 /* WAYPOINT_FOLLOW */) {
+            switch (work_mode_msg) {
+                case 5 /* SEARCH_STRIKE */:      return 300;
+                case 4 /* SEARCH_TRACK */:       return 301;
+                case 3 /* SEARCH_ONLY */:        return 302;
+                case 8 /* DENIED_ENV_FLIGHT */:  return 303;
+                default:                          return 304;
             }
         }
-        return "";
+        return 900;
     }
 
-    void priorityCb(const std_msgs::String::ConstPtr& msg) {
-        // 暂未使用(留接口,完整 priority 由 heartbeat 提供)
+    /**
+     * 是否处于"无法主动让路"的状态 — 即 UAV 在物理位置上接近静止。
+     * 这些 UAV 不能响应 avoidance cmd(无 active 控制环路),所以在冲突时
+     * 必须由对方主动避让。
+     *
+     * phase enum (MissionPhase):
+     *   0 GROUND_IDLE 1 TAKING_OFF 2 HOVERING 3 WAYPOINT_FOLLOW
+     *   4 GUIDANCE_TRACK 5 GUIDANCE_STRIKE 6 RETURNING 7 COMPLETE
+     *   8 FAILED 9 HOLDING
+     *
+     * 视作 stationary:GROUND_IDLE / HOLDING / COMPLETE / FAILED
+     * 不视作(可主动避让):TAKING_OFF / HOVERING / WAYPOINT_FOLLOW /
+     *   GUIDANCE_TRACK / GUIDANCE_STRIKE / RETURNING
+     *   (RETURNING 可能在飞回 home,自动避让 cmd 会被 waypoint_executor 接收)
+     */
+    static bool isStationaryPhase(uint8_t phase) {
+        switch (phase) {
+            case 0:  // GROUND_IDLE
+            case 7:  // COMPLETE
+            case 8:  // FAILED
+            case 9:  // HOLDING
+                return true;
+            default:
+                return false;
+        }
     }
 
-    void priorityMapCb(const std_msgs::String::ConstPtr& msg) {
-        // 同上
-        (void)msg;
+    static std::string phaseStr(uint8_t phase) {
+        switch (phase) {
+            case 0: return "GROUND_IDLE";
+            case 1: return "TAKING_OFF";
+            case 2: return "HOVERING";
+            case 3: return "WAYPOINT_FOLLOW";
+            case 4: return "GUIDANCE_TRACK";
+            case 5: return "GUIDANCE_STRIKE";
+            case 6: return "RETURNING";
+            case 7: return "COMPLETE";
+            case 8: return "FAILED";
+            case 9: return "HOLDING";
+            default: return "UNKNOWN";
+        }
     }
 
     void heartbeatCb(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
-        // 缓存心跳用于查询 neighbor skill priority 与 sn
-        // 清理过期
+        // 自环过滤:心跳 topic 是全局 /inter_uav/uav_status,本机 comm_node 也会发,
+        // 这里必须先过滤 self。否则 heartbeats_ 里会含本机心跳,tickCb 距离计算时
+        // 会算到 0m,把自己当成"最近邻居",触发 tie against self,完全没法避让。
+        if (msg->sn == uav_device_sn_) {
+            return;
+        }
+        // 心跳是 tickCb 唯一的邻居信源,周期性清理过期(避免断连 UAV 残留)
         ros::Time now = ros::Time::now();
         if ((now - last_heartbeat_purge_).toSec() > 1.0) {
             heartbeats_.erase(
@@ -250,22 +364,6 @@ private:
         heartbeats_.push_back(msg);
     }
 
-    // 邻居 SN 解析
-    int neighborUavNumberFromSn(const std::string& sn) {
-        return extractUavNumber(sn);
-    }
-
-    int neighborTaskPriorityFromSn(const std::string& sn) {
-        for (const auto& h : heartbeats_) {
-            if (h->sn == sn) {
-                // 用 skill_type 作为粗优先级(100 系列 skill 优先 > 100 等)
-                // 实际上 priority 由 skill.msg 提供,此版本暂用 skill_type
-                return static_cast<int>(h->skill_type);
-            }
-        }
-        return 0;  // 未知,默认低优
-    }
-
     void tickCb(const ros::TimerEvent&) {
         multi_uav_strike::AvoidanceCmd cmd;
         cmd.lateral_blocked = true;
@@ -274,42 +372,44 @@ private:
         cmd.speed_scale = 1.0;
         cmd.reverse_allowed = false;
 
-        // === 每 1s 打一次 tick 状态摘要,方便诊断哪一步没到位 ===
-        ROS_INFO_THROTTLE(1.0,
-            "[UavAvoidance] tick: self_pose=%d home=%d neighbors=%lu thresholds(coll=%.1f/prox=%.1f) self_prio=%d",
-            have_self_pose_, have_home_, neighbors_.size(),
-            collision_threshold_, proximity_threshold_, self_task_priority_);
+        // 每条日志都带 uav_id 前缀,方便多机并发打印时 grep 区分
+        const std::string TAG = "[AVOID " + uav_id_ + "]";
 
-        if (!have_self_pose_ || neighbors_.empty()) {
+        // ========== 缺前置条件 → 不避让 ==========
+        if (!have_self_gps_ || !have_self_state_ || heartbeats_.empty()) {
             avoidance_pub_.publish(cmd);
             return;
         }
 
-        // ========== 把 self_pose NED(m) 投影到 GPS(deg) ==========
-        // neighbors 是 GPS(deg),distance 公式需要两边同坐标空间。
-        // home 还没到 → 距离算不出来 → 跳过避障(给默认 cmd)。
-        if (!have_home_) {
-            avoidance_pub_.publish(cmd);
-            return;
-        }
-        const double cos_home_lat = std::max(0.1, std::cos(home_lat_ * M_PI / 180.0));
-        const double self_lat = home_lat_ + self_pose_.pose.position.x / 111000.0;
-        const double self_lon = home_lon_ + self_pose_.pose.position.y / (111000.0 * cos_home_lat);
-        const double self_alt = home_alt_ + self_pose_.pose.position.z;  // NED: z=down → 反号
+        // ========== 直接用 mavros raw GPS(HOME 无关,多机一致) ==========
+        // 之前用 NED + 每机 PX4 home 投影,多机 SITL 各自 HOME 不同时,同一对邻居
+        // 会算出 1m vs 43m 的距离 → 现改用 raw GPS,所有 UAV 都在同一坐标系。
+        const double self_lat = self_gps_.latitude;
+        const double self_lon = self_gps_.longitude;
+        const double self_alt = self_gps_.altitude;
+        const double cos_self_lat = std::max(0.1, std::cos(self_lat * M_PI / 180.0));
 
-        // 取离我最近的一个邻居
+        // ========== SELF 完整信息:我是谁,我在哪,我现在在干啥 ==========
+        const uint8_t self_wm_msg = translateLocalWorkModeToMsg(self_work_mode_);
+        const int self_rank = computeAvoidanceRank(self_wm_msg, self_phase_);
+
+        // ========== 列出收到的所有心跳邻居 + 各自距离 ==========
+        // 心跳是唯一信源:sn / lat / lon / alt / work_mode / phase 全部自带,
+        // 不再需要 PoseArray + lat/lon → sn 反查这种多源拼凑结构。
         double min_dist = 1e9;
         size_t min_idx = 0;
         bool found = false;
-        for (size_t i = 0; i < neighbors_.size(); ++i) {
-            // neighbor: position.{x,y,z} = {lat,lon,alt} (与 comm_node 约定)
-            // 自位置也已转换到 GPS(deg),距离 = sqrt((dlat*111000)^2 + (dlon*111000*cos(lat))^2 + dalt^2)
-            double dlat = (neighbors_[i].pose.position.x - self_lat);
-            double dlon = (neighbors_[i].pose.position.y - self_lon);
-            double dalt = (neighbors_[i].pose.position.z - self_alt);
-            double dx = dlat * 111000.0;
-            double dy = dlon * 111000.0 * cos_home_lat;
-            double dist = std::sqrt(dx * dx + dy * dy + dalt * dalt);
+        for (size_t i = 0; i < heartbeats_.size(); ++i) {
+            const auto& h = heartbeats_[i];
+            const double n_lat = h->lat;
+            const double n_lon = h->lon;
+            const double n_alt = h->alt;
+            const double dlat = (n_lat - self_lat);
+            const double dlon = (n_lon - self_lon);
+            const double dalt = (n_alt - self_alt);
+            const double dx = dlat * 111000.0;
+            const double dy = dlon * 111000.0 * cos_self_lat;
+            const double dist = std::sqrt(dx * dx + dy * dy + dalt * dalt);
             if (dist < min_dist) {
                 min_dist = dist;
                 min_idx = i;
@@ -317,100 +417,118 @@ private:
             }
         }
 
-        if (!found || min_dist > 50.0) {
-            // 50m 外:不需避障
-            // 调试:发现 UAV 离得很近但仍 > 50m 时,打出来 min_dist 方便排查公式 bug
-            ROS_INFO_THROTTLE(2.0,
-                "[UavAvoidance] no-avoid: min_dist=%.2fm (>50m, thresholds prox=%.1f/coll=%.1f)",
-                min_dist, proximity_threshold_, collision_threshold_);
+        // ========== 距离超过阈值 → 不需避障 ==========
+        if (!found || min_dist > max_avoid_distance_) {
             avoidance_pub_.publish(cmd);
             return;
         }
 
-        // ========== 优先级判定 ==========
-        // 对方 device_sn 来自 heartbeat cache(neighborCb 时已按 lat/lon 反查,
-        // 但心跳可能比 PoseArray 晚到,所以这里 sn 为空时再查一次)
-        std::string other_sn = neighbors_[min_idx].sn;
-        if (other_sn.empty()) {
-            other_sn = lookupSnByLatLon(neighbors_[min_idx].pose.position.x,
-                                        neighbors_[min_idx].pose.position.y);
-            if (!other_sn.empty()) {
-                // 回填:后续 tick 不必再查
-                neighbors_[min_idx].sn = other_sn;
-            } else {
-                ROS_INFO_THROTTLE(2.0,
-                    "[UavAvoidance] no-avoid (no sn yet): dist=%.2fm, neighbor heartbeat not matched",
-                    min_dist);
-                avoidance_pub_.publish(cmd);
-                return;
-            }
-        }
-        int other_task_prio = neighborTaskPriorityFromSn(other_sn);
-        int self_task_prio = self_task_priority_;
+        // ========== 直接从最近心跳取 sn / state / alt ==========
+        const auto& nearest = heartbeats_[min_idx];
+        const std::string& other_sn        = nearest->sn;
+        const uint8_t      other_work_mode = nearest->work_mode;
+        const uint8_t      other_phase     = nearest->phase;
+        const double       other_alt       = nearest->alt;
 
+        // ========== 优先级判定 (work_mode + phase 联合) ==========
+        const uint8_t other_wm_msg = translateLocalWorkModeToMsg(other_work_mode);
+        const int other_rank = computeAvoidanceRank(other_wm_msg, other_phase);
+
+        // 静止 UAV 检测:HOLDING/GROUND_IDLE 等状态无法主动让路(没有 active 控制器
+        // 消费 avoidance cmd)。冲突时必须由"动"的那一方避让,否则双方都不动会撞。
+        const bool self_is_stationary  = isStationaryPhase(self_phase_);
+        const bool other_is_stationary = isStationaryPhase(other_phase);
+
+        std::string priority_reason;
         bool i_am_lower_priority = false;
-        if (self_task_prio < other_task_prio) {
+
+        if (other_is_stationary && !self_is_stationary) {
+            // 对方静止(典型场景:完成任务后 HOLDING),自己必须主动避让
+            // (低 rank=900 也不重要,关键是不能撞静止的 UAV)
             i_am_lower_priority = true;
-        } else if (self_task_prio == other_task_prio) {
-            // tiebreaker: device_sn 字典序 — "1-1" < "1-2" < "2-1"
-            // sn 大的让 sn 小的(我若 sn 更大 → 我让)
-            if (uav_device_sn_ > other_sn) i_am_lower_priority = true;
+            priority_reason = "other is stationary (phase=" + phaseStr(other_phase) +
+                              " sn=" + other_sn + "), self must avoid regardless of rank";
+        } else if (self_is_stationary && !other_is_stationary) {
+            // 自己静止 → 对方应该避让,但因为我们没法主动让路,这条路走不通。
+            // 仍标记 self has priority,把 avoidance cmd 让对方去响应(对方 waypoint_executor 会执行)
+            i_am_lower_priority = false;
+            priority_reason = "self is stationary (phase=" + phaseStr(self_phase_) + "), self has priority (other should avoid)";
+        } else if (self_rank > other_rank) {
+            i_am_lower_priority = true;
+            priority_reason = "self_rank(" + std::to_string(self_rank) + ") > other_rank(" + std::to_string(other_rank) + ") → self yields";
+        } else if (self_rank == other_rank) {
+            if (uav_device_sn_ > other_sn) {
+                i_am_lower_priority = true;
+                priority_reason = "tie: same rank(" + std::to_string(self_rank) + "), self_sn(" + uav_device_sn_ + ") > other_sn(" + other_sn + ") → self yields";
+            } else {
+                priority_reason = "tie: same rank(" + std::to_string(self_rank) + "), self_sn(" + uav_device_sn_ + ") <= other_sn(" + other_sn + ") → self has priority";
+            }
+        } else {
+            priority_reason = "self_rank(" + std::to_string(self_rank) + ") < other_rank(" + std::to_string(other_rank) + ") → self has priority";
         }
 
         if (!i_am_lower_priority) {
-            // 我优先级 ≥ 对方,我直行,不需要任何减速
-            // 调试:即便距离够近,我方优先级较高时不避让
-            ROS_INFO_THROTTLE(2.0,
-                "[UavAvoidance] no-avoid (priority): self_prio=%d >= other_prio=%d dist=%.2fm",
-                self_task_priority_, other_task_prio, min_dist);
             avoidance_pub_.publish(cmd);
             return;
         }
 
-        // ========== 我需避让 ==========
-        // 用 GPS 高度差,与 neighbor.pose.position.z (alt) 单位一致(都是 m AMSL)
-        double dalt_with_other = neighbors_[min_idx].pose.position.z - self_alt;
+        // ========== 我需要避让 ==========
+        const double dalt_with_other = other_alt - self_alt;
+
+        ROS_WARN_THROTTLE(1.0, "%s AVOIDING: reason=[%s], target=sn=%s dist=%.2fm dalt=%+.2fm (thresholds coll=%.1f prox=%.1f vert_safe=%.1f)",
+                          TAG.c_str(), priority_reason.c_str(), other_sn.c_str(),
+                          min_dist, dalt_with_other,
+                          collision_threshold_, proximity_threshold_, vertical_safe_);
+
+        // ========== 垂直避让方向:buffer 规则 ==========
+        // dalt_with_other = other_alt - self_alt(正 = 对方在我上方,即我在下面)
+        //   dalt <  vertical_buffer_(我等高/更高/仅略低于对方)→ 向上爬升(climb),dir=+1
+        //   dalt >= vertical_buffer_(我明显在对方下方)        → 向下俯冲(descend),dir=-1
+        // vertical_bias 语义:向上爬升速率(正=向上,负=向下),executor 里 vz -= bias。
+        const bool climb_up = (dalt_with_other < vertical_buffer_);
+        const double vdir = climb_up ? +1.0 : -1.0;
+        const char* vdir_str = climb_up ? "CLIMB-UP" : "DESCEND";
 
         if (min_dist < collision_threshold_) {
-            // 极近距离:优先调高度
             if (std::fabs(dalt_with_other) < vertical_safe_) {
-                // 高度差小 → 主动拉垂直分离(关键:不能让低优先级 UAV 变成静止障碍物)
-                // 方向:本机 device_sn 哈希决定,保证双向避免同向漂移。
-                // 高优先级 UAV 不调高度(我让它),他从原高度穿过去,我在 5s 内爬/降出 vertical_safe 米
-                bool i_go_up = (std::hash<std::string>{}(uav_device_sn_) & 1) == 0;
-                cmd.vertical_bias = i_go_up ? +1.5 : -1.5;
-
+                // 高度还没拉开 → 按方向强避让
+                cmd.vertical_bias = vdir * vertical_avoid_strong_;
                 if (min_dist < collision_threshold_ * 0.6) {
-                    // 极近:停水平让垂直分离时间(给 5s 拉到 vertical_safe=5m 够用)
                     cmd.speed_scale = 0.0;
-                    cmd.reverse_allowed = true;  // 兜底:若垂直来不及,允许回退(暂未实现)
+                    cmd.reverse_allowed = true;
+                    ROS_WARN_THROTTLE(1.0, "%s   → COLLISION-CRITICAL (dist<%.1f): STOP+REVERSE horizontal, vert=%s bias=%+.2f, reverse_allowed=%d",
+                                      TAG.c_str(), collision_threshold_ * 0.6,
+                                      vdir_str, cmd.vertical_bias, cmd.reverse_allowed);
                 } else {
-                    cmd.speed_scale = 0.2;  // 慢行(不停,留点前进降低相对速度)
+                    cmd.speed_scale = 0.2;
+                    ROS_WARN_THROTTLE(1.0, "%s   → COLLISION (dist<%.1f): slow speed_scale=%.2f, vert=%s bias=%+.2f",
+                                      TAG.c_str(), collision_threshold_,
+                                      cmd.speed_scale, vdir_str, cmd.vertical_bias);
                 }
             } else {
-                // 高度已拉开,顺方向加速通过
-                cmd.vertical_bias = (dalt_with_other > 0 ? -1.0 : 1.0) * 0.5;
-                // 负高度差 → 对方在我下 → 我该往下压一点 → vertical_bias 负
+                // 高度已拉开 > vert_safe:垂直不再动作(executor 会锁存保持高度),
+                // 仅减速从上/下方通过
+                cmd.vertical_bias = 0.0;
+                cmd.speed_scale = 0.4;
+                ROS_WARN_THROTTLE(1.0, "%s   → COLLISION-DIST but alt-separated (|dalt|=%.1f>vert_safe=%.1f): hold alt, speed_scale=%.2f",
+                                  TAG.c_str(), std::fabs(dalt_with_other), vertical_safe_,
+                                  cmd.speed_scale);
             }
         } else if (min_dist < proximity_threshold_) {
-            // 警告距离:减速
-            cmd.speed_scale = 0.5;
-            // 高度差如已经较大,微调一下确保不撞
-            if (std::fabs(dalt_with_other) < vertical_safe_ * 0.5) {
-                cmd.vertical_bias = 0.3 * (dalt_with_other > 0 ? -1.0 : 1.0);
-            }
+            // 接近区(prox<dist<coll):仅减速,不做垂直动作。
+            // 垂直避让留到冲突区(<coll)触发,避免过早/过大的高度反应(40m 就抬高太夸张)。
+            // 渐进式减速:在 proximity 边界处 scale=1.0(刚进入时不减速,避免远处就开始"刹车"看不出来),
+            // 线性 ramp 到 collision 边界处 scale=0.3(让靠近碰撞时有明显减速效果)。
+            double t = (proximity_threshold_ - min_dist) /
+                       (proximity_threshold_ - collision_threshold_);
+            t = std::max(0.0, std::min(1.0, t));
+            cmd.speed_scale = 1.0 - 0.7 * t;  // 1.0@prox边界 → 0.3@coll边界
+            ROS_WARN_THROTTLE(1.0, "%s   → PROXIMITY (%.1f<dist<%.1f): ramped speed_scale=%.2f (t=%.2f, no vertical, |dalt|=%.1f)",
+                              TAG.c_str(), collision_threshold_, proximity_threshold_,
+                              cmd.speed_scale, t, std::fabs(dalt_with_other));
         }
 
         // 横向严禁 — 已经在 cmd.lateral_blocked=true / lateral_max=0.0
-
-        // 只在避障真正触发时打印(默认全零的 cmd 不打,免得 20Hz 噪声)
-        if (cmd.speed_scale < 1.0 || std::fabs(cmd.vertical_bias) > 1e-3) {
-            ROS_WARN_THROTTLE(1.0,
-                "[UavAvoidance] AVOID neighbor#%zu dist=%.1fm dalt=%.1fm speed_scale=%.2f vert_bias=%.2f reverse=%d (thresholds coll=%.1f prox=%.1f vert_safe=%.1f)",
-                min_idx, min_dist, dalt_with_other, cmd.speed_scale, cmd.vertical_bias, cmd.reverse_allowed,
-                collision_threshold_, proximity_threshold_, vertical_safe_);
-        }
-
         avoidance_pub_.publish(cmd);
     }
 };

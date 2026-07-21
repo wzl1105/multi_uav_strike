@@ -25,7 +25,6 @@
  * - /target_los_angle               - 目标LOS角度（来自 gimbal_simulator）
  * - /target_estimated_pose           - 目标估计位置（来自 target_estimator）
  * - /target_estimated_twist         - 目标估计速度
- * - /inter_uav/other_uav_poses      - 邻居无人机位置
  * - /inter_uav/target_info           - 其他无人机发现的目标
  * - /mavros/local_position/pose     - 本机位置
  * - /detection/obstacle              - 毫米波雷达障碍检测
@@ -48,7 +47,6 @@
 #include <std_msgs/Float32.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
-#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/Path.h>
@@ -141,7 +139,6 @@ enum class TakeoffState {
 // 内部任务执行阶段 (独立于 WorkMode, 由 mission_manager 自己推进)
 // WorkMode 是 GS 的意图 (SEARCH_*), MissionPhase 是实际在执行什么
 // 引入原因: 地面站把"起飞+航点"打包成一个任务, 期间 WorkMode 由 SET_WORKMODE 控制,
-// 但内部需要在 HOVERING 完成后自动推进到航点跟踪; 推进过程由 phase 表达,不污染 work_mode。
 enum class MissionPhase {
     PHASE_GROUND_IDLE,       // 在地面无任务
     PHASE_TAKING_OFF,        // 正在执行 OFFBOARD+ARM+爬升
@@ -250,7 +247,6 @@ private:
     ros::Subscriber target_est_pose_sub_;
     ros::Subscriber target_est_twist_sub_;
     ros::Subscriber target_est_gps_sub_;   // target_estimated_gps → 目标真实 GPS
-    ros::Subscriber other_uav_poses_sub_;
     ros::Subscriber inter_uav_target_sub_;
     ros::Subscriber self_pose_sub_;
     ros::Subscriber self_gps_sub_;       // mavros/global_position/global → 真实 GPS
@@ -281,7 +277,6 @@ private:
     ros::Publisher guidance_target_pub_;
     ros::Publisher target_filter_debug_pub_;   // 2026-07-16: 位置滤波前后对比 debug topic
     ros::Publisher guidance_speed_pub_;  // 拦截速度(下发到 guidance_control)
-    ros::Publisher avoidance_vector_pub_;
     ros::Publisher emergency_stop_pub_;
     ros::Publisher status_pub_;
     ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
@@ -298,7 +293,6 @@ private:
 
     // ============== 定时器 ==============
     ros::Timer mission_timer_;
-    ros::Timer avoidance_timer_;
     ros::Timer mission_state_timer_;   // Phase 2: 1Hz MissionState 定频上报
     ros::Timer skill_advance_timer_;   // Phase 3: Skill 状态机推进(独立频率)
     ros::Timer tracking_state_timer_;  // 跟踪锁定期间定频发 tracking_state(state=1) 给 GCS
@@ -342,14 +336,6 @@ private:
     // 映射不到时退化为 unknown_label_id_(可配,默认 1)。
     int unknown_label_id_ = 1;
 
-    // 邻居无人机
-    struct NeighborUav {
-        std::string name;
-        double ned_x, ned_y, ned_z;  // 本地 NED 坐标（机间避障用）
-        ros::Time last_update;
-    };
-    std::vector<NeighborUav> neighbors_;
-
     // GPS 参考点(机间避障时将邻居 GPS 转本地 NED)。
     // 不再 yaml 硬编码 — 由 homePositionCallback() 从 PX4 /mavros/home_position/home 自动加载
     double ref_lat_;
@@ -377,9 +363,8 @@ private:
     // static TF 广播器:home 锁定后发一次 map -> viz_frame_
     tf2_ros::StaticTransformBroadcaster static_tf_broadcaster_;
 
-    // 避障参数
-    double avoidance_safe_distance_;
-    geometry_msgs::Point current_avoidance_vector_;
+    // 避障参数 — 旧 avoidance_safe_distance / current_avoidance_vector 已废弃
+    //   (原本发给 /avoidance/vector 无人订阅,机间避让由 uav_avoidance_node + waypoint_executor 接管)
 
     // 毫米波避障参数
     double low_speed_threshold_;  // 12 m/s
@@ -565,7 +550,6 @@ public:
         current_task_status_(TaskStatus::IDLE),
         is_mission_started_(false),
         is_pose_received_(false),
-        avoidance_safe_distance_(10.0),
         is_obstacle_detected_(false),
         obstacle_distance_(100.0),
         low_speed_threshold_(12.0),
@@ -628,7 +612,6 @@ public:
         nh_private_.param<int>("device_id", self_device_id_, 0);
         // uav_device_sn:与 comm_node / uav_avoidance 同名参数,空 → 回落 device_id 字符串("0")
         nh_private_.param<std::string>("uav_device_sn", self_uav_device_sn_, "");
-        nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
         nh_private_.param<double>("low_speed_threshold", low_speed_threshold_, 12.0);
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);
         nh_private_.param<double>("mission_loop_rate", mission_loop_rate_, 50.0);
@@ -770,10 +753,8 @@ public:
             "target_estimated_gps", 10,
             &MissionManager::targetEstGpsCallback, this);
 
-        // 邻居无人机位置
-        other_uav_poses_sub_ = nh_.subscribe(
-            "inter_uav/other_uav_poses", 10,
-            &MissionManager::otherUavPosesCallback, this);
+        // 邻居无人机位置由 uav_avoidance_node 通过 /avoidance/cmd 提供(已带优先级 + cmd 类型),
+        //   本节点不再单独订阅 other_uav_poses(原 repulsion 向量发布到 /avoidance/vector 但无订阅,已删除)。
 
         // 其他无人机发现的目标
         inter_uav_target_sub_ = nh_.subscribe(
@@ -881,9 +862,6 @@ public:
         target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
             "mission/target_filter_debug", 10);
 
-        avoidance_vector_pub_ = nh_.advertise<geometry_msgs::Point>(
-            "avoidance/vector", 10);
-
         emergency_stop_pub_ = nh_.advertise<std_msgs::Bool>(
             "emergency/stop", 10);
 
@@ -943,10 +921,6 @@ public:
         mission_timer_ = nh_.createTimer(
             ros::Duration(1.0 / mission_loop_rate_),
             &MissionManager::missionTimerCallback, this);
-
-        avoidance_timer_ = nh_.createTimer(
-            ros::Duration(1.0 / mission_loop_rate_),
-            &MissionManager::avoidanceTimerCallback, this);
 
         // === Phase 2: MissionState 1Hz 定频上报 ===
         mission_state_timer_ = nh_.createTimer(
@@ -1067,19 +1041,6 @@ public:
         }
     }
 
-    void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        // 更新邻居无人机列表
-        // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
-        neighbors_.clear();
-        for (size_t i = 0; i < msg->poses.size(); ++i) {
-            NeighborUav neighbor;
-            gpsToNed(msg->poses[i].position.x, msg->poses[i].position.y, msg->poses[i].position.z,
-                     neighbor.ned_x, neighbor.ned_y, neighbor.ned_z);
-            neighbor.last_update = ros::Time::now();
-            neighbors_.push_back(neighbor);
-        }
-    }
-
     /**
      * PX4 home 回调 — 锁一次
      * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
@@ -1161,21 +1122,9 @@ public:
     }
 
     /**
-     * GPS (WGS84) -> NED 坐标转换
-     */
-    void gpsToNed(double lat, double lon, double alt,
-                  double& ned_x, double& ned_y, double& ned_z) {
-        const double EARTH_R = 6378137.0;
-        double d_lat = lat - ref_lat_;
-        ned_x = d_lat * M_PI / 180.0 * EARTH_R;  // 北向
-        double d_lon = lon - ref_lon_;
-        ned_y = d_lon * M_PI / 180.0 * EARTH_R * cos(ref_lat_ * M_PI / 180.0);  // 东向
-        ned_z = -(alt - ref_alt_);  // 下向
-    }
-
-    /**
      * NED (本地 NED/Earth 偏移,米) -> GPS (WGS84 lat/lon, AMSL alt 米)
-     * gpsToNed 的反函数;cluster 报告 ned_x/y/z,需要转成 DetectTarget.obj_lat/lon/alt 上行
+     *   旧 gpsToNed 已删除 — 唯一调用者 otherUavPosesCallback 移除后无 caller,
+     *   nedToGps 仍保留给 cluster 上行使用。
      * 注:ref_initialized_ 必须为 true(PX4 home 已锁定)才能保证精度
      */
     void nedToGps(double ned_x, double ned_y, double ned_z,
@@ -3394,15 +3343,9 @@ public:
         return takeoff_state_ == TakeoffState::TAKEOFF_COMPLETE;
     }
 
-    void avoidanceTimerCallback(const ros::TimerEvent&) {
-        // 避障只在"实际执行多机协同任务"阶段开,起飞/地面/悬停/返航期间不计算
-        // (起飞阶段 UAV 垂直分离不会撞,地面静止,悬停等新指令也不需要主动避让)
-        if (current_phase_ == MissionPhase::PHASE_WAYPOINT_FOLLOW ||
-            current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
-            current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE) {
-            computeAndPublishAvoidanceVector();
-        }
-    }
+    // 旧 avoidanceTimerCallback + computeAndPublishAvoidanceVector 已删除 —
+    //   原 repulsion 向量发到 /avoidance/vector 但无订阅,机间避让完全由
+    //   uav_avoidance_node + waypoint_executor 接管,这里不再重复计算。
 
     // ============== Phase 2: MissionState 1Hz 定频上报 ==============
 
@@ -3974,48 +3917,6 @@ public:
         }
     }
 
-    void computeAndPublishAvoidanceVector() {
-        geometry_msgs::Point avoidance_vec;
-        avoidance_vec.x = 0.0;
-        avoidance_vec.y = 0.0;
-        avoidance_vec.z = 0.0;
-
-        if (neighbors_.empty()) {
-            avoidance_vector_pub_.publish(avoidance_vec);
-            return;
-        }
-
-        // 计算机间避障向量（人工势场法）
-        for (const auto& neighbor : neighbors_) {
-            double dx = current_pose_.pose.position.x - neighbor.ned_x;
-            double dy = current_pose_.pose.position.y - neighbor.ned_y;
-            double dz = current_pose_.pose.position.z - neighbor.ned_z;
-            double dist = sqrt(dx*dx + dy*dy + dz*dz);
-
-            if (dist < avoidance_safe_distance_ && dist > 0.1) {
-                // 距离越近，斥力越大
-                double force = (avoidance_safe_distance_ - dist) / dist;
-                avoidance_vec.x += force * dx;
-                avoidance_vec.y += force * dy;
-                avoidance_vec.z += force * dz;
-            }
-        }
-
-        // 限制最大避障向量
-        double max_avoidance = 5.0;
-        double mag = sqrt(avoidance_vec.x*avoidance_vec.x +
-                          avoidance_vec.y*avoidance_vec.y +
-                          avoidance_vec.z*avoidance_vec.z);
-        if (mag > max_avoidance) {
-            avoidance_vec.x *= max_avoidance / mag;
-            avoidance_vec.y *= max_avoidance / mag;
-            avoidance_vec.z *= max_avoidance / mag;
-        }
-
-        current_avoidance_vector_ = avoidance_vec;
-        avoidance_vector_pub_.publish(avoidance_vec);
-    }
-
     void reportTargetToGs() {
         // 通过 comm_node 回传目标信息（由 comm_node 处理）
         // 这里只是标记
@@ -4049,8 +3950,7 @@ public:
             << "status:" << taskStatusToString() << ";"
             << "target_locked:" << (current_target_.is_locked ? "true" : "false") << ";"
             << "spiral_active:" << (is_spiral_active_ ? "true" : "false") << ";"
-            << "guidance_active:" << (is_guidance_active_ ? "true" : "false") << ";"
-            << "neighbors:" << neighbors_.size();
+            << "guidance_active:" << (is_guidance_active_ ? "true" : "false");
 
         status.data = oss.str();
         status_pub_.publish(status);

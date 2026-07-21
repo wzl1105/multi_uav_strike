@@ -658,43 +658,43 @@ DEMO_FLOWS = {
             },
             {
                 # 集结点直接 = 共享原点 = uav0_home 上空 30m
-                "skill_id": "uav0_gather",
-                "skill_type": 101,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 4.0,
-                "arrive_path": [],
-                "skill_area_path": [(0.0, 0.0, 30.0)],
-            },
-            {
-                # 顺时针方块 8m × 8m,中心 = uav0_home
                 "skill_id": "uav0_search",
                 "skill_type": 102,
                 "priority": 100,
                 "cruise_speed": 5.0,
                 "task_speed": 4.0,
                 "arrive_path": [],
-                "skill_area_path": [
-                    (4.0, 0.0, 30.0),    # E
-                    (4.0, 4.0, 30.0),    # NE
-                    (0.0, 4.0, 30.0),    # N
-                    (-4.0, 4.0, 30.0),   # NW
-                    (-4.0, 0.0, 30.0),   # W
-                    (-4.0, -4.0, 30.0),  # SW
-                    (0.0, -4.0, 30.0),   # S
-                    (4.0, -4.0, 30.0),   # SE
-                    (4.0, 0.0, 30.0),    # 回 E
-                ],
-            },
-            {
-                "skill_id": "uav0_return",
-                "skill_type": 103,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 5.0,
-                "arrive_path": [],
                 "skill_area_path": [(0.0, 0.0, 30.0)],
             },
+            # {
+            #     # 顺时针方块 8m × 8m,中心 = uav0_home
+            #     "skill_id": "uav0_search",
+            #     "skill_type": 102,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 4.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [
+            #         (4.0, 0.0, 30.0),    # E
+            #         (4.0, 4.0, 30.0),    # NE
+            #         (0.0, 4.0, 30.0),    # N
+            #         (-4.0, 4.0, 30.0),   # NW
+            #         (-4.0, 0.0, 30.0),   # W
+            #         (-4.0, -4.0, 30.0),  # SW
+            #         (0.0, -4.0, 30.0),   # S
+            #         (4.0, -4.0, 30.0),   # SE
+            #         (4.0, 0.0, 30.0),    # 回 E
+            #     ],
+            # },
+            # {
+            #     "skill_id": "uav0_return",
+            #     "skill_type": 103,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 5.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [(0.0, 0.0, 30.0)],
+            # },
         ],
     },
 
@@ -716,43 +716,45 @@ DEMO_FLOWS = {
             },
             {
                 # 集结点:共享 (0, 0) → uav1_NED = (0 - 13.82, 0 + 4.29) = (-13.82, 4.29, 30)
-                "skill_id": "uav1_gather",
-                "skill_type": 101,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 4.0,
-                "arrive_path": [],
-                "skill_area_path": [(-13.82, 4.29, 30.0)],
-            },
-            {
-                # 逆时针方块 8m × 8m,中心 = uav0_home(共享原点)
-                "skill_id": "uav1_search",
+                "skill_id": "uav1_searech",
                 "skill_type": 102,
                 "priority": 100,
                 "cruise_speed": 5.0,
                 "task_speed": 4.0,
                 "arrive_path": [],
-                "skill_area_path": [
-                    (-9.82, 4.29, 30.0),    # 共享 (4, 0)   E
-                    (-9.82, 8.29, 30.0),    # 共享 (4, 4)   NE
-                    (-13.82, 8.29, 30.0),   # 共享 (0, 4)   N
-                    (-17.82, 8.29, 30.0),   # 共享 (-4, 4)  NW
-                    (-17.82, 4.29, 30.0),   # 共享 (-4, 0)  W
-                    (-17.82, 0.29, 30.0),   # 共享 (-4, -4) SW
-                    (-13.82, 0.29, 30.0),   # 共享 (0, -4)  S
-                    (-9.82, 0.29, 30.0),    # 共享 (4, -4)  SE
-                    (-9.82, 4.29, 30.0),    # 回 E
-                ],
+                "skill_area_path": [(-13.82, 4.29, 30.0),
+                                    (-13.82, 40.29, 30.0),
+                                    (-20.82, 4.29, 30.0),],
             },
-            {
-                "skill_id": "uav1_return",
-                "skill_type": 103,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 5.0,
-                "arrive_path": [],
-                "skill_area_path": [(-13.82, 4.29, 30.0)],
-            },
+            # {
+            #     # 逆时针方块 8m × 8m,中心 = uav0_home(共享原点)
+            #     "skill_id": "uav1_search",
+            #     "skill_type": 102,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 4.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [
+            #         (-9.82, 4.29, 30.0),    # 共享 (4, 0)   E
+            #         (-9.82, 8.29, 30.0),    # 共享 (4, 4)   NE
+            #         (-13.82, 8.29, 30.0),   # 共享 (0, 4)   N
+            #         (-17.82, 8.29, 30.0),   # 共享 (-4, 4)  NW
+            #         (-17.82, 4.29, 30.0),   # 共享 (-4, 0)  W
+            #         (-17.82, 0.29, 30.0),   # 共享 (-4, -4) SW
+            #         (-13.82, 0.29, 30.0),   # 共享 (0, -4)  S
+            #         (-9.82, 0.29, 30.0),    # 共享 (4, -4)  SE
+            #         (-9.82, 4.29, 30.0),    # 回 E
+            #     ],
+            # },
+            # {
+            #     "skill_id": "uav1_return",
+            #     "skill_type": 103,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 5.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [(-13.82, 4.29, 30.0)],
+            # },
         ],
     },
 
@@ -774,43 +776,45 @@ DEMO_FLOWS = {
             },
             {
                 # 集结点:共享 (0, 0) → uav2_NED = (0 - 28.36, 0 + 2.49) = (-28.36, 2.49, 30)
-                "skill_id": "uav2_gather",
-                "skill_type": 101,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 4.0,
-                "arrive_path": [],
-                "skill_area_path": [(-28.36, 2.49, 30.0)],
-            },
-            {
-                # 对角方块 8m × 8m,中心 = uav0_home,起点错开(从 SW 开始)
                 "skill_id": "uav2_search",
                 "skill_type": 102,
                 "priority": 100,
                 "cruise_speed": 5.0,
                 "task_speed": 4.0,
                 "arrive_path": [],
-                "skill_area_path": [
-                    (-32.36, -1.51, 30.0),   # 共享 (-4, -4) SW  (起点)
-                    (-28.36, -1.51, 30.0),   # 共享 (0, -4)  S
-                    (-24.36, -1.51, 30.0),   # 共享 (4, -4)  SE
-                    (-24.36, 2.49, 30.0),    # 共享 (4, 0)   E
-                    (-24.36, 6.49, 30.0),    # 共享 (4, 4)   NE
-                    (-28.36, 6.49, 30.0),    # 共享 (0, 4)   N
-                    (-32.36, 6.49, 30.0),    # 共享 (-4, 4)  NW
-                    (-32.36, 2.49, 30.0),    # 共享 (-4, 0)  W
-                    (-32.36, -1.51, 30.0),   # 回 SW
-                ],
+                "skill_area_path": [(-28.36, 2.49, 30.0),
+                                    (-28.36, 20.49, 30.0),
+                                    (-0.36, 2.49, 30.0)],
             },
-            {
-                "skill_id": "uav2_return",
-                "skill_type": 103,
-                "priority": 100,
-                "cruise_speed": 5.0,
-                "task_speed": 5.0,
-                "arrive_path": [],
-                "skill_area_path": [(-28.36, 2.49, 30.0)],
-            },
+            # {
+            #     # 对角方块 8m × 8m,中心 = uav0_home,起点错开(从 SW 开始)
+            #     "skill_id": "uav2_search",
+            #     "skill_type": 102,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 4.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [
+            #         (-32.36, -1.51, 30.0),   # 共享 (-4, -4) SW  (起点)
+            #         (-28.36, -1.51, 30.0),   # 共享 (0, -4)  S
+            #         (-24.36, -1.51, 30.0),   # 共享 (4, -4)  SE
+            #         (-24.36, 2.49, 30.0),    # 共享 (4, 0)   E
+            #         (-24.36, 6.49, 30.0),    # 共享 (4, 4)   NE
+            #         (-28.36, 6.49, 30.0),    # 共享 (0, 4)   N
+            #         (-32.36, 6.49, 30.0),    # 共享 (-4, 4)  NW
+            #         (-32.36, 2.49, 30.0),    # 共享 (-4, 0)  W
+            #         (-32.36, -1.51, 30.0),   # 回 SW
+            #     ],
+            # },
+            # {
+            #     "skill_id": "uav2_return",
+            #     "skill_type": 103,
+            #     "priority": 100,
+            #     "cruise_speed": 5.0,
+            #     "task_speed": 5.0,
+            #     "arrive_path": [],
+            #     "skill_area_path": [(-28.36, 2.49, 30.0)],
+            # },
         ],
     },
 }
@@ -824,7 +828,7 @@ class GroundStationSimulator:
         self.uav_ns = uav_ns
         self.device_id = device_id
 
-        # === 期望集结伙伴 SN 列表(逗号分隔,如 "uav0,uav1,uav2")===
+        # === 期望集结伙伴 SN 列表(逗号分隔,如 "1-1,1-2,1-3")===
         # 仅对 skill_type=101 (Gather) 生效:会以 "devices_sn" 字段注入到 params_json,
         # mission_manager 端 mission_manager 解析后用作多机同步门控。
         # 单机/未设置 → 不注入,mission_manager 走 single_uav_arrived 老路径。

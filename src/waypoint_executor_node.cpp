@@ -22,7 +22,7 @@
  * 订阅：
  * - /mission/waypoint_cmd           - GPS 航点命令（来自 mission_manager 或地面站）
  * - /quad/pose 或 /mavros/local_position/pose - 本机位置（NED）
- * - /inter_uav/other_uav_poses     - 邻居无人机位置
+ * - /<ns>/avoidance/cmd             - 避障指令（来自 uav_avoidance_node,带优先级+cmd类型）
  *
  * 发布：
  * - /quad/setpoint_velocity/cmd_vel_unstamped 或 /mavros/... - NED 速度指令
@@ -33,7 +33,6 @@
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
-#include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PointStamped.h>
 #include <nav_msgs/Path.h>
@@ -69,7 +68,6 @@ private:
     // ============== 订阅 ==============
     ros::Subscriber waypoint_cmd_sub_;       // GPS 航点命令
     ros::Subscriber self_pose_sub_;          // 本机位置（NED）
-    ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
@@ -126,6 +124,10 @@ private:
     // 最新 AvoidanceCmd(默认值:全不约束)
     multi_uav_strike::AvoidanceCmd latest_avoidance_;
     bool has_latest_avoidance_;
+    // 垂直避让"接管 + 锁存":一旦避让开始控制高度,就锁住已到达的高度,
+    // 直到冲突彻底解除才交还给航点。避免"被抬高 → 航点又拉回 → 再抬高"的高度震荡。
+    bool   vert_takeover_ = false;
+    double avoid_hold_z_  = 0.0;   // 锁存的目标高度(NED, down 为正)
 
     enum class BuildingAvoidanceState { CRUISE, CLIMBING, HOLD_HIGH };
     BuildingAvoidanceState building_avoidance_state_;
@@ -159,6 +161,8 @@ private:
 
     // 航向控制(P-controller 输出角速度用)
     double yaw_max_rate_;       // 最大角速度 rad/s(由 ~yaw_max_rate 配置)
+    double yaw_speed_gate_;     // 水平速度门控:m/s,低于此值时冻结 yaw 角速度输出
+                                // (避免 CRITICAL stop+reverse 时 UAV 几乎不动但 yaw 仍追 bearing → 原地打转)
 
     // ============== 参数 ==============
     double executor_rate_;
@@ -185,12 +189,8 @@ private:
     // 航向控制选择：true=跟踪地面站发送的航点期望航向，false=计算航点指向
     bool use_desired_yaw_from_wp_;
 
-    // 邻居无人机
-    struct NeighborUav {
-        double ned_x, ned_y, ned_z;
-    };
-    std::vector<NeighborUav> neighbors_;
-    double avoidance_safe_distance_;
+    // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
+    double reverse_speed_;
 
     // 无人机编号（用于区分颜色）
     int uav_id_;
@@ -212,7 +212,7 @@ public:
         is_executing_(false),
         is_pose_received_(false),
         uav_speed_(5.0),
-        uav_vertical_speed_(1.0),
+        uav_vertical_speed_(3.0),
         arrival_threshold_(1.0),
         executor_rate_(50.0),
         flight_mode_velocity_(0),
@@ -221,7 +221,6 @@ public:
         ref_lon_(0.0),
         ref_alt_(0.0),
         use_sim_(true),
-        avoidance_safe_distance_(10.0),
         last_waypoint_reached_logged_(false),
         hold_kp_(0.8),
         yaw_max_rate_(1.0),
@@ -271,11 +270,19 @@ public:
         nh_private_.param<double>("final_approach_threshold", final_approach_threshold_, 2.5);
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
-        nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
+        // 避障 reverse_allowed 生效时沿段方向后退的速度 (m/s)
+        nh_private_.param<double>("reverse_speed", reverse_speed_, 1.0);
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
+        // 水平速度门控(m/s):低于此值冻结 yaw 角速度输出,避免 CRITICAL 避让
+        //   时身体几乎不动但 yaw 仍死追 bearing → 原地打转。默认 0.5 m/s,
+        //   - PROXIMITY 边界(40m): scale=1.0 → v≈5 m/s > 0.5 → 正常跟踪
+        //   - PROXIMITY→COLLISION 边界(20m): scale=0.3 → v≈1.5 m/s > 0.5 → 仍跟踪
+        //   - COLLISION: scale=0.2 → v≈1 m/s > 0.5 → 仍跟踪
+        //   - CRITICAL: scale=0.0 → v≈0 < 0.5 → **冻结 yaw**
+        nh_private_.param<double>("yaw_speed_gate", yaw_speed_gate_, 0.5);
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
         nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
@@ -339,10 +346,8 @@ public:
             pose_topic_, 10,
             &WaypointExecutor::selfPoseCallback, this);
 
-        // 邻居无人机位置
-        other_uav_poses_sub_ = nh_.subscribe(
-            "inter_uav/other_uav_poses", 10,
-            &WaypointExecutor::otherUavPosesCallback, this);
+        // 邻居无人机位置由 uav_avoidance_node 通过 /avoidance/cmd 提供(已带优先级 + cmd 类型),
+        //   本节点只消费 avoidance cmd,不再单独订阅 other_uav_poses。
 
         // 控制命令（来自 mission_manager）
         control_sub_ = nh_.subscribe(
@@ -552,18 +557,6 @@ public:
         current_yaw_ned_ = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz));
 
         is_pose_received_ = true;
-    }
-
-    void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
-        neighbors_.clear();
-        for (const auto& pose : msg->poses) {
-            NeighborUav neighbor;
-            // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
-            // 转换为本地 NED
-            gpsToNed(pose.position.x, pose.position.y, pose.position.z,
-                     neighbor.ned_x, neighbor.ned_y, neighbor.ned_z);
-            neighbors_.push_back(neighbor);
-        }
     }
 
     // ============== 定时器回调 ==============
@@ -808,35 +801,62 @@ public:
     /**
      * 把 AvoidanceCmd 应用到速度指令
      * 横向严禁(lateral_blocked=true)→ 强制 vx,vy = 沿段方向分量(去掉横向偏差)
-     * vertical_bias → 加到 vz
+     * vertical_bias → 向上爬升速率(正=向上,负=向下),叠加到 vz
      * speed_scale → 乘到 vx,vy(速度调整)
-     * reverse_allowed 且仍需让 → 允许 vx,vy 反向(简化:不实现)
+     * reverse_allowed → critical 冲突时沿段方向反向后退,主动拉开水平距离
      *
      * @param seg_bearing_ned 段方位角(NED),用于横向严禁时把速度投影到段方向
      */
     void applyAvoidanceCmd(double& vx, double& vy, double& vz, double seg_bearing_ned) {
         if (!has_latest_avoidance_) return;
 
-        // 1. 高度 bias(直接加)
-        vz += static_cast<double>(latest_avoidance_.vertical_bias);
+        double vbias   = static_cast<double>(latest_avoidance_.vertical_bias);
+        double scale   = static_cast<double>(latest_avoidance_.speed_scale);
+        bool   reverse = latest_avoidance_.reverse_allowed;
 
-        // 2. 速度缩放
-        double scale = static_cast<double>(latest_avoidance_.speed_scale);
+        // 是否处于"避让中"(默认 cmd 是 lateral_blocked=true/speed=1/bias=0/no-reverse,
+        // 所以用 speed<1 || bias!=0 || reverse 判定真正在避让)
+        bool avoiding = (scale < 0.999) || (std::fabs(vbias) > 1e-3) || reverse;
+
+        // ===== 垂直:避让接管 + 高度锁存(消除高度来回跳)=====
+        // vertical_bias = "向上爬升速率"(正=上,负=下);executor 内 vz 是 NED(down 正),上=负。
+        if (std::fabs(vbias) > 1e-3) {
+            // 冲突区有垂直避让指令 → 直接接管 vz 爬升/俯冲,并持续锁存当前高度
+            vz = -vbias;
+            vert_takeover_ = true;
+            avoid_hold_z_  = current_ned_z_;
+        } else if (vert_takeover_ && avoiding) {
+            // 已完成垂直分离但冲突尚未解除 → 锁定在已爬升到的高度,
+            // 不让航点把高度拉回去(P-control 保持 avoid_hold_z_)
+            vz = hold_kp_ * (avoid_hold_z_ - current_ned_z_);
+            if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+            if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+        } else {
+            // 冲突彻底解除 → 交还垂直控制给航点(vz 用调用方算好的航点跟踪值)
+            vert_takeover_ = false;
+        }
+
+        // ===== 水平:速度缩放 =====
         vx *= scale;
         vy *= scale;
 
-        // 3. 横向严禁 — L1 压航线后 vx,vy 有切向 + 横向分量,
-        //    把速度投影到段方向上,只保留切向,清除横向偏差补偿
+        double cos_b = cos(seg_bearing_ned);
+        double sin_b = sin(seg_bearing_ned);
+
+        // 横向严禁 — 把速度投影到段方向上,只保留切向,清除横向偏差补偿
         if (latest_avoidance_.lateral_blocked) {
-            double cos_b = cos(seg_bearing_ned);
-            double sin_b = sin(seg_bearing_ned);
             double v_along = vx * cos_b + vy * sin_b;
             vx = cos_b * v_along;
             vy = sin_b * v_along;
-            ROS_DEBUG_THROTTLE(5.0, "[WaypointExecutor] lateral_blocked=true (投影到段方向,横向清零)");
+            ROS_DEBUG_THROTTLE(5.0, "[WaypointExecutor] lateral_blocked=true (proj to segment, lateral cleared)");
         }
 
-        // reverse_allowed:本批次简化不实现
+        // reverse_allowed(critical 冲突):沿段方向反向后退,主动拉开水平距离
+        if (reverse) {
+            vx += -cos_b * reverse_speed_;
+            vy += -sin_b * reverse_speed_;
+            ROS_WARN_THROTTLE(1.0, "[WaypointExecutor] reverse_allowed=true -> back along segment %.1f m/s", reverse_speed_);
+        }
     }
 
     /**
@@ -930,11 +950,14 @@ public:
         // 角度环绕到 [-π, π](避免 ±180° 边界时选错方向)
         while (yaw_error_ned >  M_PI) yaw_error_ned -= 2.0 * M_PI;
         while (yaw_error_ned < -M_PI) yaw_error_ned += 2.0 * M_PI;
-        // P 控制 + 死区 + 限幅
+        // P 控制 + 死区 + 速度门控 + 限幅
         const double yaw_kp       = 2.0;   // 比例增益(典型 1.0~3.0)
         const double yaw_deadband = 0.05;  // ~3° 死区,避免小幅抖动
         double yaw_rate_ned = 0.0;
-        if (fabs(yaw_error_ned) > yaw_deadband) {
+        // 水平速度门控:水平速度过低(典型场景:CRITICAL 避让中 vx≈vy≈0)时冻结 yaw,
+        //   否则身体几乎不动但 yaw 仍死追 L1 bearing → 看起来"原地自由旋转"。
+        const double v_horiz = sqrt(vx*vx + vy*vy);
+        if (v_horiz > yaw_speed_gate_ && fabs(yaw_error_ned) > yaw_deadband) {
             yaw_rate_ned = yaw_kp * yaw_error_ned;
             if (yaw_rate_ned >  yaw_max_rate_) yaw_rate_ned =  yaw_max_rate_;
             if (yaw_rate_ned < -yaw_max_rate_) yaw_rate_ned = -yaw_max_rate_;
