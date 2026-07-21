@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<launch>
+  <node name="target_motion_simulator_node"
+        pkg="multi_uav_strike"
+        type="target_motion_simulator_node"
+        output="screen"
+        respawn="false">
+    <rosparam command="load"
+              file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
+  </node>
+</launch>

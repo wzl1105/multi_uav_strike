@@ -125,8 +125,8 @@ DEMO_FLOWS = {
                 "skill_id": "search_track_001",
                 "skill_type": 102,
                 "priority": 100,
-                "cruise_speed": 8.0,
-                "task_speed": 6.0,
+                "cruise_speed": 20.0,
+                "task_speed": 20.0,
                 "arrive_path": [
                     (50.0, 0.0, 30.0),
                     (50.0, 50.0, 30.0),

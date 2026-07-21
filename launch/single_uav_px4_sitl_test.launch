@@ -54,14 +54,14 @@
   <!-- ====================================================================== -->
   <!-- 2. 目标运动模拟（仿真目标车辆）                                          -->
   <!-- ====================================================================== -->
-  <node name="target_motion_simulator_node"
+  <!-- <node name="target_motion_simulator_node"
         pkg="multi_uav_strike"
         type="target_motion_simulator_node"
         output="screen"
         respawn="false">
     <rosparam command="load"
               file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
-  </node>
+  </node> -->
 
   <!-- ====================================================================== -->
   <!-- 3. 云台模拟节点                                                          -->

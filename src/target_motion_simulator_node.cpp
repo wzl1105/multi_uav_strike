@@ -41,6 +41,10 @@ private:
         double x = 0.0, y = 0.0;
         double vx = 0.0, vy = 0.0;
         double theta = 0.0, omega = 0.0;
+
+        // 初始运动参数
+        double speed_init = 1.0;
+        double heading_init = 0.0;
         // 运动参数(每目标独立)
         double max_speed = 10.0;
         double min_speed = 1.0;
@@ -96,8 +100,10 @@ public:
         ROS_INFO("[TargetMotionSim] initialized with %zu target(s), primary_index=%d",
                  targets_.size(), primary_index_);
         for (const auto& t : targets_) {
-            ROS_INFO("  target[%u] label=%s init=(%.1f,%.1f) max_speed=%.2f",
-                     t.id, t.label.c_str(), t.x, t.y, t.max_speed);
+            // ROS_INFO("  target[%u] label=%s init=(%.1f,%.1f) max_speed=%.2f",
+            //          t.id, t.label.c_str(), t.x, t.y, t.max_speed);
+            ROS_INFO("target[%u] %s pos=(%.1f %.1f) speed=%.1f heading=%.1fdeg",
+                        t.id, t.label.c_str(), t.x, t.y, t.speed_init, t.heading_init*180/M_PI);
         }
     }
 
@@ -112,12 +118,21 @@ public:
                 t.label              = getStr(item, "label", "general_target");
                 t.x                  = getNum(item, "x_init", 0.0);
                 t.y                  = getNum(item, "y_init", 0.0);
+                // 初始速度
+                t.speed_init         = getNum(item,"speed_init",t.min_speed);
+                // 初始方向
+                t.heading_init       = getNum(item,"heading_init",0.0) * M_PI / 180.0;
+                t.theta = t.heading_init;
+                // 根据速度和方向计算速度分量
+                t.vx = t.speed_init * cos(t.theta);
+                t.vy = t.speed_init * sin(t.theta);
+
                 t.max_speed          = getNum(item, "max_speed", def_max_speed_);
                 t.min_speed          = getNum(item, "min_speed", def_min_speed_);
                 t.max_tangential_acc = getNum(item, "max_tangential_acc", def_max_tang_acc_);
                 t.max_normal_acc     = getNum(item, "max_normal_acc", def_max_norm_acc_);
-                t.vx = t.min_speed;
-                t.vy = 0.0;
+                // t.vx = t.min_speed;
+                // t.vy = 0.0;
                 targets_.push_back(t);
             }
         }
@@ -132,7 +147,15 @@ public:
             t.min_speed = def_min_speed_;
             t.max_tangential_acc = def_max_tang_acc_;
             t.max_normal_acc = def_max_norm_acc_;
-            t.vx = t.min_speed;
+
+            // t.vx = t.min_speed;
+            n.param<double>("speed_init", t.speed_init, t.min_speed);
+            n.param<double>("heading_init", t.heading_init, 0.0);
+            t.heading_init *= M_PI/180.0;
+            t.theta = t.heading_init;
+            t.vx    = t.speed_init*cos(t.theta);
+            t.vy    = t.speed_init*sin(t.theta);
+
             targets_.push_back(t);
             ROS_WARN("[TargetMotionSim] no ~targets list found, fell back to single target");
         }

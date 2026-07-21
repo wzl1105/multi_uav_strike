@@ -12,8 +12,8 @@
 # ============================================================================
 targets:
   # ===== 静止人员 (基础回归:hit_count 晋升 + 多目标不串) =====
-  - {label: "person", x_init:  60.0, y_init: -100.0, max_speed: 0.0}    # 原:静止人 1 (116m)
-  - {label: "person", x_init:   0.0, y_init: -205.0, max_speed: 1.0, max_normal_acc: 0.5}  # 原:慢速人 (205m)
+  #- {label: "person", x_init:  60.0, y_init: -100.0, max_speed: 0.0}    # 原:静止人 1 (116m)
+  #- {label: "person", x_init:   0.0, y_init: -205.0, max_speed: 1.0, max_normal_acc: 0.5}  # 原:慢速人 (205m)
   # - {label: "person", x_init:  90.0, y_init:  -50.0, max_speed: 0.0}    # 静止人 2 (NE 102m)
   # - {label: "person", x_init: -50.0, y_init: -150.0, max_speed: 0.0}    # 静止人 3 (SW 158m)
   # - {label: "person", x_init: 130.0, y_init: -100.0, max_speed: 0.0}    # 静止人 4 (E 164m)
@@ -24,9 +24,18 @@ targets:
   # - {label: "person", x_init: 100.0, y_init: -200.0, max_speed: 0.5, max_normal_acc: 0.3}                            # 慢移老人 0.5m/s
 
   # # ===== 车辆 (验证 label-only 匹配,不该与人合并) =====
-  # - {label: "car",    x_init: 100.0, y_init: -180.0, max_speed: 5.0, max_tangential_acc: 2.0, max_normal_acc: 1.0}   # 5m/s 慢速车
+  # - {label: "car",    x_init: 30.0, y_init: 20.0, max_speed: 5.0, max_tangential_acc: 2.0, max_normal_acc: 1.0}   # 5m/s 慢速车
   # - {label: "car",    x_init: -120.0, y_init: -100.0, max_speed: 8.0, max_tangential_acc: 3.0, max_normal_acc: 1.5}  # 8m/s 较快车
   # - {label: "truck",  x_init:  50.0, y_init: -250.0, max_speed: 4.0, max_tangential_acc: 1.5, max_normal_acc: 0.8}   # 卡车 (远距 256m,验证反向视角投影)
+  # label:speed_init:初速度(m/s) heading_init:初始方向角(deg) max_speed:最大速度(m/s) max_tangential_acc:最大切向加速度(m/s²) max_normal_acc:最大法向加速度(m/s²)
+   - {label: "car1", x_init: 90.0, y_init: -80.0, speed_init: 17 , heading_init: 45.0, max_speed: 17.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car2", x_init: -130.0, y_init: -30.0, speed_init: 5.0 , heading_init: -45.0, max_speed: 6.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car3", x_init: -70.0, y_init: 20.0, speed_init: 6.0 , heading_init: -90.0, max_speed: 8.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car4", x_init: -50.0, y_init: -80.0, speed_init: 8.0 , heading_init: 90.0, max_speed: 10.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car5", x_init: 30.0, y_init: 50.0, speed_init: 17 , heading_init: -90.0, max_speed: 17.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car6", x_init: 120.0, y_init: -100.0, speed_init: 17 , heading_init: -30.0, max_speed: 17.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car7", x_init: -200.0, y_init: 50.0, speed_init: 17 , heading_init: 45.0, max_speed: 17.0, max_tangential_acc: 2.0, max_normal_acc: 0.0}
+   - {label: "car8", x_init: 90.0, y_init: -80.0, speed_init: 0.0, heading_init: 45.0, max_speed: 0.0, max_tangential_acc: 0.0, max_normal_acc: 0.0}  #静止目标
 
 # /target_position(Point,兼容 topic)取哪个目标作为主目标
 # === 2026-07-16: 测试多目标,默认指向新增的远距卡车,验证反向视角投影 + 大距离稳定性 ===
