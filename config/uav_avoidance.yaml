@@ -4,12 +4,16 @@
 # ============================================================================
 collision_threshold: 15.0   # 极近距离（m），需要立即让
 proximity_threshold: 40.0 # 警告距离（m），需要减速
+# 高速接近时按闭合速度(cs)扩大阈值:effective=max(固定阈值,反应时间*cs)
+collision_t_react: 1.5     # 冲突区反应时间（s）
+proximity_t_react: 2.0     # 接近区反应时间（s）
+max_avoid_t_react: 2.5     # 最大避障距离反应时间（s）
 vertical_safe: 8.0         # 高度安全差（m），<此值需调高度
 # 垂直避让方向 buffer(m):dalt = 对方高度 - 本机高度(正=对方在上方)
 #   dalt <  vertical_buffer → 向上爬升避让(我等高/更高/仅略低）
 #   dalt >= vertical_buffer → 向下俯冲避让(我明显在对方下方）
 vertical_buffer: 2.0
-vertical_avoid_strong: 2.5 # 冲突区垂直避让速率（m/s）
+vertical_avoid_strong: 5.0 # 冲突区垂直避让速率（m/s）
 vertical_avoid_mild: 1.5   # 接近区垂直避让速率（m/s）
 max_avoid_distance: 120.0  # 超过此距离直接判定"无需避障"(原硬编码 50m)
 loop_freq: 20.0            # 控制循环频率（Hz）

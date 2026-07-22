@@ -8,5 +8,6 @@ int32   skill_type
 int32   state
 # 当前任务执行阶段 (mission_manager 的 MissionPhase 枚举值),GS 用此判断 UAV 是 waypoint-following / guidance-striking / holding
 #   0 = GROUND_IDLE, 1 = TAKING_OFF, 2 = HOVERING, 3 = WAYPOINT_FOLLOW, 4 = GUIDANCE_TRACK,
-#   5 = GUIDANCE_STRIKE, 6 = RETURNING, 7 = COMPLETE, 8 = FAILED, 9 = HOLDING
+#   5 = GUIDANCE_STRIKE, 6 = RETURNING, 7 = COMPLETE, 8 = FAILED, 9 = HOLDING,
+#   10 = OVERRIDDEN, 11 = TARGET_LOST_HOVER
 uint8   phase

@@ -149,7 +149,9 @@ enum class MissionPhase {
     PHASE_RETURNING,         // 返航
     PHASE_COMPLETE,          // 任务完成
     PHASE_FAILED,            // 失败
-    PHASE_HOLDING            // 所有 skill 完成后原地悬停, 等新 task_flow
+    PHASE_HOLDING,           // 所有 skill 完成后原地悬停, 等新 task_flow
+    PHASE_OVERRIDDEN,        // 飞手接管(PX4 mode != OFFBOARD);机载感知,等 GS 发起恢复
+    PHASE_TARGET_LOST_HOVER  // 目标丢失悬停(Guidance 阶段 target 消失后保持位置)
 };
 
 // === Phase 2: Skill 生命周期 ===
@@ -448,6 +450,27 @@ private:
     bool        landing_complete_logged_;    // 是否已打印"落地完成"日志(避免刷屏)
     double      landing_safety_timeout_sec_; // 着陆后仍未 disarm 的兜底超时(秒)
 
+    // === 飞手接管感知与受控恢复(2026-07-23) ===
+    // PX4 FC mode 离开 OFFBOARD 时视为飞手接管。接管瞬间写一次快照,
+    //   切回 OFFBOARD 时按快照 resume(详见 mavrosStateCallback / executeRecoveryFromOverride)。
+    bool        is_fcu_overridden_       = false;
+    ros::Time   override_enter_time_;
+    struct OverrideSnapshot {
+        MissionPhase phase_when_overrided;
+        WorkMode     work_mode_when_overrided;
+        std::string  flow_id_when_overrided;
+        std::string  skill_id_when_overrided;
+        ros::Time    snapshot_time;
+    } override_snapshot_;
+
+    // === 目标丢失状态机(2026-07-23) ===
+    // Guidance 阶段(SEARCH_TRACK/STRIKE)目标消失后,先 hover 在原位一段时间,
+    //   超过更长时间则回到 WAYPOINT_FOLLOW 继续扫。
+    ros::Time   target_lost_hover_enter_time_;
+    bool        target_lost_hover_active_   = false;
+    double      target_lost_hold_sec_       = 2.0;   // GUIDANCE_* → TARGET_LOST_HOVER 阈值
+    double      target_lost_resume_sec_     = 10.0;  // TARGET_LOST_HOVER → WAYPOINT_FOLLOW 阈值
+
     // ============== MissionPhase 状态机 ==============
     MissionPhase current_phase_;         // 当前任务执行阶段
     bool is_waypoints_received_;         // 地面站是否已下发航点
@@ -579,6 +602,10 @@ public:
         landing_start_time_(ros::Time()),
         landing_complete_logged_(false),
         landing_safety_timeout_sec_(120.0),  // AUTO.LAND 兜底超时 120s
+        is_fcu_overridden_(false),
+        override_enter_time_(ros::Time()),
+        target_lost_hover_enter_time_(ros::Time()),
+        target_lost_hover_active_(false),
         current_phase_(MissionPhase::PHASE_GROUND_IDLE),
         is_waypoints_received_(false),
         current_waypoint_count_(0),
@@ -726,6 +753,11 @@ public:
         ROS_INFO("[MissionManager] Gather sync: heartbeat_timeout=%.1fs, threshold=%.2f",
                  partner_heartbeat_timeout_, gather_threshold_);
 
+        // === 目标丢失状态机参数(2026-07-23) ===
+        // Guidance 阶段目标消失后,先进入 hover 一段时间(航向保持),
+        //   再超时则回 WAYPOINT_FOLLOW 继续扫。
+        nh_private_.param<double>("target_lost_hold_sec",   target_lost_hold_sec_,   2.0);
+        nh_private_.param<double>("target_lost_resume_sec", target_lost_resume_sec_, 10.0);
     }
 
     void initSubscribers() {
@@ -1167,6 +1199,99 @@ public:
         if (is_offboard_mode_ && !isTakeoffComplete()) {
             ROS_WARN_THROTTLE(5.0, "[MissionManager] OFFBOARD mode detected, waiting for takeoff complete...");
         }
+
+        // === 2026-07-23: 飞手接管检测 + AUTO.LAND 完成收尾 ===
+        // 接管判定:PX4 mode != OFFBOARD,且当前 phase 处于飞行阶段 (排除 GROUND_IDLE / FAILED / COMPLETE)。
+        // 快照规则:只在 OFFBOARD → 其他模式的瞬变上写,后续模式跳变保留首次快照(用户口径 B)。
+        bool prev_override = is_fcu_overridden_;
+        bool aircraft_live_phase =
+            current_phase_ != MissionPhase::PHASE_GROUND_IDLE &&
+            current_phase_ != MissionPhase::PHASE_FAILED &&
+            current_phase_ != MissionPhase::PHASE_COMPLETE;
+        is_fcu_overridden_ = (msg->mode != "OFFBOARD") && aircraft_live_phase;
+
+        if (is_fcu_overridden_ && !prev_override) {
+            // 接管起点:写一次快照 + 切 phase 通知心跳
+            override_enter_time_ = ros::Time::now();
+            override_snapshot_.phase_when_overrided     = current_phase_;
+            override_snapshot_.work_mode_when_overrided = current_work_mode_;
+            override_snapshot_.flow_id_when_overrided    = current_flow_id_;
+            override_snapshot_.skill_id_when_overrided   =
+                (current_skill_index_ < skill_queue_.size())
+                    ? skill_queue_[current_skill_index_].msg.skill_id
+                    : std::string();
+            override_snapshot_.snapshot_time             = ros::Time::now();
+            current_phase_ = MissionPhase::PHASE_OVERRIDDEN;
+            ROS_ERROR("[MissionManager] >>>> PILOT OVERRIDE: px4_mode=%s prev_phase=%s prev_work_mode=%s flow=%s skill=%s",
+                      msg->mode.c_str(),
+                      missionPhaseToString(override_snapshot_.phase_when_overrided).c_str(),
+                      workModeToString(override_snapshot_.work_mode_when_overrided).c_str(),
+                      override_snapshot_.flow_id_when_overrided.c_str(),
+                      override_snapshot_.skill_id_when_overrided.c_str());
+        }
+        if (!is_fcu_overridden_ && prev_override) {
+            // 切回 OFFBOARD:走恢复流程
+            executeRecoveryFromOverride();
+        }
+
+        // AUTO.LAND 完成检测:armed=false 且正在落地 → 视为已经完成,等 GCS 发新 TaskFlow。
+        // 原 triggerPx4Landing 只 set is_landing_in_progress_=true,checkLandingComplete 只 log 不清,
+        // 此处集中重置。
+        if (!msg->armed && is_landing_in_progress_) {
+            ROS_WARN("[MissionManager] AUTO.LAND complete (disarmed) — awaiting new TaskFlow with takeoff");
+            is_landing_in_progress_  = false;
+            is_fcu_overridden_       = false;
+            current_phase_           = MissionPhase::PHASE_GROUND_IDLE;
+            // 注意:不动 has_task_flow_,等 GCS 显式发新 flow
+        }
+    }
+
+    // === 2026-07-23: 从飞手接管中受控恢复 ===
+    // 触发时机:mavrosStateCallback 检测到 is_fcu_overridden_ 由 true→false,即 PX4 mode 重新变回
+    // OFFBOARD(由 GS 发 MAV_CMD_DO_SET_MODE(176, OFFBOARD) 直通飞控完成)。因此进入本函数时飞机
+    // *已经* 在 OFFBOARD,无需再调 setMode()——那样会在订阅回调里跑 5s 阻塞 spinOnce,造成重入。
+    // 恢复策略:按接管瞬间的快照还原 phase;若快照是 GUIDANCE_*,看锁定目标是否还新鲜决定继续制导
+    // 还是转 TARGET_LOST_HOVER。
+    void executeRecoveryFromOverride() {
+        ROS_WARN("[MissionManager] <<<< RECOVERY from override: restoring phase=%s work_mode=%s flow=%s skill=%s",
+                 missionPhaseToString(override_snapshot_.phase_when_overrided).c_str(),
+                 workModeToString(override_snapshot_.work_mode_when_overrided).c_str(),
+                 override_snapshot_.flow_id_when_overrided.c_str(),
+                 override_snapshot_.skill_id_when_overrided.c_str());
+
+        // 1. 还原接管瞬间的执行阶段
+        current_phase_ = override_snapshot_.phase_when_overrided;
+
+        // 2. 若接管前在制导阶段,判断锁定目标是否还在视野(用锁定时间新鲜度近似)
+        if (current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
+            current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE) {
+            ros::Time now = ros::Time::now();
+            double age = (now - locked_cluster_time_).toSec();
+            if (locked_cluster_id_ != 0 && age < target_lost_hold_sec_) {
+                // 目标仍新鲜:is_guidance_active_ 在接管期间未被动过,guidance_control_node 立即接管
+                ROS_WARN("[MissionManager] Guidance resume (target fresh, cluster=%lu age=%.1fs)",
+                         (unsigned long)locked_cluster_id_, age);
+            } else {
+                // 目标已丢失:转悬停状态,关制导。setpoint 交给 waypoint_executor 的 stop(0 vel),
+                // 航向由 yaw_speed_gate_ 在 v=0 时天然冻结(保持当前值,用户口径)。
+                ROS_WARN("[MissionManager] Guidance target lost on recovery (cluster=%lu age=%.1fs) → TARGET_LOST_HOVER",
+                         (unsigned long)locked_cluster_id_, age);
+                current_phase_                = MissionPhase::PHASE_TARGET_LOST_HOVER;
+                target_lost_hover_active_     = true;
+                target_lost_hover_enter_time_ = now;
+                disableGuidance();
+            }
+        } else if (current_phase_ == MissionPhase::PHASE_WAYPOINT_FOLLOW ||
+                   current_phase_ == MissionPhase::PHASE_HOVERING) {
+            // waypoint_executor 的段状态(segment_phase_/arrive_idx_/seg_start_x_/y_)在接管期间被
+            // 天然保留,setpoint 流也未断,切回 OFFBOARD 后立即被飞控接走,无需额外指令。
+            ROS_WARN("[MissionManager] Waypoint/hover resume from override");
+        } else {
+            ROS_WARN("[MissionManager] Recovery restored phase=%s (no guidance/waypoint action)",
+                     missionPhaseToString(current_phase_).c_str());
+        }
+
+        publishMissionState();  // 让 GS 立即看到恢复后的 phase
     }
 
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -1296,6 +1421,8 @@ public:
             case MissionPhase::PHASE_GUIDANCE_STRIKE:
             case MissionPhase::PHASE_RETURNING:
             case MissionPhase::PHASE_COMPLETE:
+            case MissionPhase::PHASE_OVERRIDDEN:          // 飞手接管:物理上仍在空中
+            case MissionPhase::PHASE_TARGET_LOST_HOVER:   // 目标丢失悬停:仍在空中
                 return true;
             default:
                 return false;
@@ -1316,20 +1443,29 @@ public:
             return;
         }
 
-        // === 飞行安全门:若 UAV 已在飞行中,且新 task_flow 首发是 takeoff skill,
-        //     拒绝接收并报警 — 避免 GS 误操作覆盖当前飞行任务 ===
-        // 场景:返航中(GROUND 触发)收新 takeoff;航点跟踪中收 takeoff;
-        //       guidance 中收 takeoff;都应当拒绝。
-        // 例外:phase=GROUND_IDLE/HOLDING 时(地面或悬停待命)允许接收。
+        // === 飞行安全门:若 UAV 已在飞行中,且新 task_flow 首发是 takeoff skill ===
+        // 用户口径 D(2026-07-23):已空中时不再一律 REJECT,而是"剥掉首个 takeoff skill 再入队"——
+        //   典型场景是飞手接管后 GS 直接重发完整 flow([Takeoff, Search, ...]),飞机已在空中,
+        //   起飞段应跳过,直接从后续 skill 续飞。
+        //   仅当整个 flow 只有一个孤立 takeoff([Takeoff])时仍 REJECT,避免起飞后空跑无后续任务。
+        // 例外:phase=GROUND_IDLE/HOLDING 时(地面或悬停待命)takeoff 正常执行,不剥。
+        bool strip_leading_takeoff = false;
         if (!msg->skills.empty() &&
             (msg->skills[0].skill_type == 100 || msg->skills[0].skill_type == 106) &&
             isInFlight()) {
-            ROS_ERROR("[MissionManager] >>>> REJECT takeoff task_flow: UAV already in flight "
-                      "(phase=%s, takeoff skill_type=%u). GS sent takeoff while airborne — "
-                      "ignored for safety. Send IDLE first to abort current mission.",
-                      missionPhaseToString().c_str(),
-                      static_cast<unsigned>(msg->skills[0].skill_type));
-            return;
+            if (msg->skills.size() <= 1) {
+                ROS_ERROR("[MissionManager] >>>> REJECT single-takeoff task_flow: UAV already in flight "
+                          "(phase=%s, takeoff skill_type=%u, no follow-on skills). Ignored for safety.",
+                          missionPhaseToString().c_str(),
+                          static_cast<unsigned>(msg->skills[0].skill_type));
+                return;
+            }
+            strip_leading_takeoff = true;
+            ROS_WARN("[MissionManager] >>>> Skipping leading takeoff (already airborne, phase=%s) — "
+                     "starting from skill '%s' (type=%u)",
+                     missionPhaseToString().c_str(),
+                     msg->skills[1].skill_id.c_str(),
+                     static_cast<unsigned>(msg->skills[1].skill_type));
         }
 
         // === 返航中收到新 task_flow 的兜底 ===
@@ -1385,7 +1521,10 @@ public:
         // 把 skill 流拷进运行时队列
         skill_queue_.clear();
         skill_queue_.reserve(msg->skills.size());
-        for (const auto& s : msg->skills) {
+        // strip_leading_takeoff(已空中收到 [Takeoff, ...]):跳过 index 0 的 takeoff skill
+        size_t skill_begin_idx = strip_leading_takeoff ? 1u : 0u;
+        for (size_t si = skill_begin_idx; si < msg->skills.size(); ++si) {
+            const auto& s = msg->skills[si];
             SkillRuntime sr;
             sr.msg = s;
             sr.state = SkillState::PENDING;
@@ -3448,7 +3587,56 @@ public:
         if (current_skill_index_ >= skill_queue_.size()) return;
         SkillRuntime& sr = skill_queue_[current_skill_index_];
         const ros::Time now = ros::Time::now();
-        
+
+        // === 目标丢失状态机(2026-07-23,用户口径 C)===
+        // 判据:locked_cluster_time_ 的新鲜度(clusterStatesCallback 每次锁定/刷新会更新它)。
+        //   GUIDANCE_TRACK/STRIKE 中 age > T_hold(2s) → 进入 TARGET_LOST_HOVER(disableGuidance,
+        //     waypoint_executor stop → setpoint 0 vel;航向由 yaw_speed_gate_ 在 v=0 时天然冻结)。
+        //   TARGET_LOST_HOVER 中 age > T_resume(10s) → 回 WAYPOINT_FOLLOW,resume 段扫描。
+        //   若目标在 hover 期间重现,clusterStatesCallback 会刷新 locked_cluster_time_,age 复位,
+        //     此处不主动 re-enable guidance(用户口径未要求);等 T_resume 回 waypoint 后由正常搜索链路重锁。
+        if ((current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
+             current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE) &&
+            locked_cluster_id_ != 0 && !locked_cluster_time_.isZero()) {
+            double age = (now - locked_cluster_time_).toSec();
+            if (age > target_lost_hold_sec_) {
+                ROS_WARN("[MissionManager] Target lost in guidance (cluster=%lu age=%.1fs > hold=%.1fs) "
+                         "→ TARGET_LOST_HOVER",
+                         (unsigned long)locked_cluster_id_, age, target_lost_hold_sec_);
+                current_phase_                = MissionPhase::PHASE_TARGET_LOST_HOVER;
+                target_lost_hover_active_     = true;
+                target_lost_hover_enter_time_ = now;
+                disableGuidance();
+                std_msgs::String stop_cmd;
+                stop_cmd.data = "stop";
+                waypoint_control_pub_.publish(stop_cmd);
+                publishMissionState();
+            }
+        } else if (current_phase_ == MissionPhase::PHASE_TARGET_LOST_HOVER &&
+                   target_lost_hover_active_) {
+            double age = locked_cluster_time_.isZero()
+                             ? (now - target_lost_hover_enter_time_).toSec()
+                             : (now - locked_cluster_time_).toSec();
+            if (age > target_lost_resume_sec_) {
+                ROS_WARN("[MissionManager] Target lost resume timeout (age=%.1fs > resume=%.1fs) "
+                         "→ WAYPOINT_FOLLOW, resuming segment scan",
+                         age, target_lost_resume_sec_);
+                target_lost_hover_active_ = false;
+                locked_cluster_id_        = 0;
+                locked_cluster_ned_x_     = 0.0;
+                locked_cluster_ned_y_     = 0.0;
+                locked_cluster_ned_alt_   = 0.0;
+                locked_cluster_time_      = ros::Time();
+                tracked_target_.is_valid  = false;
+                publishPrimaryTarget(0);  // estimator 回退最高置信度
+                current_phase_            = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                std_msgs::String resume_cmd;
+                resume_cmd.data = "resume";
+                waypoint_control_pub_.publish(resume_cmd);
+                publishMissionState();
+            }
+        }
+
         switch (sr.state) {
             case SkillState::PENDING:
                 // 等 pushCurrentSkillToExecutor() 推过去
@@ -3983,6 +4171,8 @@ public:
             case MissionPhase::PHASE_COMPLETE:         return "COMPLETE";
             case MissionPhase::PHASE_FAILED:           return "FAILED";
             case MissionPhase::PHASE_HOLDING:          return "HOLDING";
+            case MissionPhase::PHASE_OVERRIDDEN:          return "OVERRIDDEN";
+            case MissionPhase::PHASE_TARGET_LOST_HOVER:   return "TARGET_LOST_HOVER";
             default: return "UNKNOWN";
         }
     }
