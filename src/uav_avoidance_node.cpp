@@ -54,13 +54,16 @@ public:
         nh_private_.param<std::string>("uav_device_sn", uav_device_sn_, uav_id_);
         nh_private_.param<double>("collision_threshold", collision_threshold_, 8.0);
         nh_private_.param<double>("proximity_threshold", proximity_threshold_, 30.0);
+        nh_private_.param<double>("collision_t_react", collision_t_react_, 1.5);
+        nh_private_.param<double>("proximity_t_react", proximity_t_react_, 2.0);
+        nh_private_.param<double>("max_avoid_t_react", max_avoid_t_react_, 2.5);
         nh_private_.param<double>("vertical_safe", vertical_safe_, 5.0);
         // 垂直避让方向 buffer(m):dalt = other_alt - self_alt(正 = 对方在我上方)。
         //   dalt <  vertical_buffer_(我与对方等高 / 更高 / 仅略低)→ 向上爬升避让
         //   dalt >= vertical_buffer_(我明显在对方下方)         → 向下俯冲避让
         nh_private_.param<double>("vertical_buffer", vertical_buffer_, 2.0);
         // 垂直避让速率(m/s,正值):强(冲突区)/ 弱(接近区),方向由 buffer 规则决定
-        nh_private_.param<double>("vertical_avoid_strong", vertical_avoid_strong_, 2.5);
+        nh_private_.param<double>("vertical_avoid_strong", vertical_avoid_strong_, 5.0);
         nh_private_.param<double>("vertical_avoid_mild", vertical_avoid_mild_, 1.5);
         // max_avoid_distance:超过此距离直接判定"无需避障",原硬编码 50m
         nh_private_.param<double>("max_avoid_distance", max_avoid_distance_, 100.0);
@@ -145,6 +148,9 @@ private:
     std::string uav_device_sn_;
     double collision_threshold_;
     double proximity_threshold_;
+    double collision_t_react_;       // 碰撞阈值对应的反应时间(s)
+    double proximity_t_react_;       // 接近阈值对应的反应时间(s)
+    double max_avoid_t_react_;       // 最大避障距离对应的反应时间(s)
     double vertical_safe_;
     double vertical_buffer_;        // 垂直避让方向 buffer(见构造函数注释)
     double vertical_avoid_strong_;  // 冲突区垂直避让速率 (m/s)
@@ -152,6 +158,11 @@ private:
     double max_avoid_distance_;   // > 此距离直接判定"无需避障"
     double loop_freq_;
     int self_uav_num_;
+
+    // 最近邻距离变化估计闭合速度,用于高速接近时提前扩大避障区
+    double last_min_dist_ = -1.0;
+    ros::Time last_min_dist_time_;
+    double closing_speed_smoothed_ = 0.0;
 
     // 自位置(NED,日志/调试用)
     bool have_self_pose_;
@@ -306,19 +317,23 @@ private:
      * phase enum (MissionPhase):
      *   0 GROUND_IDLE 1 TAKING_OFF 2 HOVERING 3 WAYPOINT_FOLLOW
      *   4 GUIDANCE_TRACK 5 GUIDANCE_STRIKE 6 RETURNING 7 COMPLETE
-     *   8 FAILED 9 HOLDING
+     *   8 FAILED 9 HOLDING 10 OVERRIDDEN 11 TARGET_LOST_HOVER
      *
-     * 视作 stationary:GROUND_IDLE / HOLDING / COMPLETE / FAILED
+     * 视作 stationary:GROUND_IDLE / HOLDING / COMPLETE / FAILED / OVERRIDDEN / TARGET_LOST_HOVER
      * 不视作(可主动避让):TAKING_OFF / HOVERING / WAYPOINT_FOLLOW /
      *   GUIDANCE_TRACK / GUIDANCE_STRIKE / RETURNING
      *   (RETURNING 可能在飞回 home,自动避让 cmd 会被 waypoint_executor 接收)
+     *   OVERRIDDEN:飞手接管,飞机不会响应程控避让指令 → 邻居主动让路
+     *   TARGET_LOST_HOVER:目标丢失悬停,意图回扫描,视作不可移动
      */
     static bool isStationaryPhase(uint8_t phase) {
         switch (phase) {
-            case 0:  // GROUND_IDLE
-            case 7:  // COMPLETE
-            case 8:  // FAILED
-            case 9:  // HOLDING
+            case 0:   // GROUND_IDLE
+            case 7:   // COMPLETE
+            case 8:   // FAILED
+            case 9:   // HOLDING
+            case 10:  // OVERRIDDEN
+            case 11:  // TARGET_LOST_HOVER
                 return true;
             default:
                 return false;
@@ -337,6 +352,8 @@ private:
             case 7: return "COMPLETE";
             case 8: return "FAILED";
             case 9: return "HOLDING";
+            case 10: return "OVERRIDDEN";
+            case 11: return "TARGET_LOST_HOVER";
             default: return "UNKNOWN";
         }
     }
@@ -377,6 +394,9 @@ private:
 
         // ========== 缺前置条件 → 不避让 ==========
         if (!have_self_gps_ || !have_self_state_ || heartbeats_.empty()) {
+            last_min_dist_ = -1.0;
+            last_min_dist_time_ = ros::Time::now();
+            closing_speed_smoothed_ = 0.0;
             avoidance_pub_.publish(cmd);
             return;
         }
@@ -417,8 +437,39 @@ private:
             }
         }
 
+        // ========== 按闭合速度扩大反应距离 ==========
+        // 只用距离差估计闭合速度,并做 EMA 平滑,避免单次心跳抖动把阈值拉满。
+        if (!found) {
+            last_min_dist_ = -1.0;
+            last_min_dist_time_ = ros::Time::now();
+            closing_speed_smoothed_ = 0.0;
+            avoidance_pub_.publish(cmd);
+            return;
+        }
+
+        const ros::Time now = ros::Time::now();
+        double closing_speed = 0.0;
+        if (last_min_dist_ >= 0.0) {
+            const double dt = (now - last_min_dist_time_).toSec();
+            if (dt > 0.001 && dt < 10.0) {
+                closing_speed = (last_min_dist_ - min_dist) / dt;
+                if (closing_speed < 0.0) closing_speed = 0.0;
+                if (closing_speed > 200.0) closing_speed = 200.0;
+            }
+        }
+        last_min_dist_ = min_dist;
+        last_min_dist_time_ = now;
+        const double alpha = 0.3;
+        closing_speed_smoothed_ = alpha * closing_speed +
+                                  (1.0 - alpha) * closing_speed_smoothed_;
+        const double cs = std::max(0.0, closing_speed_smoothed_);
+
+        const double eff_max_avoid = std::max(max_avoid_distance_, max_avoid_t_react_ * cs);
+        const double eff_prox = std::max(proximity_threshold_, proximity_t_react_ * cs);
+        const double eff_coll = std::max(collision_threshold_, collision_t_react_ * cs);
+
         // ========== 距离超过阈值 → 不需避障 ==========
-        if (!found || min_dist > max_avoid_distance_) {
+        if (min_dist > eff_max_avoid) {
             avoidance_pub_.publish(cmd);
             return;
         }
@@ -475,10 +526,10 @@ private:
         // ========== 我需要避让 ==========
         const double dalt_with_other = other_alt - self_alt;
 
-        ROS_WARN_THROTTLE(1.0, "%s AVOIDING: reason=[%s], target=sn=%s dist=%.2fm dalt=%+.2fm (thresholds coll=%.1f prox=%.1f vert_safe=%.1f)",
+        ROS_WARN_THROTTLE(1.0, "%s AVOIDING: reason=[%s], target=sn=%s dist=%.2fm dalt=%+.2fm (thresholds coll=%.1f prox=%.1f max=%.1f cs=%.1fm/s vert_safe=%.1f)",
                           TAG.c_str(), priority_reason.c_str(), other_sn.c_str(),
                           min_dist, dalt_with_other,
-                          collision_threshold_, proximity_threshold_, vertical_safe_);
+                          eff_coll, eff_prox, eff_max_avoid, cs, vertical_safe_);
 
         // ========== 垂直避让方向:buffer 规则 ==========
         // dalt_with_other = other_alt - self_alt(正 = 对方在我上方,即我在下面)
@@ -489,20 +540,22 @@ private:
         const double vdir = climb_up ? +1.0 : -1.0;
         const char* vdir_str = climb_up ? "CLIMB-UP" : "DESCEND";
 
-        if (min_dist < collision_threshold_) {
+        if (min_dist < eff_coll) {
             if (std::fabs(dalt_with_other) < vertical_safe_) {
                 // 高度还没拉开 → 按方向强避让
                 cmd.vertical_bias = vdir * vertical_avoid_strong_;
-                if (min_dist < collision_threshold_ * 0.6) {
+                if (min_dist < eff_coll * 0.6) {
+                    // 极限冲突时允许横向绕开航线,避免仅沿线减速/回退仍无法脱离
+                    cmd.lateral_blocked = false;
                     cmd.speed_scale = 0.0;
                     cmd.reverse_allowed = true;
-                    ROS_WARN_THROTTLE(1.0, "%s   → COLLISION-CRITICAL (dist<%.1f): STOP+REVERSE horizontal, vert=%s bias=%+.2f, reverse_allowed=%d",
-                                      TAG.c_str(), collision_threshold_ * 0.6,
+                    ROS_WARN_THROTTLE(1.0, "%s   → COLLISION-CRITICAL (dist<%.1f): lateral-unblocked + STOP+REVERSE horizontal, vert=%s bias=%+.2f, reverse_allowed=%d",
+                                      TAG.c_str(), eff_coll * 0.6,
                                       vdir_str, cmd.vertical_bias, cmd.reverse_allowed);
                 } else {
                     cmd.speed_scale = 0.2;
                     ROS_WARN_THROTTLE(1.0, "%s   → COLLISION (dist<%.1f): slow speed_scale=%.2f, vert=%s bias=%+.2f",
-                                      TAG.c_str(), collision_threshold_,
+                                      TAG.c_str(), eff_coll,
                                       cmd.speed_scale, vdir_str, cmd.vertical_bias);
                 }
             } else {
@@ -514,17 +567,17 @@ private:
                                   TAG.c_str(), std::fabs(dalt_with_other), vertical_safe_,
                                   cmd.speed_scale);
             }
-        } else if (min_dist < proximity_threshold_) {
+        } else if (min_dist < eff_prox) {
             // 接近区(prox<dist<coll):仅减速,不做垂直动作。
             // 垂直避让留到冲突区(<coll)触发,避免过早/过大的高度反应(40m 就抬高太夸张)。
             // 渐进式减速:在 proximity 边界处 scale=1.0(刚进入时不减速,避免远处就开始"刹车"看不出来),
             // 线性 ramp 到 collision 边界处 scale=0.3(让靠近碰撞时有明显减速效果)。
-            double t = (proximity_threshold_ - min_dist) /
-                       (proximity_threshold_ - collision_threshold_);
+            double t = (eff_prox - min_dist) /
+                       (eff_prox - eff_coll);
             t = std::max(0.0, std::min(1.0, t));
             cmd.speed_scale = 1.0 - 0.7 * t;  // 1.0@prox边界 → 0.3@coll边界
             ROS_WARN_THROTTLE(1.0, "%s   → PROXIMITY (%.1f<dist<%.1f): ramped speed_scale=%.2f (t=%.2f, no vertical, |dalt|=%.1f)",
-                              TAG.c_str(), collision_threshold_, proximity_threshold_,
+                              TAG.c_str(), eff_coll, eff_prox,
                               cmd.speed_scale, t, std::fabs(dalt_with_other));
         }
 

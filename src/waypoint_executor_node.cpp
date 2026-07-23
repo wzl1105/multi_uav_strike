@@ -40,6 +40,7 @@
 #include <std_msgs/Int16.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <mavros_msgs/HomePosition.h>
+#include <mavros_msgs/State.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <cmath>
@@ -124,10 +125,13 @@ private:
     // 最新 AvoidanceCmd(默认值:全不约束)
     multi_uav_strike::AvoidanceCmd latest_avoidance_;
     bool has_latest_avoidance_;
-    // 垂直避让"接管 + 锁存":一旦避让开始控制高度,就锁住已到达的高度,
-    // 直到冲突彻底解除才交还给航点。避免"被抬高 → 航点又拉回 → 再抬高"的高度震荡。
-    bool   vert_takeover_ = false;
-    double avoid_hold_z_  = 0.0;   // 锁存的目标高度(NED, down 为正)
+    // 垂直避让 latch(保留 anti-oscillation):爬升时锁存高度,短暂保留(由 latch_release_delay_ 控制)
+    //   防止 vbias 抖动导致的"被抬高 → 拉回 → 再抬高"震荡,但保留时间窗不会太长,
+    //   过了这个时间窗无论距离是否退出 PROXIMITY 都释放,让下降早点开始。
+    bool      vert_takeover_             = false;
+    double    avoid_hold_z_              = 0.0;   // 锁存的目标高度(NED)
+    ros::Time last_climb_active_time_;            // 上一次 vbias!=0 的时刻(每 tick 更新)
+    double    latch_release_delay_       = 1.5;   // climb 结束后 latch 保留时长(s),过后释放
 
     enum class BuildingAvoidanceState { CRUISE, CLIMBING, HOLD_HIGH };
     BuildingAvoidanceState building_avoidance_state_;
@@ -180,6 +184,7 @@ private:
     double ref_alt_;
     bool ref_initialized_ = false;
     ros::Subscriber home_position_sub_;  // 一次订阅,拿 PX4 home
+    ros::Subscriber mavros_state_sub_;   // /mavros/state(仅真机):接管感知观测点
 
     // 仿真/真机切换
     bool use_sim_;
@@ -263,7 +268,7 @@ public:
     void initParams() {
         nh_private_.param<double>("executor_rate", executor_rate_, 50.0);
         nh_private_.param<double>("uav_speed", uav_speed_, 5.0);
-        nh_private_.param<double>("uav_vertical_speed", uav_vertical_speed_, 1.0);
+        nh_private_.param<double>("uav_vertical_speed", uav_vertical_speed_, 2.0);
         nh_private_.param<double>("arrival_threshold", arrival_threshold_, 1.0);
         // 终段直接逼近阈值 — 当飞机距航点 < 此值时,从 L1 压航线切到直接朝航点飞
         // (默认 2.5m:大于 arrival_threshold,留出从 L1 切到直接逼近的过渡区)
@@ -283,6 +288,12 @@ public:
         //   - COLLISION: scale=0.2 → v≈1 m/s > 0.5 → 仍跟踪
         //   - CRITICAL: scale=0.0 → v≈0 < 0.5 → **冻结 yaw**
         nh_private_.param<double>("yaw_speed_gate", yaw_speed_gate_, 0.5);
+        // Latch 保留时间(s):climb 结束后 latch 仍保留的时长,缓冲 vbias 抖动。
+        //   超过此时间(典型:对方已离开较远但 scale 还在边缘)→ 释放,允许开始下降。
+        //   - 0 → 等价于"完全不 latch"(快速下降,但 oscillation 风险最大)
+        //   - 正大 → 等价于原行为(抗 oscillation,但延迟下降)
+        //   - 默认 1.5s:抗短时抖动的同时仍能在对方离开后较快下降
+        nh_private_.param<double>("latch_release_delay", latch_release_delay_, 1.5);
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
         nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
@@ -379,6 +390,17 @@ public:
         home_position_sub_ = nh_.subscribe(
             "mavros/home_position/home", 10,
             &WaypointExecutor::homePositionCallback, this);
+
+        // === 2026-07-23: 飞手接管感知观测点(仅真机 use_sim_=false)===
+        // 决策(用户口径):接管期间**不停 setpoint**,让 setpoint_velocity 继续流,切回 OFFBOARD 后
+        //   立即被飞控接走(避免 500ms COM_OFFBOARD_LOSS_TIMEOUT 真空)。段状态
+        //   (segment_phase_/arrive_idx_/seg_start_x_/y_)在 guidance 触发的 stop() 时已被天然保留,
+        //   构成隐式快照。因此本回调只做 DEBUG 观测,不改任何执行状态——保留订阅点以备未来扩展。
+        if (!use_sim_) {
+            mavros_state_sub_ = nh_.subscribe(
+                "mavros/state", 10,
+                &WaypointExecutor::mavrosStateCallback, this);
+        }
     }
 
     void initPublishers() {
@@ -465,6 +487,15 @@ public:
         ref_lon_ = msg->geo.longitude;
         ref_alt_ = msg->geo.altitude;
         ref_initialized_ = true;
+    }
+
+    // === 2026-07-23: 飞手接管观测(仅真机)===
+    // 见 initSubscribers 处的决策说明:接管期间本节点**不改任何执行状态**,setpoint 继续流,
+    // 切回 OFFBOARD 后被飞控立即接走。此回调仅打 DEBUG,保留订阅点以备未来扩展(如接管期
+    // 主动降频 setpoint 或朝向丢失目标)。
+    void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        ROS_DEBUG_THROTTLE(2.0, "[WaypointExecutor] mavros_state mode=%s armed=%d",
+                           msg->mode.c_str(), msg->armed ? 1 : 0);
     }
 
     // ============== 回调函数 ==============
@@ -818,21 +849,29 @@ public:
         // 所以用 speed<1 || bias!=0 || reverse 判定真正在避让)
         bool avoiding = (scale < 0.999) || (std::fabs(vbias) > 1e-3) || reverse;
 
-        // ===== 垂直:避让接管 + 高度锁存(消除高度来回跳)=====
-        // vertical_bias = "向上爬升速率"(正=上,负=下);executor 内 vz 是 NED(down 正),上=负。
+        // ===== 垂直:避让接管 + 时间衰减锁存 =====
+        // vbias = "向上爬升速率"(正=上,负=下);executor 内 vz 是 NED(down 正),上=负。
+        //   - active 爬升(vbias!=0):接管 vz 爬升/俯冲,刷新 last_climb_active_time_
+        //   - 爬升刚结束(仍 avoidance 中):保留 latch 至 latch_release_delay_ 秒,
+        //     抗短时 oscillation;超过窗口即释放,让下降早点开始
+        //   - 完全不用避让:清 latch
         if (std::fabs(vbias) > 1e-3) {
-            // 冲突区有垂直避让指令 → 直接接管 vz 爬升/俯冲,并持续锁存当前高度
             vz = -vbias;
             vert_takeover_ = true;
             avoid_hold_z_  = current_ned_z_;
+            last_climb_active_time_ = ros::Time::now();
         } else if (vert_takeover_ && avoiding) {
-            // 已完成垂直分离但冲突尚未解除 → 锁定在已爬升到的高度,
-            // 不让航点把高度拉回去(P-control 保持 avoid_hold_z_)
-            vz = hold_kp_ * (avoid_hold_z_ - current_ned_z_);
-            if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
-            if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+            double since_climb = (ros::Time::now() - last_climb_active_time_).toSec();
+            if (since_climb < latch_release_delay_) {
+                // 仍在保留窗口内 — 锁存峰值(P-control),缓冲 vbias 抖动
+                vz = hold_kp_ * (avoid_hold_z_ - current_ned_z_);
+                if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+                if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+            } else {
+                // 保留窗口已过(典型场景:对方已离开 PROXIMITY 区但 scale 仍在边缘)→ 释放
+                vert_takeover_ = false;
+            }
         } else {
-            // 冲突彻底解除 → 交还垂直控制给航点(vz 用调用方算好的航点跟踪值)
             vert_takeover_ = false;
         }
 
