@@ -454,6 +454,10 @@ private:
     // PX4 FC mode 离开 OFFBOARD 时视为飞手接管。接管瞬间写一次快照,
     //   切回 OFFBOARD 时按快照 resume(详见 mavrosStateCallback / executeRecoveryFromOverride)。
     bool        is_fcu_overridden_       = false;
+    // suppress_recovery_:taskFlowCallback 主动 setMode("OFFBOARD") 时拉起,
+    //   阻止 mavrosStateCallback 在 setMode 的 spinOnce 期间按"snapshot 恢复旧 phase"
+    //   那条路径跑 — 新 TaskFlow 接下来要自己从零设 phase,不能被旧 snapshot 污染。
+    bool        suppress_recovery_       = false;
     ros::Time   override_enter_time_;
     struct OverrideSnapshot {
         MissionPhase phase_when_overrided;
@@ -603,6 +607,7 @@ public:
         landing_complete_logged_(false),
         landing_safety_timeout_sec_(120.0),  // AUTO.LAND 兜底超时 120s
         is_fcu_overridden_(false),
+        suppress_recovery_(false),
         override_enter_time_(ros::Time()),
         target_lost_hover_enter_time_(ros::Time()),
         target_lost_hover_active_(false),
@@ -1207,7 +1212,11 @@ public:
         bool aircraft_live_phase =
             current_phase_ != MissionPhase::PHASE_GROUND_IDLE &&
             current_phase_ != MissionPhase::PHASE_FAILED &&
-            current_phase_ != MissionPhase::PHASE_COMPLETE;
+            current_phase_ != MissionPhase::PHASE_COMPLETE &&
+            // HOLDING/RETURNING 不算"飞行中被接管":RETURNING 期间 PX4 本就在 AUTO.LAND(非 OFFBOARD),
+            // HOLDING 落地收尾窗口也可能短暂并存 AUTO.LAND,二者都不应被误判成飞手接管。
+            current_phase_ != MissionPhase::PHASE_HOLDING &&
+            current_phase_ != MissionPhase::PHASE_RETURNING;
         is_fcu_overridden_ = (msg->mode != "OFFBOARD") && aircraft_live_phase;
 
         if (is_fcu_overridden_ && !prev_override) {
@@ -1231,7 +1240,14 @@ public:
         }
         if (!is_fcu_overridden_ && prev_override) {
             // 切回 OFFBOARD:走恢复流程
-            executeRecoveryFromOverride();
+            // suppress_recovery_:taskFlowCallback 主动 setMode("OFFBOARD") 时拉起,
+            //   期间不能让 snapshot 恢复(否则会污染新 flow 的 phase 初始化)。
+            if (suppress_recovery_) {
+                ROS_WARN("[MissionManager] Override transition detected but suppressed "
+                         "(taskFlowCallback is taking back OFFBOARD proactively)");
+            } else {
+                executeRecoveryFromOverride();
+            }
         }
 
         // AUTO.LAND 完成检测:armed=false 且正在落地 → 视为已经完成,等 GCS 发新 TaskFlow。
@@ -1443,27 +1459,64 @@ public:
             return;
         }
 
+        // === 飞手接管场景下的"新任务"路径(2026-07-23,用户口径 E)===
+        // 与"继续任务"路径(等 GS 发 50000 切回 OFFBOARD, mavrosStateCallback 触发 snapshot recovery)
+        //   并列的另一条 UX:GS 直接重发新 TaskFlow, 由程序**主动**拿回 OFFBOARD 控制权。
+        //
+        // 必须按顺序:
+        //   1) suppress_recovery_=true  → 防止 setMode 的 spinOnce 期间 mavrosStateCallback
+        //      看到"OFFBOARD 且 prev_override=true"后跑 snapshot recovery, 把新 flow 的 phase
+        //      初始化污染成旧 phase(尤其 GUIDANCE_*/TARGET_LOST_HOVER 那条支路)。
+        //   2) setMode("OFFBOARD") 阻塞等 PX4 确认(最多 5s)。失败(飞手在 5s 内又抢了)
+        //      → 直接 return,新 flow 不入队(GS 应改为先发 50000)。
+        //   3) suppress_recovery_=false,mavrosStateCallback 此时已把 is_fcu_overridden_ 刷成 false,
+        //      未来回调 prev_override=false,不会再触发 recovery。
+        if (is_fcu_overridden_) {
+            ROS_WARN("[MissionManager] >>>> New TaskFlow during OVERRIDE — proactively requesting OFFBOARD "
+                     "(flow_id=%s, skills=%lu)", msg->flow_id.c_str(), msg->skills.size());
+            suppress_recovery_ = true;
+            bool ok = setMode("OFFBOARD");
+            suppress_recovery_ = false;
+            if (!ok) {
+                ROS_ERROR("[MissionManager] >>>> OFFBOARD switch failed (pilot may have re-overridden) — "
+                          "dropping new TaskFlow flow_id=%s. GS should retry or send SET_MODE(50000) first.",
+                          msg->flow_id.c_str());
+                return;
+            }
+            ROS_WARN("[MissionManager] >>>> OFFBOARD confirmed, proceeding with new TaskFlow flow_id=%s",
+                     msg->flow_id.c_str());
+        }
+
         // === 飞行安全门:若 UAV 已在飞行中,且新 task_flow 首发是 takeoff skill ===
         // 用户口径 D(2026-07-23):已空中时不再一律 REJECT,而是"剥掉首个 takeoff skill 再入队"——
         //   典型场景是飞手接管后 GS 直接重发完整 flow([Takeoff, Search, ...]),飞机已在空中,
         //   起飞段应跳过,直接从后续 skill 续飞。
         //   仅当整个 flow 只有一个孤立 takeoff([Takeoff])时仍 REJECT,避免起飞后空跑无后续任务。
         // 例外:phase=GROUND_IDLE/HOLDING 时(地面或悬停待命)takeoff 正常执行,不剥。
+        //
+        // "已空中"判定:**必须** isInFlight() && current_mavros_state_.armed 同时为真 —
+        //   之前只看 isInFlight() 有 bug:飞手手动 disarm 落地后 phase 还停在 PHASE_OVERRIDDEN
+        //   (我们刚把 OVERRIDDEN 算成 in-flight),此时 GS 发 [Takeoff] 会被错误剥掉,而飞机其实
+        //   在地上 disarmed,必须执行 takeoff。加上 armed 检查后:disarm 状态下无论 phase 是什么,
+        //   takeoff 都正常执行(地面起飞流程:arm + 爬升)。
+        bool uav_airborne = isInFlight() && current_mavros_state_.armed;
         bool strip_leading_takeoff = false;
         if (!msg->skills.empty() &&
             (msg->skills[0].skill_type == 100 || msg->skills[0].skill_type == 106) &&
-            isInFlight()) {
+            uav_airborne) {
             if (msg->skills.size() <= 1) {
                 ROS_ERROR("[MissionManager] >>>> REJECT single-takeoff task_flow: UAV already in flight "
-                          "(phase=%s, takeoff skill_type=%u, no follow-on skills). Ignored for safety.",
+                          "(phase=%s, armed=%d, takeoff skill_type=%u, no follow-on skills). Ignored for safety.",
                           missionPhaseToString().c_str(),
+                          current_mavros_state_.armed ? 1 : 0,
                           static_cast<unsigned>(msg->skills[0].skill_type));
                 return;
             }
             strip_leading_takeoff = true;
-            ROS_WARN("[MissionManager] >>>> Skipping leading takeoff (already airborne, phase=%s) — "
+            ROS_WARN("[MissionManager] >>>> Skipping leading takeoff (already airborne, phase=%s armed=%d) — "
                      "starting from skill '%s' (type=%u)",
                      missionPhaseToString().c_str(),
+                     current_mavros_state_.armed ? 1 : 0,
                      msg->skills[1].skill_id.c_str(),
                      static_cast<unsigned>(msg->skills[1].skill_type));
         }
@@ -3105,8 +3158,15 @@ public:
                          elapsed, current_mavros_state_.mode.c_str());
                 ROS_WARN("[MissionManager] ===== UAV on ground. Awaiting next task_flow or shutdown. =====");
                 landing_complete_logged_ = true;
+                // 权威复位:不依赖 mavrosStateCallback 的 armed=false 分支时序(那段只在
+                // is_landing_in_progress_ 仍为 true 的那一拍触发,易被并发回调抢先清掉而漏跑)。
+                // 这里直接落地=GROUND_IDLE,清接管标志,让下一条带 takeoff 的 task_flow 能正常起飞
+                // (否则 phase 残留在 RETURNING/OVERRIDDEN → isInFlight()==true → taskFlowCallback 剥/拒 takeoff)。
+                is_landing_in_progress_ = false;
+                is_fcu_overridden_      = false;
+                current_phase_          = MissionPhase::PHASE_GROUND_IDLE;
                 // 不再切回 PHASE_HOLDING (UAV 已在地面,setpoint publisher 不需要再起)
-                // GS 通过 MissionState.phase=RETURNING + state.armed=false 即可判定任务结束
+                // GS 通过 MissionState.phase=GROUND_IDLE + state.armed=false 即可判定任务结束
             }
             return;
         }
@@ -3832,11 +3892,17 @@ public:
                     //   是 → 触发 PX4 AUTO.LAND 降落 (PX4 着陆后自动 disarm)
                     //   否 → 进入 PHASE_HOLDING, 原地+当前航向悬停等新 task_flow
                     const auto& last_skill = skill_queue_.back().msg;
-                    if (last_skill.skill_type == 103 && !is_landing_in_progress_) {
-                        ROS_WARN("[MissionManager] >>>> Last skill is Return (103) "
-                                 " triggering PX4 AUTO.LAND (safety_timeout=%.1fs)",
-                                 landing_safety_timeout_sec_);
-                        triggerPx4Landing();
+                    if (last_skill.skill_type == 103) {
+                        // Return skill:触发一次 AUTO.LAND;已在降落流程则幂等空操作,
+                        // 绝不能掉进 enterHoldState()——那会在 disarm 后重启贴地 setpoint 流,
+                        // 并把 phase 写成 HOLDING 被后续误判为飞手接管(见 mavrosStateCallback)。
+                        if (!is_landing_in_progress_) {
+                            ROS_WARN("[MissionManager] >>>> Last skill is Return (103) "
+                                     " triggering PX4 AUTO.LAND (safety_timeout=%.1fs)",
+                                     landing_safety_timeout_sec_);
+                            triggerPx4Landing();
+                        }
+                        // else: 降落进行中,等 checkLandingComplete / mavrosStateCallback 收尾
                     } else {
                         ROS_WARN_THROTTLE(5.0, "[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
                                  skill_queue_.size());
