@@ -1263,13 +1263,24 @@ public:
 
         // AUTO.LAND 完成检测:armed=false 且正在落地 → 视为已经完成,等 GCS 发新 TaskFlow。
         // 原 triggerPx4Landing 只 set is_landing_in_progress_=true,checkLandingComplete 只 log 不清,
-        // 此处集中重置。
-        if (!msg->armed && is_landing_in_progress_) {
-            ROS_WARN("[MissionManager] AUTO.LAND complete (disarmed) — awaiting new TaskFlow with takeoff");
-            is_landing_in_progress_  = false;
-            is_fcu_overridden_       = false;
-            current_phase_           = MissionPhase::PHASE_GROUND_IDLE;
-            // 注意:不动 has_task_flow_,等 GCS 显式发新 flow
+        // 此处集中重置。任何 disarm 状态都视为地面 idle，避免 phase=OVERRIDDEN
+        // 与 is_fcu_overridden_=true 同时残留到下一次 TaskFlow，导致 taskFlowCallback 走
+        // setMode(OFFBOARD) 死路。
+        if (!msg->armed) {
+            const bool was_in_flight =
+                is_landing_in_progress_ ||
+                current_phase_ == MissionPhase::PHASE_OVERRIDDEN ||
+                current_phase_ == MissionPhase::PHASE_RETURNING ||
+                current_phase_ == MissionPhase::PHASE_TAKING_OFF;
+            if (was_in_flight) {
+                ROS_WARN("[MissionManager] UAV disarmed on landing (mode=%s prev_phase=%s) — "
+                         "resetting to PHASE_GROUND_IDLE for fresh takeoff",
+                         msg->mode.c_str(), missionPhaseToString().c_str());
+                is_landing_in_progress_  = false;
+                is_fcu_overridden_       = false;
+                current_phase_           = MissionPhase::PHASE_GROUND_IDLE;
+                // 注意:不动 has_task_flow_,等 GCS 显式发新 flow
+            }
         }
     }
 
@@ -1483,19 +1494,31 @@ public:
         //   3) suppress_recovery_=false,mavrosStateCallback 此时已把 is_fcu_overridden_ 刷成 false,
         //      未来回调 prev_override=false,不会再触发 recovery。
         if (is_fcu_overridden_) {
-            ROS_WARN("[MissionManager] >>>> New TaskFlow during OVERRIDE — proactively requesting OFFBOARD "
-                     "(flow_id=%s, skills=%lu)", msg->flow_id.c_str(), msg->skills.size());
-            suppress_recovery_ = true;
-            bool ok = setMode("OFFBOARD");
-            suppress_recovery_ = false;
-            if (!ok) {
-                ROS_ERROR("[MissionManager] >>>> OFFBOARD switch failed (pilot may have re-overridden) — "
-                          "dropping new TaskFlow flow_id=%s. GS should retry or send SET_MODE(50000) first.",
-                          msg->flow_id.c_str());
-                return;
+            if (!current_mavros_state_.armed) {
+                // 飞机已 disarm 落地(典型场景:AUTO.LAND 完成 / 飞手手动 disarm)。
+                // PX4 在 AUTO.LAND/AUTO.LOITER 等状态下不允许直接切 OFFBOARD。
+                // 不走 setMode(OFFBOARD) 死路,改为清掉接管标志 + phase 重置,
+                // 让后面 takeoff 段走标准的 triggerOffboardAndArm() 序列。
+                ROS_WARN("[MissionManager] >>>> Disarmed on landing during OVERRIDE (mode=%s) — "
+                         "clearing OVERRIDE flag, treating as fresh takeoff (flow_id=%s)",
+                         current_mavros_state_.mode.c_str(), msg->flow_id.c_str());
+                is_fcu_overridden_ = false;
+                current_phase_     = MissionPhase::PHASE_GROUND_IDLE;
+            } else {
+                ROS_WARN("[MissionManager] >>>> New TaskFlow during OVERRIDE — proactively requesting OFFBOARD "
+                         "(flow_id=%s, skills=%lu)", msg->flow_id.c_str(), msg->skills.size());
+                suppress_recovery_ = true;
+                bool ok = setMode("OFFBOARD");
+                suppress_recovery_ = false;
+                if (!ok) {
+                    ROS_ERROR("[MissionManager] >>>> OFFBOARD switch failed (pilot may have re-overridden) — "
+                              "dropping new TaskFlow flow_id=%s. GS should retry or send SET_MODE(50000) first.",
+                              msg->flow_id.c_str());
+                    return;
+                }
+                ROS_WARN("[MissionManager] >>>> OFFBOARD confirmed, proceeding with new TaskFlow flow_id=%s",
+                         msg->flow_id.c_str());
             }
-            ROS_WARN("[MissionManager] >>>> OFFBOARD confirmed, proceeding with new TaskFlow flow_id=%s",
-                     msg->flow_id.c_str());
         }
 
         // === 飞行安全门:若 UAV 已在飞行中,且新 task_flow 首发是 takeoff skill ===
