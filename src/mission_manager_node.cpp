@@ -60,6 +60,7 @@
 #include <geometry_msgs/TransformStamped.h>
 
 #include <string>
+#include <algorithm>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -81,8 +82,7 @@
                                                 // 替代原 cluster_event(后者只 publish 一次,会被 IN_TASK 时序窗口漏掉)
 #include "multi_uav_strike/TrackingState.h"
 #include "multi_uav_strike/WaypointStatus.h"
-#include "multi_uav_strike/UavGatherStatus.h"
-#include "multi_uav_strike/InterUavStatus.h"     // 多机心跳订阅(多机 gather 同步用)
+#include "multi_uav_strike/InterUavStatus.h"     // 多机心跳订阅(多机 gather 同步用,2026-07-24 替代原 UavGatherStatus)
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 自适应低通,平滑 target_estimated_pose (2026-07-16)
 
@@ -149,7 +149,7 @@ enum class MissionPhase {
     PHASE_RETURNING,         // 返航
     PHASE_COMPLETE,          // 任务完成
     PHASE_FAILED,            // 失败
-    PHASE_HOLDING,           // 所有 skill 完成后原地悬停, 等新 task_flow
+    PHASE_HOLDING,           // 原地悬停:等待集结伙伴或新 task_flow
     PHASE_OVERRIDDEN,        // 飞手接管(PX4 mode != OFFBOARD);机载感知,等 GS 发起恢复
     PHASE_TARGET_LOST_HOVER  // 目标丢失悬停(Guidance 阶段 target 消失后保持位置)
 };
@@ -177,11 +177,19 @@ struct SkillRuntime {
     ros::Time                in_task_enter_time;
     // 集结超时计时(仅 skill_type=101 适用)
     ros::Time                gather_enter_time;
+    // 本机到达集结点并进入 HOLDING 的时刻;等待至少一个心跳超时窗后才允许通过屏障
+    ros::Time                gather_local_arrived_time;
     // 集结期望伙伴名单(仅 skill_type=101 适用)
     //   - 任务流注入:从 Skill.params_json["devices_sn"] 解出(GS 真实协议)
     //   - 老路径 fallback:launch 私有 param ~expected_sns(空时)
     //   - 空 → 单机路径(single_uav_arrived)
     std::vector<std::string> gather_partners_;
+    // === 2026-07-24: 伙伴 HOLDING 一次性标记 ===
+    //   分布式集结屏障必须等"每个伙伴都到过 HOLDING",而不是"每个伙伴都正在 HOLDING"。
+    //   后者会让先到的 2 架走了(phase 切到下一阶段),第 3 架永远等不到。
+    //   关键路径:interUavStatusCallback 收到伙伴 phase=HOLDING → 写入此 map(只写一次)。
+    //   checkAllUavsGathered() 改为遍历此 map。
+    std::map<std::string, ros::Time> gather_partner_holding_seen_;
     // 暂停/失败原因,日志用
     std::string              last_event;
 };
@@ -289,7 +297,8 @@ private:
     ros::Publisher detect_targets_pub_;      // 批量:multi_uav_strike/DetectTargets
     ros::Publisher tracking_state_pub_;      // multi_uav_strike/TrackingState
     ros::Publisher waypoint_skill_pub_;      // 向 executor 下发 Skill(分段航点)
-    ros::Publisher gather_status_pub_;       // 集结多机状态(Phase 7)
+    // 注:集结多机状态(原 gather_status_pub_)已删除(2026-07-24) —
+    //   改为复用 InterUavStatus.phase(机间避障同一条总线),UavGatherStatus 不再参与数据通路。
     ros::Publisher primary_target_pub_;      // 主目标 cluster_id → target_estimator (UInt64)
                                              // 0 = mission 未指定主目标(estimator 回退最高置信度)
 
@@ -448,6 +457,8 @@ private:
     bool        is_landing_in_progress_;     // 是否正在执行 AUTO.LAND 流程
     ros::Time   landing_start_time_;         // 触发 AUTO.LAND 的时刻(用于安全超时)
     bool        landing_complete_logged_;    // 是否已打印"落地完成"日志(避免刷屏)
+    bool        landing_already_triggered_;  // 本 task_flow 是否已为最后一个 Return skill 触发过降落
+                                            // (防止 disarm → 状态复位后,10Hz 状态机又重入 COMPLETE 分支重复触发)
     double      landing_safety_timeout_sec_; // 着陆后仍未 disarm 的兜底超时(秒)
 
     // === 飞手接管感知与受控恢复(2026-07-23) ===
@@ -605,6 +616,7 @@ public:
         is_landing_in_progress_(false),
         landing_start_time_(ros::Time()),
         landing_complete_logged_(false),
+        landing_already_triggered_(false),
         landing_safety_timeout_sec_(120.0),  // AUTO.LAND 兜底超时 120s
         is_fcu_overridden_(false),
         suppress_recovery_(false),
@@ -642,7 +654,7 @@ public:
 
     void initParams() {
         nh_private_.param<int>("device_id", self_device_id_, 0);
-        // uav_device_sn:与 comm_node / uav_avoidance 同名参数,空 → 回落 device_id 字符串("0")
+        // uav_device_sn:与 comm_node / uav_avoidance 同名参数;launch 必须注入设备 SN
         nh_private_.param<std::string>("uav_device_sn", self_uav_device_sn_, "");
         nh_private_.param<double>("low_speed_threshold", low_speed_threshold_, 12.0);
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);
@@ -942,9 +954,8 @@ public:
         waypoint_skill_pub_ = nh_.advertise<multi_uav_strike::Skill>(
             "waypoint_executor/skill", 10);
 
-        // 集结多机状态(Phase 7)
-        gather_status_pub_ = nh_.advertise<multi_uav_strike::UavGatherStatus>(
-            "inter_uav/gather_status", 10);
+        // 集结多机状态(Phase 7)— 已删除(2026-07-24)
+        //   改用 InterUavStatus 复用机间避障的总线,不再单独 publish /inter_uav/gather_status。
 
         // 主目标 cluster_id → target_estimator。
         // 多目标改造: estimator 不再自己挑最高置信度,而是 mission_manager
@@ -1525,12 +1536,14 @@ public:
         // 场景:Return skill 触发了 AUTO.LAND,但中途(未 disarm 前)GS 决定不降了,下发新任务
         // 处理:清掉 is_landing_in_progress_,让 advanceSkillStateMachine 推新 skill
         //   不需要切 PX4 mode(下面会触发起飞流程,OFFBOARD+ARM 序列会接管)
+        // 同时清掉 landing_already_triggered_:让新 task_flow 里如果有 Return,能再次触发。
         if (is_landing_in_progress_) {
             ROS_WARN("[MissionManager] New TaskFlow arrived during AUTO.LAND — aborting landing, "
                      "will reset to PHASE_GROUND_IDLE for fresh takeoff");
-            is_landing_in_progress_  = false;
-            landing_complete_logged_ = false;
-            current_phase_          = MissionPhase::PHASE_GROUND_IDLE;
+            is_landing_in_progress_      = false;
+            landing_complete_logged_     = false;
+            landing_already_triggered_   = false;
+            current_phase_               = MissionPhase::PHASE_GROUND_IDLE;
         }
 
         // 防御：如果当前 setpoint publisher 在跑(说明前序 flow 结束后进入 PHASE_HOLDING 或正在 takeoff),
@@ -1582,6 +1595,8 @@ public:
             sr.msg = s;
             sr.state = SkillState::PENDING;
             sr.state_enter_time = ros::Time::now();
+            sr.gather_enter_time = ros::Time();
+            sr.gather_local_arrived_time = ros::Time();
             sr.last_event = "queued";
             // === 集结合(skill_type=101):从 params_json 解 devices_sn 作多机同步名单 ===
             //   1) 任务流带 "devices_sn":[...] → 用它(GS 真实协议下发)
@@ -1777,8 +1792,18 @@ public:
         if (sr.msg.skill_type == 100 || sr.msg.skill_type == 106) {
             return;
         }
-        // 推到 executor
+        // 推到 executor。若上一条 gather 正在 HOLDING,先发布新 skill 让 executor
+        // 建好速度 setpoint 源,再停 mission_manager 的 position-hold,避免 OFFBOARD 真空。
+        const bool handoff_from_holding =
+            current_phase_ == MissionPhase::PHASE_HOLDING;
         waypoint_skill_pub_.publish(sr.msg);
+        if (handoff_from_holding) {
+            current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+            if (setpoint_running_) {
+                stopSetpointPublisher();
+            }
+            ROS_WARN("[MissionManager] HOLDING to WAYPOINT_FOLLOW: next skill handed to executor");
+        }
 
         // 状态推进 PENDING → TRANSIT
         if (sr.state == SkillState::PENDING) {
@@ -2475,6 +2500,8 @@ public:
      * 多机心跳回调 — 多机 gather 同步用
      *   - 仅缓存本机(由 nh_.getNamespace() 决定)以外的 SN
      *   - 缓存带时间戳,skill_advance_timer 周期清理超时
+     *   - === 2026-07-24: 当前 skill 是 gather(101)且伙伴 phase=HOLDING,标记一次性 seen ===
+     *     解决"先到 2 架走了,phase 切到下一阶段,最后一架永远等不到所有人 HOLDING"的问题。
      * 注:回调里不做"是否到齐"判断,统一在 skillAdvanceTimerCallback IN_TASK 分支
      *   调 checkAllUavsGathered() 做实时快照,避免竞争
      */
@@ -2486,6 +2513,36 @@ public:
         }
         partner_heartbeats_[msg->sn].latest      = msg;
         partner_heartbeats_[msg->sn].last_update = ros::Time::now();
+
+        // === 2026-07-24: gather 屏障 — 标记"已见过此伙伴 HOLDING" ===
+        // 当前任务运行时(skill_queue_[current_skill_index_] 有效)+ skill_type==101
+        // + 伙伴当前 phase==HOLDING → 写入 gather_partner_holding_seen_,只写一次
+        // (map::insert 不覆盖)。partner_heartbeat_timeout_ 在 checkAllUavsGathered()
+        //   里用于 fresh 检测,这里不做额外时间窗判定(本机已在 HOLDING 等待
+        //   partner_heartbeat_timeout_ 时间窗,伙伴心跳进入窗口前不会调这里)。
+        if (current_skill_index_ >= skill_queue_.size()) {
+            return;
+        }
+        SkillRuntime& sr_ref = skill_queue_[current_skill_index_];
+        if (sr_ref.msg.skill_type != 101) {
+            return;  // 当前不是 gather skill
+        }
+        if (sr_ref.gather_enter_time.isZero()) {
+            return;  // 还没真正进入 gather(可能还在 ENTRY_PENDING)
+        }
+        // 伙伴当前 phase 是否 HOLDING
+        if (msg->phase != static_cast<uint8_t>(MissionPhase::PHASE_HOLDING)) {
+            return;
+        }
+        // 写入(只写一次,后续不再更新 — 一旦见过就永久算"到过")
+        auto ins = sr_ref.gather_partner_holding_seen_.insert(
+            {msg->sn, ros::Time::now()});
+        if (ins.second) {
+            ROS_WARN("[MissionManager] Skill[101] Partner %s acknowledged HOLDING (seen=%zu/%zu)",
+                     msg->sn.c_str(),
+                     sr_ref.gather_partner_holding_seen_.size(),
+                     sr_ref.gather_partners_.size());
+        }
     }
 
     /**
@@ -3097,13 +3154,14 @@ public:
     //   - 任务流中段出现 Return 也走同一入口(advanceSkillStateMachine 不区分位置)
     //   - 中途有用户重新下发 task_flow 时,taskFlowCallback 顶部会清 is_landing_in_progress_
     void triggerPx4Landing() {
-        if (is_landing_in_progress_) {
-            return;  // 幂等:已在降落流程,避免被 10Hz 状态机重复触发
+        if (is_landing_in_progress_ || landing_already_triggered_) {
+            return;  // 幂等:已在降落流程,或本 task_flow 已触发过返航,避免 10Hz 状态机重复触发
         }
-        is_landing_in_progress_   = true;
-        landing_start_time_       = ros::Time::now();
-        landing_complete_logged_  = false;
-        current_phase_            = MissionPhase::PHASE_RETURNING;
+        is_landing_in_progress_      = true;
+        landing_already_triggered_   = true;
+        landing_start_time_          = ros::Time::now();
+        landing_complete_logged_     = false;
+        current_phase_               = MissionPhase::PHASE_RETURNING;
 
         ROS_WARN("[MissionManager] ===== Return-skill  PX4 AUTO.LAND triggered =====");
 
@@ -3136,7 +3194,7 @@ public:
                           current_mavros_state_.mode.c_str());
             }
         } else {
-            ROS_WARN("[MissionManager] AUTO.LAND: use_sim_=%d, skipping actual mode call (sim mode); "
+            ROS_WARN_THROTTLE(5.0, "[MissionManager] AUTO.LAND: use_sim_=%d, skipping actual mode call (sim mode); "
                      "waiting for disarm", use_sim_ ? 1 : 0);
         }
     }
@@ -3801,37 +3859,56 @@ public:
                 // IN_TASK 分支不再需要主动轮询 strike/lock 决策,只等 attack_cmd 处理 SEARCH_TRACK 的确认。
                 // (代码保留注释,便于将来在此处加技能超时/计数等通用逻辑。)
 
-                // skill_type=101 集结合:单 UAV 飞到集结点,或多 UAV 全部到齐,或 timeout
+                // skill_type=101 集结合:本机先到点进入 HOLDING,再等伙伴 HOLDING 或 timeout
                 if (sr.msg.skill_type == 101) {
-                    // 单 UAV 到达:本机已飞到 skill_area_path 最后一个航点
-                    //   修复:原 checkAllUavsGathered 永远 true → GATHER 跳过飞航点直接 COMPLETE
-                    //   现在单 UAV 真正压线飞到 skill_area 末点才算完
-                    //   skill_total>0 防护:GATHER 应保证至少 1 条 skill_area,空路径视为异常靠 timeout 兜底
-                    bool single_uav_arrived = latest_wp_status_ &&
+                    // 本机已飞到 skill_area_path 最后一个航点。
+                    // skill_total>0 防护:GATHER 应至少有 1 条 skill_area,空路径靠 timeout 兜底。
+                    const bool local_arrived = latest_wp_status_ &&
                         latest_wp_status_->skill_id == sr.msg.skill_id &&
                         latest_wp_status_->skill_total > 0 &&
                         latest_wp_status_->skill_idx >= latest_wp_status_->skill_total;
-                    // 多 UAV 同步:本机 + 期望伙伴中达到门限的 SN 数 / 期望数 ≥ gather_threshold_
-                    //   名单来自 SkillRuntime.gather_partners_(任务流 devices_sn 注入)
-                    //   空名单 → 多机同步关闭,等价于单 UAV 路径
-                    bool all_uavs_arrived = checkAllUavsGathered(sr.gather_partners_);
-                    bool timed_out = gather_timeout_ > 0.0 &&
+                    const bool has_remote_partners = std::any_of(
+                        sr.gather_partners_.begin(), sr.gather_partners_.end(),
+                        [&](const std::string& sn) { return sn != self_uav_device_sn_; });
+
+                    // 多机屏障第一阶段:本机到点后保持原位,并通过 InterUavStatus.phase=HOLDING
+                    // 广播“已到达”。不能因本机到点就立即 COMPLETE,否则伙伴来不及观察 HOLDING。
+                    if (has_remote_partners && local_arrived &&
+                        sr.gather_local_arrived_time.isZero()) {
+                        sr.gather_local_arrived_time = now;
+                        enterHoldState();
+                        sr.last_event = "IN_TASK: local UAV arrived, waiting for gather partners";
+                        ROS_WARN("[MissionManager] Skill[101] Local UAV arrived; HOLDING for %zu partners",
+                                 sr.gather_partners_.size());
+                    }
+
+                    // MissionState 和 InterUavStatus 都是周期链路。至少保持一个伙伴心跳超时窗,
+                    // 确保本机 HOLDING 已经被伙伴看到,再允许通过分布式屏障。
+                    const bool local_holding_announced = local_arrived &&
+                        !sr.gather_local_arrived_time.isZero() &&
+                        (now - sr.gather_local_arrived_time).toSec() >= partner_heartbeat_timeout_;
+                    const bool partners_arrived = has_remote_partners &&
+                        local_holding_announced &&
+                        checkAllUavsGathered(sr.gather_partners_);
+                    const bool timed_out = gather_timeout_ > 0.0 &&
                         (now - sr.gather_enter_time).toSec() > gather_timeout_;
-                    if (single_uav_arrived || all_uavs_arrived || timed_out) {
+                    const bool gather_complete = has_remote_partners ?
+                        partners_arrived : local_arrived;
+
+                    if (gather_complete || timed_out) {
                         sr.state = SkillState::EXIT_PENDING;
                         sr.state_enter_time = now;
                         sr.last_event = timed_out ?
                             "IN_TASK to EXIT_PENDING (gather timeout)" :
-                            single_uav_arrived ? "IN_TASK to EXIT_PENDING (single UAV at gather point)" :
-                            "IN_TASK to EXIT_PENDING (all UAVs gathered)";
+                            has_remote_partners ?
+                                "IN_TASK to EXIT_PENDING (all UAVs holding)" :
+                                "IN_TASK to EXIT_PENDING (single UAV at gather point)";
                         ROS_WARN("[MissionManager] Skill[101] Gather %s (partners=%zu, threshold=%.2f)",
                                  timed_out ? "TIMEOUT" :
-                                 single_uav_arrived ? "ARRIVED (single UAV at last skill_area)" :
-                                 "COMPLETE (all UAVs)",
+                                 has_remote_partners ? "COMPLETE (all UAVs HOLDING)" :
+                                                       "ARRIVED (single UAV)",
                                  sr.gather_partners_.size(), gather_threshold_);
                     }
-                    // 发本机 gather_status(其它 UAV 看)
-                    publishGatherStatus();
                     break;
                 }
 
@@ -3893,16 +3970,18 @@ public:
                     //   否 → 进入 PHASE_HOLDING, 原地+当前航向悬停等新 task_flow
                     const auto& last_skill = skill_queue_.back().msg;
                     if (last_skill.skill_type == 103) {
-                        // Return skill:触发一次 AUTO.LAND;已在降落流程则幂等空操作,
+                        // Return skill:触发一次 AUTO.LAND;已在降落流程或已触发过则幂等空操作,
                         // 绝不能掉进 enterHoldState()——那会在 disarm 后重启贴地 setpoint 流,
                         // 并把 phase 写成 HOLDING 被后续误判为飞手接管(见 mavrosStateCallback)。
-                        if (!is_landing_in_progress_) {
+                        // landing_already_triggered_ 守卫:disarm → is_landing_in_progress_=false
+                        // 后,10Hz 状态机会反复重入此分支,防止重复触发+重复打印。
+                        if (!is_landing_in_progress_ && !landing_already_triggered_) {
                             ROS_WARN("[MissionManager] >>>> Last skill is Return (103) "
                                      " triggering PX4 AUTO.LAND (safety_timeout=%.1fs)",
                                      landing_safety_timeout_sec_);
                             triggerPx4Landing();
                         }
-                        // else: 降落进行中,等 checkLandingComplete / mavrosStateCallback 收尾
+                        // else: 降落进行中或已触发过,等 checkLandingComplete / mavrosStateCallback 收尾
                     } else {
                         ROS_WARN_THROTTLE(5.0, "[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
                                  skill_queue_.size());
@@ -3923,23 +4002,25 @@ public:
     }
 
     /**
-     * 101 集结 — 多 UAV 同步检查(Phase 7 接通)
-     * 参数:gather_partners — 本条 gather skill 的期望伙伴 SN 列表(从 Skill.params_json 解出)
-     *   空 → 单机路径,返回 false(让 single_uav_arrived 决定)
-     *   非空 → 遍历名单,在 partner_heartbeats_ 缓存里查:
-     *     - 伙伴 SN 在缓存中存在
-     *     - 心跳未超时(默认 3s)
-     *     - 伙伴当前 skill_type == 101(在集结合)
-     *   满足的伙伴数 / 名单数(去本机) ≥ gather_threshold_ → 返回 true
+     * 101 集结 — 用 InterUavStatus 实现多 UAV 到达屏障
+     * 参数:gather_partners — 本条 gather skill 的期望设备 SN 列表
+     *   空或仅含本机 → 单机路径,返回 false(由 local_arrived 决定完成)
+     *   含其它设备 → 遍历 partner_heartbeats_:
+     *     - 伙伴 SN 有未超时的心跳(默认 3s)
+     *     - 伙伴在当前 gather skill 的 gather_partner_holding_seen_ 出现过
+     *       (即至少见过一次 phase=HOLDING — 不要求当前仍在 HOLDING)
+     *   到达伙伴数 / 期望伙伴数(去本机) >= gather_threshold_ 时返回 true。
      *
-     * 注 1:本机不计入"到达"判定(由 single_uav_arrived 单独处理)
-     * 注 2:不查 partner.skill_id — 不同 UAV 用不同 skill_id 是常见情况
-     *   (e.g., uav0_gather / uav1_gather),只看 skill_type 即可识别"在集结合"
-     * 注 3:本检查有 race:伙伴刚进 IN_TASK(skill_type 切到 101)但还没到点
-     *   也会算到。gather_timeout_ 兜底(掉队机不响应 → 最终超时推进)
-     *   严格"到达"判定需 InterUavStatus 加 arrived 字段,目前用 skill_type 粗判
+     * 本机是否到达由调用方单独检查;不同 UAV 的 skill_id 可以不同,因此这里只按 SN 和 seen 标记判断。
+     *
+     * === 2026-07-24 关键变更 ===
+     * 原实现判 partner_heartbeats_[sn].latest->phase == HOLDING → 只能等"伙伴正在 HOLDING"。
+     *   后果:2 架先到 → 走 → phase 切到下一阶段(WAYPOINT_FOLLOW/GUIDANCE_*)→ 第 3 架永远等不到。
+     * 改为查 gather_partner_holding_seen_(interUavStatusCallback 里只要见过 phase=HOLDING
+     *   就一次性写入,map::insert 不覆盖)→ 伙伴走过 HOLDING 后即使离开也算"到过"。
+     * 函数签名从 const 改为非 const,因为要访问 skill_queue_[current_skill_index_] 的 seen map。
      */
-    bool checkAllUavsGathered(const std::vector<std::string>& gather_partners) const {
+    bool checkAllUavsGathered(const std::vector<std::string>& gather_partners) {
         if (gather_partners.empty()) {
             // 单机/未配置多机 → 让 single_uav_arrived 处理
             return false;
@@ -3947,18 +4028,42 @@ public:
         ros::Time now = ros::Time::now();
         size_t arrived_count = 0;
         size_t valid_partners = 0;
-        std::string my_ns = nh_.getNamespace();
-        if (!my_ns.empty() && my_ns[0] == '/') my_ns = my_ns.substr(1);
+        // === 2026-07-24: 用 device_sn 而非 namespace 过滤"自己" ===
+        // 之前用 nh_.getNamespace()("uav0")去和 gather_partners_("1-1"...)比对 → 永远不命中 → 自己总被算
+        // 修复:partner 名单语义是设备 SN(GS 在 Skill.params_json["devices_sn"] 注入的也是 SN),
+        //   InterUavStatus.msg 里填的也是 device_sn_,两边单位一致 → 用 self_uav_device_sn_ 过滤。
+        // 注:self_uav_device_sn_ 由 launch ~uav_device_sn 注入,空 → 退化为"不过滤"(原 buggy 行为),
+        //   真机多机测试 launch 都用 TZS_DEVICE_SN 设了 1-1/1-2/1-3,这里没问题。
+        // 注 2:launch 默认="$(optenv TZS_DEVICE_SN 1-1)",改 launch 后本字段有值,过滤生效。
+        const std::string& my_sn = self_uav_device_sn_;
+
+        // 拿到当前 gather skill 的 seen map(避免空指针)。
+        // skill_queue_ 可能在 task_flow 切换时被 clear,所以先判 index 合法。
+        // skill_queue_[i].msg.skill_type==101 双重确认(若当前是 takeoff 等其它 skill,
+        //   不应该用 gather 的 seen map — 但 IN_TASK 分支只在 skill_type==101 时才进,
+        //   所以这里也只在该条件下取 seen map)。
+        const std::map<std::string, ros::Time>* seen_map_ptr = nullptr;
+        if (current_skill_index_ < skill_queue_.size()) {
+            const auto& sr_ref = skill_queue_[current_skill_index_];
+            if (sr_ref.msg.skill_type == 101) {
+                seen_map_ptr = &sr_ref.gather_partner_holding_seen_;
+            }
+        }
 
         for (const auto& sn : gather_partners) {
-            if (sn == my_ns) continue;  // 跳过自己
+            if (sn == my_sn) continue;  // 跳过自己(SN 匹配)
             ++valid_partners;
+            // 心跳是否新鲜(防止伙伴断网后 stale 残留被错算"到过")
             auto it = partner_heartbeats_.find(sn);
             if (it == partner_heartbeats_.end()) continue;
             const auto& ph = it->second;
             if (!ph.latest) continue;
             if ((now - ph.last_update).toSec() > partner_heartbeat_timeout_) continue;
-            if (ph.latest->skill_type == 101) {
+            // === 2026-07-24: 改为一次性 seen 标记 ===
+            // 只要此伙伴在 seen map 里出现过(任何时刻)→ 算到达。
+            // 离开 HOLDING 后 phase 变了,但 map 不会被清,屏障可正确通过。
+            if (seen_map_ptr != nullptr &&
+                seen_map_ptr->find(sn) != seen_map_ptr->end()) {
                 ++arrived_count;
             }
         }
@@ -3967,28 +4072,6 @@ public:
         }
         double ratio = static_cast<double>(arrived_count) / static_cast<double>(valid_partners);
         return ratio >= gather_threshold_;
-    }
-
-    /**
-     * 101 集结 — 发布本机 gather 状态
-     */
-    void publishGatherStatus() {
-        multi_uav_strike::UavGatherStatus gs;
-        gs.sn = nh_.getNamespace();
-        if (!gs.sn.empty() && gs.sn[0] == '/') gs.sn = gs.sn.substr(1);
-        gs.arrived_state = 1;  // 已到(IN_TASK 即视为已到)
-        // GPS 未 lock 时 lat/lon/alt 留 0,避免把 NED 本地坐标当经纬度上报
-        if (is_gps_received_) {
-            gs.lat = current_gps_.latitude;
-            gs.lon = current_gps_.longitude;
-            gs.alt = current_gps_.altitude;
-        } else {
-            gs.lat = 0.0;
-            gs.lon = 0.0;
-            gs.alt = 0.0;
-        }
-        gs.priority = 100;  // 占位
-        gather_status_pub_.publish(gs);
     }
 
     // ============== 任务处理 ==============

@@ -148,6 +148,7 @@
           type="mission_manager_node"
           output="screen"
           respawn="false">
+      <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"

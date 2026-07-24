@@ -19,3 +19,14 @@ float64 alt
 
 # 偏航角(弧度,NED 顺时针,0=N)
 float32 yaw
+
+# NED 速度(m/s):来自 /mavros/local_position/velocity (源 ENU,comm_node/starling_bridge
+# 内部转 NED 后填入,转换式见 comm_node.cpp::velocityCallback 注释)。
+#   - 与 yaw 同用 NED 约定,心跳"姿态相关"字段自洽
+#   - uav_avoidance 用它判定邻居是否静止(防御圈收缩)
+#   - uav_avoidance 也用它算真实 closing speed(替代原位置差估算)
+#   - 静态/初始化阶段=0,下游应据此判断信源是否就绪
+#   - z 方向:正值 = 向下(NED),UAV 起飞/悬停时 ≈ 0
+float32 vx
+float32 vy
+float32 vz

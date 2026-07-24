@@ -4,16 +4,50 @@
 # ============================================================================
 collision_threshold: 15.0   # 极近距离（m），需要立即让
 proximity_threshold: 40.0 # 警告距离（m），需要减速
-# 高速接近时按闭合速度(cs)扩大阈值:effective=max(固定阈值,反应时间*cs)
-collision_t_react: 1.5     # 冲突区反应时间（s）
-proximity_t_react: 2.0     # 接近区反应时间（s）
-max_avoid_t_react: 2.5     # 最大避障距离反应时间（s）
-vertical_safe: 8.0         # 高度安全差（m），<此值需调高度
+# === 2026-07-24: 阈值随闭合速度双向缩放(替换原 max(base, t_react*cs) 单向放大)===
+# eff_thresh = base * cs_scale,cs_scale = clamp(1.0 + avoid_threshold_gain*cs, min_scale, max_scale)
+#   cs > 0(接近)→ 放大阈值,提前触发,留更多缓冲
+#   cs < 0(分离)→ 缩小阈值,允许更近距离(已知要分开)
+#   cs = 0     → 用基线阈值
+# 例(gain=0.3, min=0.5, max=2.0):
+#   cs = +3 m/s(快速接近) → cs_scale = 1.9 → 阈值×1.9(60m 才减速,30m 才垂直避让)
+#   cs = -1 m/s(慢分离)   → cs_scale = 0.7 → 阈值×0.7(28m 减速,10.5m 垂直)
+avoid_threshold_gain:      0.3   # 闭合速度每 m/s 给 cs_scale 加多少(双向)
+avoid_threshold_min_scale: 0.5   # 分离时阈值不低于基线 50%(避免塌缩)
+avoid_threshold_max_scale: 2.0   # 接近时阈值不超过基线 200%(留余量)
+# === 基于 velocity_local 的径向闭合速度 ===
+# 正=两机接近,负=分离。优先使用双方 NED 速度点乘相对位置,不再依赖高频 GPS 距离微分。
+closing_speed_alpha: 0.2           # EMA 新样本权重;越小越稳,越大响应越快
+closing_speed_fallback_min_dt: 0.5 # 本机速度未就绪时,距离差 fallback 至少累计这么久再求导(s)
+reverse_min_closing_speed: 0.5     # critical 区确认接近并允许首次倒车的最小闭合速度(m/s)
+separating_speed_scale: 0.4        # critical 区已确认分离时,保持正向离开的速度比例
+# === 旧 t_react 系列参数已不再使用(代码里读 ignore),保留以便旧 launch 引用 ===
+collision_t_react: 1.5     # 已忽略(2026-07-24)
+proximity_t_react: 2.0     # 已忽略
+max_avoid_t_react: 2.5     # 已忽略
+vertical_safe: 8.0         # 高度安全差基线（m）— 实际 = vertical_safe * cs_scale
 # 垂直避让方向 buffer(m):dalt = 对方高度 - 本机高度(正=对方在上方)
 #   dalt <  vertical_buffer → 向上爬升避让(我等高/更高/仅略低）
 #   dalt >= vertical_buffer → 向下俯冲避让(我明显在对方下方）
 vertical_buffer: 2.0
 vertical_avoid_strong: 5.0 # 冲突区垂直避让速率（m/s）
 vertical_avoid_mild: 1.5   # 接近区垂直避让速率（m/s）
+# === 2026-07-24: 邻居速度驱动的动态高度避让 ===
+# 邻居水平速度（m/s）低于 stationary_speed_threshold → 视为静止（HOLDING / 任务结束），
+# 把 vertical_bias 从 vertical_avoid_strong 平滑过渡到 vertical_bias_soft。
+# 目标：集结场景下，UAV A 已 HOLDING，UAV B 接近时不再被垂直推高到 3D 距离判不到
+# 集结点航点。GS 必须保证集结点水平 + 垂直间隔 > eff_vert(=vertical_safe*cs_scale)，
+#   否则 B 仍会被推。
+stationary_speed_threshold: 0.5  # 邻居水平速度 < 此值视为静止（m/s，平方比较）
+vertical_bias_soft: 0.0          # 邻居完全静止时的 vertical_bias（m/s，0 = 完全不推）
+# === 2026-07-24: 垂直迟滞(抗 vbias 反复 toggle 引起的剧烈点头)===
+# GPS 噪声(~0.5m)叠加在 |dalt|<eff_vert 硬阈值上,会导致 20Hz tick 下 vbias 每 50ms 在
+#   +5 ↔ 0 之间反复 toggle,executor 看到的 vz 在 -5 ↔ 0 之间疯狂跳,PX4 机身剧烈点头。
+#   迟滞加死后:正在爬必须 |dalt| > eff_vert + hyst 才释放,释放后必须 |dalt| < eff_vert - hyst
+#   才重新推。死区 2*hysteresis(默认 2m)远大于 GPS 噪声,切断 toggle 链。
+vertical_hysteresis: 1.0   # 死区半宽(m)。0=关迟滞(可能剧烈点头),2.0=超稳但阈值更宽
+# 水平避让区迟滞比例:进入阈值=动态阈值*(1-margin),退出阈值=动态阈值*(1+margin)。
+# 结合“仅按新心跳更新闭合速度”,避免 GPS/心跳噪声让 speed_scale 在区间边界反复切换。
+horizontal_hysteresis: 0.05 # 5% 单边迟滞,总死区为动态阈值的 10%
 max_avoid_distance: 120.0  # 超过此距离直接判定"无需避障"(原硬编码 50m)
 loop_freq: 20.0            # 控制循环频率（Hz）
