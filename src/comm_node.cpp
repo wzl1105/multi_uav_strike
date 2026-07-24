@@ -29,6 +29,7 @@
 #include <std_msgs/Int16.h>
 #include <std_msgs/Bool.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/NavSatFix.h>
@@ -63,6 +64,7 @@ private:
     ros::Subscriber self_pose_sub_;          // 本机 NED 位姿(姿态用,以及 GPS 未到时 NED→GPS 兜底投影)
     ros::Subscriber gps_global_sub_;         // 本机 EKF2 GPS(mavros/global_position/global,HOME 依赖但必发)
     ros::Subscriber gps_raw_sub_;            // 本机真实 GPS(mavros/global_position/raw,不依赖 PX4 HOME)
+    ros::Subscriber velocity_sub_;           // 本机 NED 速度(mavros/local_position/velocity_local,2026-07-24 加)
     ros::Subscriber yolo_result_sub_;        // YOLO检测结果(typed YoloDetection)
     ros::Subscriber target_est_pose_sub_;    // 目标估计位置
     // === Phase 7: 其他 UAV 心跳 ===
@@ -133,6 +135,13 @@ private:
     bool is_gps_received_ = false;
     // raw vs global 跟踪,用于决定 gpsGlobalCallback 是否仍要覆盖
     bool is_raw_gps_received_ = false;
+    // NED 速度(m/s):来自 /mavros/local_position/velocity_local (ENU 源,这里转 NED 后填进心跳)。
+    //   uav_avoidance 用它判定邻居是否静止(防御圈收缩)和算真实 closing speed。
+    //   与 msg 里的 yaw 同用 NED 约定,使心跳内"姿态相关"字段自洽。
+    float self_velocity_ned_x_ = 0.0f;
+    float self_velocity_ned_y_ = 0.0f;
+    float self_velocity_ned_z_ = 0.0f;
+    bool  has_self_velocity_    = false;
     // (2026-07-20) NED→GPS 兜底投影是否启用。
     // 当 raw/global 都还没到、但 self_pose 已到时,先发基于 NED 的"近似 GPS"心跳,
     // 让 uav_avoidance 至少有数据流;距离计算在多机 SITL 各自 HOME 相同时近似准。
@@ -241,6 +250,12 @@ public:
         gps_raw_sub_ = nh_.subscribe(
             "mavros/global_position/raw", 10,
             &CommNode::gpsRawCallback, this);
+        // NED 速度(m/s),TwistStamped.linear.{x,y,z}。
+        // mavros 在 EKF2 完成速度融合后才发,启动初若干秒可能没数据 → 默认 0,等
+        // has_self_velocity_=true 后才有意义(下游按需自行判断)。
+        velocity_sub_ = nh_.subscribe(
+            "mavros/local_position/velocity_local", 10,
+            &CommNode::velocityCallback, this);
     }
 
     void initPublishers() {
@@ -356,7 +371,28 @@ public:
     }
 
     /**
-     * (deprecated) 原 NED -> GPS 投影 — 已删除,改用 gpsRawCallback。
+     * /mavros/local_position/velocity_local 回调 — ENU 源,这里转 NED 后存。
+     * mavlink LOCAL_POSITION_NED → mavros 内部 ENU 转换 → ROS /velocity topic
+     *   header.frame_id = "map",twist.linear.{x,y,z} = (East, North, Up) m/s。
+     *   PX4 EKF2 完成后才有数据,启动初若干秒可能没消息。
+     * 转换(与 mission_manager::selfPoseCallback line 1325-1327 对位置的处理同款):
+     *   v_ned.x (North) = v_enu.y
+     *   v_ned.y (East)  = v_enu.x
+     *   v_ned.z (Down)  = -v_enu.z
+     * 注:转换后的 vz 在 UAV 起飞/悬停时 ≈ 0(无垂直运动),盘旋/下降时为负(向上为正)。
+     */
+    void velocityCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
+        self_velocity_ned_x_ = static_cast<float>(msg->twist.linear.y);   // ENU N → NED x
+        self_velocity_ned_y_ = static_cast<float>(msg->twist.linear.x);   // ENU E → NED y
+        self_velocity_ned_z_ = -static_cast<float>(msg->twist.linear.z);  // ENU U → NED z
+        if (!has_self_velocity_) {
+            has_self_velocity_ = true;
+            ROS_WARN("[Comm] >>>> First velocity received (ENU→NED converted): vx=%.2f vy=%.2f vz=%.2f m/s",
+                     self_velocity_ned_x_, self_velocity_ned_y_, self_velocity_ned_z_);
+        }
+    }
+
+    /**
      * 旧代码用每机 PX4 home 做参考,多机 SITL 时各自 HOME 不同会算错距离。
      * 如果未来需要回退,在 launch 显式传 ref_lat/lon/alt 即可重建此函数。
      */
@@ -450,6 +486,12 @@ public:
         hs.lon           = current_self_pose_.pose.position.y;
         hs.alt           = current_self_pose_.pose.position.z;
         hs.yaw           = 0.0;  // 简化:暂不发 yaw
+        // NED 速度(m/s,源 ENU → 这里已转 NED)。has_self_velocity_=false 时为 0;
+        // 下游 uav_avoidance 在算邻居静止判定时把 < 0.5 m/s 视为静止,0 也会算静止 —
+        // 是保守安全侧。
+        hs.vx            = self_velocity_ned_x_;
+        hs.vy            = self_velocity_ned_y_;
+        hs.vz            = self_velocity_ned_z_;
         inter_uav_status_pub_.publish(hs);
 
         // 2. 清理超时心跳

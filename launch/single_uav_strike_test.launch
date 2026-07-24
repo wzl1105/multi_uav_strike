@@ -141,6 +141,7 @@
           type="mission_manager_node"
           output="screen"
           respawn="false">
+      <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
       <param name="avoidance_safe_distance" value="10.0" />
       <param name="low_speed_threshold" value="12.0" />
       <param name="strike_distance_threshold" value="2.0" />

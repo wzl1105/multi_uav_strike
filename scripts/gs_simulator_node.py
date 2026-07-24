@@ -423,7 +423,7 @@ DEMO_FLOWS = {
                 "cruise_speed": 5.0,
                 "task_speed": 4.0,
                 "arrive_path": [],
-                "skill_area_path": [(20.0, 0.0, 30.0),  # 集结到 home 东侧 20m
+                "skill_area_path": [(4.0, 0.0, 30.0),  # 集结到 home 东侧 20m
                 ],
             },
             {
@@ -487,7 +487,7 @@ DEMO_FLOWS = {
                 "cruise_speed": 5.0,
                 "task_speed": 4.0,
                 "arrive_path": [],
-                "skill_area_path": [(-20.0, 0.0, 30.0),  # 集结到 home 西侧 20m(与 uav0 错开方向)
+                "skill_area_path": [(-0.82, 8.29, 35),  # 集结到 home 西侧 20m(与 uav0 错开方向)
                 ],
             },
             {
@@ -553,7 +553,7 @@ DEMO_FLOWS = {
                 "task_speed": 4.0,
                 "arrive_path": [],
                 "skill_area_path": [
-                    (0.0, 20.0, 30.0),  # 集结到 home 北侧 20m
+                    (-4.0, -3.0, 25.0),  # 集结到 home 北侧 20m
                 ],
             },
             {

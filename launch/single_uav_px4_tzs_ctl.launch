@@ -46,6 +46,7 @@
     <include file="$(find mavros)/launch/px4.launch">
       <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
       <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
+      <arg name="gcs_url" value="udp://:14561@192.168.3.22:14560"/>
     </include>
   </group>
 
@@ -150,6 +151,7 @@
           output="screen"
           respawn="false">
       <param name="device_id" value="0" />
+    <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
