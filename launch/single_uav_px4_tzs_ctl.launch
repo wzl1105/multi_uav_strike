@@ -186,7 +186,7 @@
   <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.3.90" />
+      <param name="gcs_ip" value="192.168.43.5" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />

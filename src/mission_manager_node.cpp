@@ -212,6 +212,13 @@ struct SkillRuntime {
     ros::Time                attack_strike_sync_time_;
     // 本机到达 attack_point 的时刻(上报用,comm_node 写进心跳)
     ros::Time                attack_arrival_time_;
+    // Attack(105) 到达 attack_point 后等待 strike trigger 的开始时刻(2026-07-26)
+    //   - attack_arrival_time_ 是给 partner 算 strike_sync_time 的语义锚点,
+    //     仍然以 UAV *踩到* attack_point 的那一刻为准
+    //   - attack_hover_enter_time_ 是给 mission_manager 自己算兜底超时用,
+    //     两值在 IN_TASK case 中同一帧被设置,数值相同但语义不同
+    //   - 超时时长 attack_hover_timeout_sec_(MM 成员,可配,默认 30s)
+    ros::Time                attack_hover_enter_time_;
     // formation=2:本机 attack_point(由 planCoordinatedAttack 实时规划填入)
     double                   attack_point_lat_ = 0.0;
     double                   attack_point_lon_ = 0.0;
@@ -407,6 +414,17 @@ private:
 
     // 下发给 guidance_control_node 的拦截速度(InterceptGuidance 用)
     double guidance_speed_;
+    // 兜底最低下发速度(2026-07-26):Skill 消息里 task_speed=0(GS 漏发/老版本默认值)
+    //   时 guidance_speed_ 会被 0 覆盖,guidance_control_node 拿到零速会直接忽略
+    //   ("Ignoring non-positive uav_speed"),plane 不动。强制 ≥ 此值,保证 guidance
+    //   至少以最低速度朝目标推进。可通过 ~min_guidance_speed 调。
+    double min_guidance_speed_;
+    // strike 触发时的 cluster 新鲜度门槛(2026-07-26):locked_cluster_time_ 超过此值
+    //   即视为 stale,triggerStrike() 入口放弃 strike 并清锁,让 waypoint 继续
+    //   飞向 attack_point(目标位置),新 cluster 进得来时重新当 primary 锁上。
+    //   解决 "到了 WP1 没目标,但 stale cluster(13.8s)反复触发 strike → guidance
+    //   ping-pong(0.4s 内 5 个 cycle,heading 抖、velocity 跳)" 的根因。
+    double max_strike_cluster_age_sec_;
     double obstacle_distance_;
 
     // 螺旋接近参数
@@ -572,6 +590,13 @@ private:
     double      locked_cluster_ned_alt_ = 0.0;
     uint64_t    locked_cluster_id_     = 0;     // 0 = 未锁定
     ros::Time   locked_cluster_time_;
+    // target_estimator 给的"目标最后一次被 YOLO 实际命中"的微秒时间戳(2026-07-26)。
+    //   区别于 locked_cluster_time_(后者只是 cluster_states 回调到达时刻,只要 cluster 还
+    //   在 alive 列表里就会被 cluster_states 10Hz 持续刷新,不能反映目标真实可见性)。
+    //   触发 strike 的真正 stale 判据是 last_seen_us:UAV 飞过目标位置后 YOLO 看不见目标,
+    //   cluster_states 仍把 cluster 当 alive(last_seen_us 是 stale 时刻),沿用其 pose 会
+    //   让 guidance 把 UAV 拉回旧位置 → "倒退"飞行 + target_lost 100ms ping-pong。
+    uint64_t    locked_cluster_last_seen_us_ = 0; // 0 = 未知(从未锁定)
 
     // === Attack(105) strike gating ===
     //   clusterStatesCallback 在 SEARCH_STRIKE 分支检测到门控未过(sequential 等前一架 /
@@ -582,11 +607,26 @@ private:
     uint64_t    attack_strike_pending_cluster_id_ = 0;
     ros::Time   attack_strike_pending_time_;     // 挂起起始(用于超时放弃)
 
+    // Attack(105) hover 阶段 setpoint publisher latched 标记(2026-07-26):
+    //   跑到 attack_point 起 setpoint publisher 锁 XY+Z 时设 true,直到 Attack skill
+    //   推进到 EXIT_PENDING 才清 false。runPx4TakeoffSequence 每 tick 会按 phase 检查
+    //   是否该 stop setpoint("避免覆盖其他模块"),但 Attack hover 是 mission_manager
+    //   主动 latch 的,phase 又故意保留为 WAYPOINT_FOLLOW 不让 GS 看到 phase 跳变,
+    //   所以如果不豁免,runPx4TakeoffSequence 一看到 phase!=TAKING_OFF/HOVERING/HOLDING
+    //   立刻把刚起的 publisher 停了 → PX4 OFFBOARD 失流 → AUTO.LAND failsafe。
+    //   用这个标志在 runPx4TakeoffSequence 守卫里做豁免。
+    bool        attack_hover_setpoint_latched_   = false;
+
     // === Attack(105) 多机协同参数 ===
     double      attack_safety_margin_m_         = 3.0;   // 协同:每架距目标保留距离
     double      attack_close_range_threshold_m_ = 5.0;   // 协同:UAV 已近时 attack_point = 当前位置
     double      attack_sync_strike_buffer_sec_  = 1.0;   // 协同:同步开火缓冲
     double      attack_strike_pending_timeout_sec_ = 60.0; // 门控挂起 strike 超时
+    double      attack_hover_timeout_sec_          = 30.0; // Attack(105) 到 attack_point 等 strike trigger 兜底超时(2026-07-26)
+                                                                //   与 attack_strike_pending_timeout_sec_ 互为补充:
+                                                                //     - 后者:已看到目标但 gating WAITING → 60s 放弃(由 advanceAttackPhaseMachine 兜底)
+                                                                //     - 此处:到 attack_point 始终没看到目标 → 30s 放弃(由 advanceSkillStateMachine 兜底)
+                                                                //   收到任何 cluster 后前者会接管。本超时只看 attack_hover_enter_time_,不看 attack_strike_pending_。
 
     // === 已忽略目标黑名单 ===
     std::vector<IgnoredTarget> ignored_targets_;
@@ -633,6 +673,8 @@ public:
         is_spiral_active_(false),
         is_guidance_active_(false),
         guidance_speed_(10.0),    // 默认 10 m/s,可在 mission_manager.yaml 的 ~max_speed 覆盖
+        min_guidance_speed_(2.0), // 兜底最低下发速度(2026-07-26),见字段注释
+        max_strike_cluster_age_sec_(0.5), // strike cluster 新鲜度门槛(2026-07-26),见字段注释
         strike_distance_threshold_(2.0),
         mission_loop_rate_(50.0),
         target_lock_confidence_(0.7),
@@ -825,6 +867,13 @@ public:
         // formation=1/2 门控挂起 strike 的超时,超时则放弃当前 skill
         nh_private_.param<double>("attack_strike_pending_timeout_sec",
                                                           attack_strike_pending_timeout_sec_, 60.0);
+        // Attack(105):到 attack_point 后等 strike trigger 的兜底超时,见 attack_hover_timeout_sec_ 注释
+        nh_private_.param<double>("attack_hover_timeout_sec",
+                                                          attack_hover_timeout_sec_, 30.0);
+        // 下发给 guidance 的兜底最低速度(2026-07-26),见 min_guidance_speed_ 字段注释
+        nh_private_.param<double>("min_guidance_speed", min_guidance_speed_, 2.0);
+        // strike cluster 新鲜度门槛(2026-07-26),见 max_strike_cluster_age_sec_ 字段注释
+        nh_private_.param<double>("max_strike_cluster_age_sec", max_strike_cluster_age_sec_, 0.5);
     }
 
     void initSubscribers() {
@@ -1322,7 +1371,17 @@ public:
         // 此处集中重置。任何 disarm 状态都视为地面 idle，避免 phase=OVERRIDDEN
         // 与 is_fcu_overridden_=true 同时残留到下一次 TaskFlow，导致 taskFlowCallback 走
         // setMode(OFFBOARD) 死路。
-        if (!msg->armed) {
+        //
+        // === 2026-07-26 fix: 必须 armed=true→false 跳变才能触发 ===
+        //   原版 6ff6e90 把 PHASE_TAKING_OFF 加进 was_in_flight 后,首条 mavrosStateCallback
+        //   (msg->armed=false,phase=TAKING_OFF,刚由 taskFlowCallback 设上去)就会误触发:
+        //     - takeoff 序列刚把 phase 切到 TAKING_OFF → PX4 还没真 arm → msg->armed 本来就是 0
+        //     - disarm-on-landing 看到 "armed=false + TAKING_OFF" 立刻 reset phase=GROUND_IDLE
+        //     - runPx4TakeoffSequence 在 2964 行门控早 return,起飞卡死;用户看到的现象:
+        //         "triggerOffboardAndArm SUCCESS 之后立刻 UAV disarmed on landing → AUTO.LAND"
+        //   只有 armed 从 1→0 的真 disarm 才需要 reset (PX4 真的飞不起来),初始 0 不是 disarm 事件。
+        const bool was_armed = current_mavros_state_.armed;  // 在 line 1248 赋值之前的快照
+        if (!msg->armed && was_armed) {
             const bool was_in_flight =
                 is_landing_in_progress_ ||
                 current_phase_ == MissionPhase::PHASE_OVERRIDDEN ||
@@ -2074,6 +2133,14 @@ public:
      *   - attack_strike_sync_time_ 未规划 → WAITING
      *   - 当前时间 < sync 时间 → WAITING
      *   - 否则 READY
+     *
+     * 注:此函数**不再**额外检查 UAV 是否到达 attack_point。Strike 允许在 skill_area_path
+     *   内任何时刻 fire(由 clusterStatesCallback 顶部的 skill_idx>=1 门控保证"至少到过 WP1"):
+     *   - WP1 刚踩到(idx=0→1):executor 立即转向 WP2,任何 cluster 命中都会 fire
+     *   - WP1 → WP2 飞行段:cluster 命中 fire
+     *   - WP2 踩到(此前的版本会把这里 block 住):仍 fire,旧 hover 兜底只在 strike 一直未
+     *     fire(全程没看到目标)时由 attack_hover_timeout_sec_ 兜底退出,见 IN_TASK case。
+     *   之前的 attack_hover_enter_time_ 检查已于 2026-07-26 用户口径变更后移除。
      */
     enum class AttackStrikeGating { READY, WAITING };
     AttackStrikeGating checkAttackStrikeGating(const SkillRuntime& sr) {
@@ -2333,6 +2400,38 @@ public:
      *   在 is_locked=true 后会持续更新 current_target_.pose,几帧后即可收敛到精确位置。
      */
     void triggerStrike() {
+        // === Stale cluster 守卫(2026-07-26)===
+        //   场景:UAV 到达 attack_point 时若没有真实目标在视野里,target_estimator
+        //   可能仍持有很久前锁上的 stale cluster(last_seen_us 在过去几秒甚至更久)。
+        //   该 cluster 会反复触发 strike → guidance → target_lost → 重新触发 strike
+        //   → guidance 的 ping-pong,飞机背着倒退飞。
+        //   真正能反映"目标是否还在视野里"的判据是 locked_cluster_last_seen_us_
+        //   (YOLO 实际命中时刻,微秒);locked_cluster_time_ 只是 cluster_states 回调
+        //   时刻,只要 cluster 还活着就会被 10Hz 持续刷新,age 永远是 0.05~0.1s,
+        //   用它判 stale 等于不判。
+        //   守门:last_seen_us_age > 阈值时放弃 strike 并清锁,让 waypoint_executor
+        //   继续沿 skill_area_path 飞向 attack_point,新 cluster 进得来时重新触发 strike。
+        if (locked_cluster_id_ == 0) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] triggerStrike aborted: no locked cluster");
+            return;
+        }
+        if (locked_cluster_last_seen_us_ != 0) {
+            const double last_seen_age_sec =
+                (ros::Time::now().toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
+            if (last_seen_age_sec > max_strike_cluster_age_sec_) {
+                ROS_WARN_THROTTLE(2.0, "[MissionManager] triggerStrike aborted: stale "
+                                  "locked_cluster_id_=%lu last_seen_age=%.2fs > max=%.2fs "
+                                  "— clearing lock, let waypoint continue to attack_point",
+                                  static_cast<unsigned long>(locked_cluster_id_),
+                                  last_seen_age_sec, max_strike_cluster_age_sec_);
+                locked_cluster_id_            = 0;
+                locked_cluster_time_          = ros::Time();
+                locked_cluster_last_seen_us_  = 0;
+                tracked_target_.is_valid      = false;
+                setLockState(TrackLockState::NOT_LOCKED);
+                return;
+            }
+        }
         // 新锁定:reset One Euro Filter,确保首次位置不会被旧目标的 x_prev 污染
         target_smooth_x_.reset();
         target_smooth_y_.reset();
@@ -2432,6 +2531,39 @@ public:
                 continue;
             }
 
+            // === Stale gate by cluster.last_seen_us (2026-07-26)===
+            //   真正能反映"目标是否还在视野里"的判据是 cluster.last_seen_us
+            //   (target_estimator 在 YOLO 命中时刷新,见 target_estimator_node.cpp:285)。
+            //   cluster_states 10Hz 持续把 cluster 当 alive,但 UAV 飞过目标位置后
+            //   YOLO 不再命中 → last_seen_us 停在过去。
+            //   之前用 locked_cluster_time_(cluster_states 回调时刻)做 stale 判据无效,
+            //   因为只要 cluster 还活着就会被 10Hz 持续刷新,age 永远是 0.05~0.1s,
+            //   触发不了任何 threshold,导致:
+            //     1. clusterStatesCallback 仍把 stale cluster 派发到 SEARCH_STRIKE,
+            //        triggerStrike() 启动 guidance 飞向 stale pose,UAV "倒退"
+            //     2. handleSearchStrike 每 tick 看 is_guidance_active_=false +
+            //        current_target_.is_locked=true → 反复 startGuidanceApproach,
+            //        触发 100ms 一次的 GUIDANCE_STRIKE ↔ TARGET_LOST_HOVER ping-pong
+            //   修法:对每个 cluster 派发前检查 last_seen_us,超过阈值:
+            //     - 从 reported_clusters_ 移除(让下一次新检测能进 dispatch)
+            //     - skip(不锁、不报、不触发 strike,避免拉 UAV 飞向旧位置)
+            if (cluster.last_seen_us != 0) {
+                const ros::Time now_ros = ros::Time::now();
+                const double    cluster_age_sec =
+                    (now_ros.toNSec() / 1000ULL - cluster.last_seen_us) / 1e6;
+                if (cluster_age_sec > max_strike_cluster_age_sec_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE "
+                                      "(last_seen_age=%.2fs > max=%.2fs, pose=%.1f,%.1f,%.1f) "
+                                      "→ skip dispatch (let waypoint continue)",
+                                      cluster.cluster_id, cluster.label.c_str(),
+                                      cluster_age_sec, max_strike_cluster_age_sec_,
+                                      cluster.ned_x, cluster.ned_y, cluster.ned_alt);
+                    // 从 dedup 集合移除,允许下一次新检测(last_seen_us 刷新后)重新派发
+                    reported_clusters_.erase(cluster.cluster_id);
+                    continue;
+                }
+            }
+
             // === SEARCH_TRACK 模式特例:lock 跟 label 走,不跟 cluster_id ===
             // 场景:FOV 边缘目标反复进出 / UAV 高速机动 → target_estimator 因 LOS 投影位置
             //   偏移反复开新 cluster_id;但目标没换。如果按 cluster_id 死锁,tracked_target_
@@ -2448,11 +2580,12 @@ public:
                 setLockState(TrackLockState::LOCKED_WAIT_CONFIRM);
                 tracked_target_.locked_at  = ros::Time::now();
                 // 更新 locked_cluster_* 用于 triggerStrike
-                locked_cluster_ned_x_   = cluster.ned_x;
-                locked_cluster_ned_y_   = cluster.ned_y;
-                locked_cluster_ned_alt_ = cluster.ned_alt;
-                locked_cluster_id_      = cluster.cluster_id;
-                locked_cluster_time_    = ros::Time::now();
+                locked_cluster_ned_x_         = cluster.ned_x;
+                locked_cluster_ned_y_         = cluster.ned_y;
+                locked_cluster_ned_alt_       = cluster.ned_alt;
+                locked_cluster_id_            = cluster.cluster_id;
+                locked_cluster_time_          = ros::Time::now();
+                locked_cluster_last_seen_us_  = cluster.last_seen_us;
                 // 当前 cluster_id 也加入 reported(避免同一 cluster 反复 transfer 触发 startGuidanceApproach)
                 reported_clusters_[cluster.cluster_id] = -1;
                 // === 多目标: 通知 estimator 主目标 cluster_id 转移 ===
@@ -2461,7 +2594,17 @@ public:
             }
 
             // dedup — 同一 cluster_id 同 task_flow 只处理一次
+            // 但: 如果这是当前 locked cluster_id,每次 callback 都要刷新
+            //   locked_cluster_time_ 和 locked_cluster_last_seen_us_,
+            //   否则 advanceSkillStateMachine 算 (now - locked_cluster_time_)
+            //   永远 = "首次派发以来秒数",2.0s 后必然误判 TARGET_LOST_HOVER,
+            //   而此时 cluster 实际 YOLO 命中可能一直很新。 (2026-07-26)
             if (reported_clusters_.count(cluster.cluster_id)) {
+                if (cluster.cluster_id == locked_cluster_id_ &&
+                    cluster.last_seen_us != 0) {
+                    locked_cluster_time_         = ros::Time::now();
+                    locked_cluster_last_seen_us_ = cluster.last_seen_us;
+                }
                 continue;
             }
 
@@ -2486,11 +2629,12 @@ public:
             }
 
             // 缓存为 locked_cluster_*,供 attackCmdCallback / triggerStrike 使用
-            locked_cluster_ned_x_   = cluster.ned_x;
-            locked_cluster_ned_y_   = cluster.ned_y;
-            locked_cluster_ned_alt_ = cluster.ned_alt;
-            locked_cluster_id_      = cluster.cluster_id;
-            locked_cluster_time_    = ros::Time::now();
+            locked_cluster_ned_x_         = cluster.ned_x;
+            locked_cluster_ned_y_         = cluster.ned_y;
+            locked_cluster_ned_alt_       = cluster.ned_alt;
+            locked_cluster_id_            = cluster.cluster_id;
+            locked_cluster_time_          = ros::Time::now();
+            locked_cluster_last_seen_us_  = cluster.last_seen_us;
 
             // === 按 work_mode 派发 ===
             switch (current_work_mode_) {
@@ -2523,7 +2667,11 @@ public:
                 tracked_target_.locked_at  = ros::Time::now();
 
                 reported_clusters_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
-                guidance_speed_ = sr.msg.task_speed;
+                // task_speed=0(GS 漏发 / 老 Skill 模板默认值)时会被 guidance_control
+                //   报"non-positive uav_speed"忽略,plane 不动,改成 std::max 兜底,见
+                //   min_guidance_speed_ 字段注释(2026-07-26)
+                //   Skill.msg task_speed 是 float32,需 cast 到 double 才能 std::max
+                guidance_speed_ = std::max(static_cast<double>(sr.msg.task_speed), min_guidance_speed_);
                 startGuidanceApproach();
                 // === 多目标: 通知 estimator 主目标 cluster_id ===
                 publishPrimaryTarget(cluster.cluster_id);
@@ -2579,7 +2727,11 @@ public:
                     detect_targets_pub_.publish(batch);
                 }
                 reported_clusters_[cluster.cluster_id] = 1;
-                guidance_speed_ = sr.msg.task_speed;
+                // task_speed=0(GS 漏发 / 老 Skill 模板默认值)时会被 guidance_control
+                //   报"non-positive uav_speed"忽略,plane 不动,改成 std::max 兜底,见
+                //   min_guidance_speed_ 字段注释(2026-07-26)
+                //   Skill.msg task_speed 是 float32,需 cast 到 double 才能 std::max
+                guidance_speed_ = std::max(static_cast<double>(sr.msg.task_speed), min_guidance_speed_);
                 // 门控通过的 strike:清掉挂起标记,避免后续 advanceAttackPhaseMachine 重复触发
                 attack_strike_pending_             = false;
                 attack_strike_pending_cluster_id_  = 0;
@@ -2971,7 +3123,12 @@ public:
             current_phase_ != MissionPhase::PHASE_HOVERING &&
             current_phase_ != MissionPhase::PHASE_HOLDING) {
             // 切出 TAKING_OFF 时：停止 setpoint 发布器（避免持续发送位置指令覆盖其他模块）
-            if (setpoint_running_) {
+            //   例外:Attack(105) hover 阶段 phase 故意保留为 WAYPOINT_FOLLOW(不让 GS 看到
+            //     phase 跳变),但 mission_manager 主动 latch 了 setpoint publisher 锁 XY+Z
+            //     在 attack_point,一旦停掉 PX4 OFFBOARD 失流 → COM_OFFBOARD_LOSS_TIMEOUT →
+            //     AUTO.LAND failsafe(2026-07-26 修复:用 attack_hover_setpoint_latched_ 标记
+            //     豁免,Attack EXIT_PENDING 路径会清标志并停 publisher)。
+            if (setpoint_running_ && !attack_hover_setpoint_latched_) {
                 stopSetpointPublisher();
             }
             // 注意:不再重置 takeoff_state_。phase=WAYPOINT_FOLLOW/HOLDING 时 takeoff_state_=COMPLETE
@@ -3337,16 +3494,30 @@ public:
         if (restore_mode == WorkMode::IDLE) {
             restore_mode = post_takeoff_work_mode_;
         }
-        bool mode_restored = (restore_mode != current_work_mode_);
-        if (mode_restored) {
+        // === 2026-07-26 fix: 不覆盖新 TaskFlow 首发 Attack(105) 已经 promote 的 SEARCH_STRIKE ===
+        //   时序:advanceSkillStateMachine 先跑 (ENTRY_PENDING→IN_TASK → Attack(105) 路径在 4197 行
+        //   把 current_work_mode_ 升到 SEARCH_STRIKE),然后 performTakeoffHandoff 才在同 tick 跑。
+        //   旧逻辑会无条件 restore 到 work_mode_before_takeoff_,把 SEARCH_STRIKE 又打回 SEARCH_ONLY,
+        //   之后 clusterStatesCallback 走 SEARCH_ONLY 分支,YOLO 命中只 type=3 上报、从不 strike。
+        //   判定:新 TaskFlow 首发是 Attack(105) 且已被 promote → 跳过 restore(已经是正确语义)。
+        bool attack_already_promoted = false;
+        if (current_skill_index_ < skill_queue_.size() &&
+            skill_queue_[current_skill_index_].msg.skill_type == 105 &&
+            current_work_mode_ == WorkMode::SEARCH_STRIKE) {
+            attack_already_promoted = true;
+        }
+        bool mode_restored = false;
+        if (!attack_already_promoted && restore_mode != current_work_mode_) {
             current_work_mode_ = restore_mode;
+            mode_restored = true;
         }
         work_mode_before_takeoff_ = WorkMode::IDLE;  // 一次性缓存,清空防误用
         ROS_WARN("[MissionManager] ===== AUTO-HANDOFF: TAKEOFF -> WAYPOINT_FOLLOW "
-                 "(waypoints=%zu, work_mode=%s%s) =====",
+                 "(waypoints=%zu, work_mode=%s%s%s) =====",
                  current_waypoint_count_,
                  workModeToString(current_work_mode_).c_str(),
-                 mode_restored ? " [restored]" : "");
+                 mode_restored ? " [restored]" : "",
+                 attack_already_promoted ? " [attack-promote preserved]" : "");
         // phase_before_takeoff_ 不在此处清,因为它将在 GROUND_IDLE → TAKING_OFF → HOVERING → WAYPOINT_FOLLOW 链路结束后
         // 由新 task_flow 的 entry 路径再次覆盖。这里清掉反而可能在重新进入 PHASE_TAKING_OFF 的瞬间丢失兜底。
         disableGuidance();  // 起飞后默认关闭制导,等 SEARCH_TRACK/STRIKE 再 enable
@@ -4048,17 +4219,20 @@ public:
         SkillRuntime& sr = skill_queue_[current_skill_index_];
         const ros::Time now = ros::Time::now();
 
-        // === 目标丢失状态机(2026-07-23,用户口径 C)===
-        // 判据:locked_cluster_time_ 的新鲜度(clusterStatesCallback 每次锁定/刷新会更新它)。
-        //   GUIDANCE_TRACK/STRIKE 中 age > T_hold(2s) → 进入 TARGET_LOST_HOVER(disableGuidance,
-        //     waypoint_executor stop → setpoint 0 vel;航向由 yaw_speed_gate_ 在 v=0 时天然冻结)。
+        // === 目标丢失状态机(2026-07-23,用户口径 C;2026-07-26 改用 last_seen_us)===
+        // 判据:locked_cluster_last_seen_us_(YOLO 实际命中微秒戳)的新鲜度。
+        //   此前用 locked_cluster_time_(cluster_states 回调到达时刻)无效 — dedup 路径下
+        //   locked_cluster_time_ 只在首次派发时被设,后续 10Hz callback 直接 continue,
+        //   不刷新时间戳,导致 (now - locked_cluster_time_) 单调递增 → 首次派发后 2.0s
+        //   (target_lost_hold_sec_)必然误判 TARGET_LOST_HOVER,即使 YOLO 命中一直新鲜。
+        //   修法:dedup 分支同步刷新 locked_cluster_time_/last_seen_us_ (见 clusterStatesCallback),
+        //        此处改用 (now - last_seen_us) 反映"YOLO 多久没看到目标"。
+        //   GUIDANCE_TRACK/STRIKE 中 age > T_hold(2s) → 进入 TARGET_LOST_HOVER。
         //   TARGET_LOST_HOVER 中 age > T_resume(10s) → 回 WAYPOINT_FOLLOW,resume 段扫描。
-        //   若目标在 hover 期间重现,clusterStatesCallback 会刷新 locked_cluster_time_,age 复位,
-        //     此处不主动 re-enable guidance(用户口径未要求);等 T_resume 回 waypoint 后由正常搜索链路重锁。
         if ((current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
              current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE) &&
-            locked_cluster_id_ != 0 && !locked_cluster_time_.isZero()) {
-            double age = (now - locked_cluster_time_).toSec();
+            locked_cluster_id_ != 0 && locked_cluster_last_seen_us_ != 0) {
+            double age = (now.toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
             if (age > target_lost_hold_sec_) {
                 ROS_WARN("[MissionManager] Target lost in guidance (cluster=%lu age=%.1fs > hold=%.1fs) "
                          "→ TARGET_LOST_HOVER",
@@ -4074,9 +4248,10 @@ public:
             }
         } else if (current_phase_ == MissionPhase::PHASE_TARGET_LOST_HOVER &&
                    target_lost_hover_active_) {
-            double age = locked_cluster_time_.isZero()
-                             ? (now - target_lost_hover_enter_time_).toSec()
-                             : (now - locked_cluster_time_).toSec();
+            // 恢复超时: 用 last_seen_us 优先;若从未锁定(target_lost 期间 0),fallback 进入时间
+            double age = (locked_cluster_last_seen_us_ != 0)
+                             ? (now.toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6
+                             : (now - target_lost_hover_enter_time_).toSec();
             if (age > target_lost_resume_sec_) {
                 ROS_WARN("[MissionManager] Target lost resume timeout (age=%.1fs > resume=%.1fs) "
                          "→ WAYPOINT_FOLLOW, resuming segment scan",
@@ -4215,6 +4390,25 @@ public:
                 // IN_TASK 分支不再需要主动轮询 strike/lock 决策,只等 attack_cmd 处理 SEARCH_TRACK 的确认。
                 // (代码保留注释,便于将来在此处加技能超时/计数等通用逻辑。)
 
+                // === Attack(105) sticky 防御性 promote:每 tick 强制 work_mode=SEARCH_STRIKE ===
+                //   背景:ENTRY_PENDING→IN_TASK 一次性 promote(4209 行)只在 transition 时跑一次。
+                //     - GS 通过 typedWorkModeCallback 持续发 SET_WORKMODE=SEARCH_ONLY 会被覆盖回去,
+                //       1Hz topic /uav0/mission/current_work_mode 又会显示 mode:3
+                //     - 用户 SITL 实测 2026-07-26:Topic 一直是 3,clusterStatesCallback 派发走 SEARCH_ONLY 分支,
+                //       YOLO 命中只 type=3,从不 strike(就反馈"一直 search_only,没切 search_strike")
+                //   fix:在 IN_TASK case 头部,每 10Hz tick 强制 current_work_mode_=SEARCH_STRIKE,
+                //     让 1Hz publish 总能赶上最新值,即便 GS 同 tick 后发 SEARCH_ONLY 也会被下一拍
+                //     10Hz skillAdvanceTimer 重新升回 SEARCH_STRIKE(topic 100ms 内刷新)。
+                //   协议注释:这条强制 promote 与 typedWorkModeCallback 在 GS 显式 SET_WORKMODE=IDLE
+                //     时仍然冲突,但 IDLE 表示"退出任务",Attack(105) IN_TASK 期间 GS 不应发 IDLE。
+                if (sr.msg.skill_type == 105 && current_work_mode_ != WorkMode::SEARCH_STRIKE) {
+                    WorkMode old_mode = current_work_mode_;
+                    current_work_mode_ = WorkMode::SEARCH_STRIKE;
+                    ROS_WARN_THROTTLE(5.0, "[MissionManager] Attack(105) IN_TASK sticky promote: "
+                                          "work_mode %s -> SEARCH_STRIKE",
+                                          workModeToString(old_mode).c_str());
+                }
+
                 // skill_type=101 集结合:本机先到点进入 HOLDING,再等伙伴 HOLDING 或 timeout
                 if (sr.msg.skill_type == 101) {
                     // 本机已飞到 skill_area_path 最后一个航点。
@@ -4277,21 +4471,90 @@ public:
                 if (!latest_wp_status_) break;
                 if (latest_wp_status_->skill_idx >= latest_wp_status_->skill_total &&
                     latest_wp_status_->skill_id == sr.msg.skill_id) {
-                    // === Attack(105) 专用:到达 attack_point 即记录时刻 ===
-                    //   partner 据此算全局 strike_sync_time(formation=2)
-                    //   一帧只记一次(防止 repeated trigger)
+                    // === Attack(105) 专用:到达 attack_point 不立即 EXIT_PENDING(2026-07-26 修复) ===
+                    //   旧行为:UAV 踩到 attack_point 立刻 EXIT_PENDING → COMPLETE。
+                    //     此时目标转头刚进视野,target_estimator→YOLO→clusterStatesCallback→
+                    //     triggerStrike() 还没拿到第一帧就被收尾,YOLO 后续命中只发 type=3
+                    //     (cluster_states_callback pending 路径)然后 skill 整体结束,UAV 转向下一
+                    //     skill 或回 hold,完全错过 strike 时机。
+                    //   新行为:在 attack_point 锁住一帧,沿用已有 trigger 链路:
+                    //     - 记录 attack_arrival_time_(partner 据此算 strike_sync_time 不变)
+                    //     - 记录 attack_hover_enter_time_(mission_manager 自己兜底超时用)
+                    //     - 切 attack_phase_ = SEARCHING(沿用 search 阶段的目标检测/聚类)
+                    //     - 起 setpoint publisher 在 attack_point 锁 XY+Z(详见下面 inline 说明)
+                    //     - **不**转换 SkillState,保持在 IN_TASK
+                    //   strike 真触发由 clusterStatesCallback(SEARCH_STRIKE 分支)+ advanceAttackPhaseMachine
+                    //     完成,本分支不直接调 triggerStrike()。
+                    //   退出路径见本 if 块之后的两段:(a) attack_hover_timeout 兜底;(b) 已有 attack_strike_pending_timeout 兜底。
                     if (sr.msg.skill_type == 105 &&
                         sr.attack_arrival_time_.isZero()) {
-                        sr.attack_arrival_time_ = ros::Time::now();
-                        ROS_WARN("[MissionManager] Attack(105) arrived at attack_point "
-                                 "ts=%.3f (comm → heartbeat for partner recompute)",
-                                 sr.attack_arrival_time_.toSec());
+                        sr.attack_arrival_time_     = now;
+                        sr.attack_hover_enter_time_ = now;
+                        sr.attack_phase_            = SkillRuntime::AttackPhase::SEARCHING;
+
+                        // 起 setpoint publisher 锁位置在 attack_point,避免 OFFBOARD 失流 →
+                        //   PX4 COM_OFFBOARD_LOSS_TIMEOUT → AUTO.LAND failsafe。
+                        //   复用 startSetpointPublisher()/takeoff_setpoint_ 既有机制,
+                        //   此时 UAV 刚踩到 attack_point,current_pose_ 即是该处,直接 latch。
+                        //   注意:**不**改 current_phase_,与 enterHoldState() 在此处的区别。
+                        if (!setpoint_running_ && is_pose_received_) {
+                            startSetpointPublisher();
+                            takeoff_setpoint_.pose.position.x = current_pose_.pose.position.y;  // y_ned → x_enu (east)
+                            takeoff_setpoint_.pose.position.y = current_pose_.pose.position.x;  // x_ned → y_enu (north)
+                            takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z; // 当前高度
+                            attack_hover_setpoint_latched_ = true;
+                            ROS_WARN("[MissionManager] Attack(105) setpoint publisher latched at attack_point "
+                                     "(pos=%.2f,%.2f, alt=%.2f)",
+                                     takeoff_setpoint_.pose.position.x,
+                                     takeoff_setpoint_.pose.position.y,
+                                     takeoff_setpoint_.pose.position.z);
+                        }
+
+                        ROS_WARN("[MissionManager] Attack(105) arrived at attack_point ts=%.3f → "
+                                 "HOVERING for strike trigger (hover_timeout=%.1fs, pending=%s)",
+                                 sr.attack_arrival_time_.toSec(), attack_hover_timeout_sec_,
+                                 attack_strike_pending_ ? "true" : "false");
                     }
-                    sr.state = SkillState::EXIT_PENDING;
-                    sr.state_enter_time = now;
-                    sr.last_event = "IN_TASK to EXIT_PENDING (skill area done)";
-                    ROS_WARN("[MissionManager] Skill[%zu] id=%s to EXIT_PENDING",
-                             current_skill_index_, sr.msg.skill_id.c_str());
+                    // Attack(105) 不进 EXIT_PENDING(已在上面分支完成 hover 起步);其余 skill_type 沿用旧行为
+                    if (sr.msg.skill_type != 105) {
+                        sr.state = SkillState::EXIT_PENDING;
+                        sr.state_enter_time = now;
+                        sr.last_event = "IN_TASK to EXIT_PENDING (skill area done)";
+                        ROS_WARN("[MissionManager] Skill[%zu] id=%s to EXIT_PENDING",
+                                 current_skill_index_, sr.msg.skill_id.c_str());
+                    }
+                }
+
+                // === Attack(105) 等待 strike trigger 兜底超时(2026-07-26) ===
+                //   覆盖"到 attack_point 始终没看到目标"的场景,与 attack_strike_pending_timeout_sec_
+                //   在 advanceAttackPhaseMachine 中的 60s 兜底互为补充:
+                //     - 本超时:即使完全没设过 attack_strike_pending_(没收到任何 cluster)也跑;
+                //       设置后无敌触发,就放弃。
+                //     - 已有兜底:只在 attack_strike_pending_ 已 true 但 gating 一直 WAITING 时跑。
+                //   优先级:此处 EXIT_PENDING(攻击放弃)在 in_task_timeout → FAILED 之前;若 in_task_timeout_
+                //   同时爆,FAILED 覆盖(更严重,符合"内层 timeout 被外层 timeout 顶上"的语义)。
+                if (sr.msg.skill_type == 105 &&
+                    !sr.attack_hover_enter_time_.isZero() &&
+                    attack_hover_timeout_sec_ > 0.0 &&
+                    (now - sr.attack_hover_enter_time_).toSec() > attack_hover_timeout_sec_) {
+                    sr.attack_phase_      = SkillRuntime::AttackPhase::ABANDONED;
+                    sr.state               = SkillState::EXIT_PENDING;
+                    sr.state_enter_time    = now;
+                    sr.last_event          = "IN_TASK to EXIT_PENDING (attack hover timeout)";
+                    // 结束 hover:清 latched 标志并停 setpoint publisher。
+                    //   此时 phase=WAYPOINT_FOLLOW,runPx4TakeoffSequence 下个 tick
+                    //   看到标志为 false 才会 stop(否则会因 phase 不对不停,后续 skill
+                    //   接管时残留 publisher 流会冲突)。
+                    attack_hover_setpoint_latched_ = false;
+                    if (setpoint_running_) {
+                        stopSetpointPublisher();
+                    }
+                    ROS_WARN("[MissionManager] Skill[%zu] id=%s Attack(105) HOVER TIMEOUT "
+                             "(%.1fs > %.1fs), ABANDONED (pending=%s)",
+                             current_skill_index_, sr.msg.skill_id.c_str(),
+                             (now - sr.attack_hover_enter_time_).toSec(),
+                             attack_hover_timeout_sec_,
+                             attack_strike_pending_ ? "true" : "false");
                 }
 
                 // in_task_timeout 检查
@@ -4415,6 +4678,11 @@ public:
                         sr.state = SkillState::EXIT_PENDING;
                         sr.state_enter_time = ros::Time::now();
                         sr.last_event = "IN_TASK to EXIT_PENDING (attack abandon)";
+                        // 结束 hover:同上,清标志停 publisher
+                        attack_hover_setpoint_latched_ = false;
+                        if (setpoint_running_) {
+                            stopSetpointPublisher();
+                        }
                     }
                 }
             }
@@ -4564,6 +4832,46 @@ public:
             // 目标未锁定，执行航点
             current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
         } else {
+            // === Stale-locked 守卫(2026-07-26)===
+            //   场景:target_lost_hold 触发 disableGuidance(),但 current_target_.is_locked
+            //     没被清(clusterStatesCallback 锁定时设的,disableGuidance 不改它)。
+            //     下一个 tick handleSearchTrack 看到 is_guidance_active_=false +
+            //     is_locked=true → 反复 startGuidanceApproach(),触发 100ms 一次的
+            //     GUIDANCE_TRACK ↔ TARGET_LOST_HOVER ping-pong,且 guidance 仍按
+            //     stale pose 给 setpoint → UAV 飞回旧位置("倒退")。
+            //   守门:is_locked 但 last_seen_us 已老 → 主动 disable + 清锁,
+            //     让 waypoint 接管,与 clusterStatesCallback 派发前的 stale gate 互补。
+            //   阈值 2026-07-26:用 target_lost_hold_sec_(默认 2.0s)代替 max_strike_cluster_age_sec_(0.5s),
+            //     让 stale-locked guard 跟 advanceSkillStateMachine 共用同一判据和阈值,
+            //     避免 0.5s vs 2.0s 两个 guard 在同一目标的 last_seen 上互相干扰。
+            if (locked_cluster_last_seen_us_ != 0) {
+                const double last_seen_age_sec =
+                    (ros::Time::now().toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
+                if (last_seen_age_sec > target_lost_hold_sec_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] handleSearchTrack: locked target "
+                                      "stale (last_seen_age=%.2fs > hold=%.2fs, cluster=%lu) "
+                                      "— disable guidance, clear lock, resume waypoint",
+                                      last_seen_age_sec, target_lost_hold_sec_,
+                                      static_cast<unsigned long>(locked_cluster_id_));
+                    disableGuidance();
+                    current_target_.is_locked   = false;
+                    current_target_.is_detected = false;
+                    current_target_.is_shared   = false;
+                    locked_cluster_id_            = 0;
+                    locked_cluster_time_          = ros::Time();
+                    locked_cluster_last_seen_us_  = 0;
+                    tracked_target_.is_valid      = false;
+                    setLockState(TrackLockState::NOT_LOCKED);
+                    // 重启 waypoint_executor(若它还在 stop 状态)
+                    std_msgs::String wp_cmd;
+                    wp_cmd.data = "resume";
+                    waypoint_control_pub_.publish(wp_cmd);
+                    current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                    current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
+                    publishPrimaryTarget(0);
+                    return;
+                }
+            }
             // 目标已锁定，直接启动制导接近
             startGuidanceApproach();
         }
@@ -4580,6 +4888,35 @@ public:
             // 目标未锁定，执行航点
             current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
         } else {
+            // === Stale-locked 守卫(2026-07-26),与 handleSearchTrack 同因同解 ===
+            //   阈值统一用 target_lost_hold_sec_(默认 2.0s)代替 max_strike_cluster_age_sec_(0.5s)。
+            if (locked_cluster_last_seen_us_ != 0) {
+                const double last_seen_age_sec =
+                    (ros::Time::now().toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
+                if (last_seen_age_sec > target_lost_hold_sec_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] handleSearchStrike: locked target "
+                                      "stale (last_seen_age=%.2fs > hold=%.2fs, cluster=%lu) "
+                                      "— disable guidance, clear lock, resume waypoint",
+                                      last_seen_age_sec, target_lost_hold_sec_,
+                                      static_cast<unsigned long>(locked_cluster_id_));
+                    disableGuidance();
+                    current_target_.is_locked   = false;
+                    current_target_.is_detected = false;
+                    current_target_.is_shared   = false;
+                    locked_cluster_id_            = 0;
+                    locked_cluster_time_          = ros::Time();
+                    locked_cluster_last_seen_us_  = 0;
+                    tracked_target_.is_valid      = false;
+                    setLockState(TrackLockState::NOT_LOCKED);
+                    std_msgs::String wp_cmd;
+                    wp_cmd.data = "resume";
+                    waypoint_control_pub_.publish(wp_cmd);
+                    current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                    current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
+                    publishPrimaryTarget(0);
+                    return;
+                }
+            }
             // 目标已锁定，直接启动制导接近
             startGuidanceApproach();
         }

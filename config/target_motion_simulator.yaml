@@ -29,8 +29,13 @@ targets:
   # - {label: "truck",  x_init:  50.0, y_init: -250.0, max_speed: 4.0, max_tangential_acc: 1.5, max_normal_acc: 0.8}   # 卡车 (远距 256m,验证反向视角投影)
 
 # /target_position(Point,兼容 topic)取哪个目标作为主目标
-# === 2026-07-16: 测试多目标,默认指向新增的远距卡车,验证反向视角投影 + 大距离稳定性 ===
-primary_index: 10
+# === 2026-07-26: 修复 ===
+#   原 primary_index: 10 超出 targets 数组长度(targets 只有 2 项),
+#   target_motion_simulator_node.cpp:139-141 自动 fallback 到 0(x=60,y=-100 不是用户真目标),
+#   导致 guidance_control_node 算 STRIKE EVAL min_dist 永远偏大(141m).
+#   /target_position 现在 strike_eval 已停用(enable_strike_evaluation=false),
+#   但这个字段仍是真值,改 1 = targets[1] = (x=0, y=-205, 慢速人),用户真目标。
+primary_index: 1
 
 # ===== 全局默认运动参数(targets 项缺省时回落;同时兼容旧单目标 x_init/y_init/label) =====
 max_speed: 0.01            # 最大速度(m/s)
