@@ -210,6 +210,15 @@ private:
     // 只有 SEARCH_ONLY 模式下航点执行器才发控制指令，其他模式交给 guidance_control
     std::string current_work_mode_;
 
+    // === Attack(105) 专用 ===
+    // 当前 skill_type(由 skillCallback 缓存)。executeSegmentFlight 用此判断:
+    //   - SKILL_AREA 段 idx>=1 且 active_skill_type_==105 时:
+    //     把 L1 bearing 覆盖为"指向 WP2",保证 UAV 机头朝向目标,方便 YOLO 锁定。
+    uint8_t active_skill_type_ = 0;
+    // Attack(105) WP2 地板高度(NED 米,负值=地上方米)
+    //   GS 发的目标 MSL=0(地面)时,不直接撞过去,而是保持至少此高度悬停/接近。
+    double   attack_min_altitude_ned_ = -20.0;
+
 public:
     WaypointExecutor() : nh_private_("~"),
         current_waypoint_index_(0),
@@ -344,6 +353,12 @@ public:
 
         // 航向控制选择：true=跟踪地面站发送的期望航向，false=计算航点指向
         nh_private_.param<bool>("use_desired_yaw_from_wp", use_desired_yaw_from_wp_, true);
+
+        // === Attack(105) 专用 ===
+        // WP2 地板高度(NED),默认 -10.0m = 相对本机 home 上方 10m,避免 GS 标的目标
+        // MSL=0 时飞机直接撞地。skillCallback 在 Attack skill 收到时把 WP2 的
+        // ned_z 钳到此值上限。
+        nh_private_.param<double>("attack_min_altitude_ned", attack_min_altitude_ned_, -20.0);
     }
 
     void initSubscribers() {
@@ -452,9 +467,17 @@ public:
 
     /**
      * GPS (WGS84) -> NED 坐标转换
+     *
+     * @param alt_is_msl  false(默认)=alt 已是相对 PX4 home 的米数(GS 给的"home 上方 N 米"),
+     *                          适用于 Search/Gather/Return 等常规 skill。
+     *                    true =alt 是 MSL 绝对高(海平面之上),用于 Attack(105):
+     *                          跨机协同场景里探测机记录的是目标 MSL + 绝对 GPS,
+     *                          GS 转发给接收机,接收机必须用本机 ref_alt_ 归算成本地 NED。
+     *                          要求 ref_alt_ 已 locked(见 homePositionCallback / skillCallback 安全门)。
      */
     void gpsToNed(double lat, double lon, double alt,
-                  double& ned_x, double& ned_y, double& ned_z) {
+                  double& ned_x, double& ned_y, double& ned_z,
+                  bool alt_is_msl = false) {
         const double EARTH_R = 6378137.0;
 
         // 纬度差 -> N (北向)
@@ -466,7 +489,13 @@ public:
         ned_y = d_lon * M_PI / 180.0 * EARTH_R * cos(ref_lat_ * M_PI / 180.0);
 
         // 高度差 -> D (下向)
-        ned_z = -(alt);// - ref_alt_);
+        //   alt_is_msl=true  : MSL 绝对高,减 ref_alt_ 归算成本机 NED
+        //   alt_is_msl=false : GS 已发相对量,直接取负
+        if (alt_is_msl) {
+            ned_z = -(alt - ref_alt_);
+        } else {
+            ned_z = -alt;
+        }
     }
 
     /**
@@ -475,6 +504,10 @@ public:
      * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
      * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
      * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
+     *
+     * 注意:ref_alt_ 是 Attack(105) MSL → 本地 NED 转换的唯一权威来源。
+     * skillCallback 会在 ref_initialized_=false 时拒绝 Attack skill,
+     * 保证只有 home 锁定后才接收需要 MSL→NED 的航点。
      */
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
         if (ref_initialized_) return;  // 锁一次
@@ -680,7 +713,24 @@ public:
 
         double dx_to_target = target_wp.ned_x - current_ned_x_;
         double dy_to_target = target_wp.ned_y - current_ned_y_;
-        const double effective_target_z = target_wp.ned_z + lidar_altitude_offset_;
+        // === Attack(105) SKILL_AREA 飞行轨迹高度钳 ===
+        //   不修改 WP2 坐标,只在飞行目标 z 上钳到 attack_min_altitude_ned_
+        //   (默认 -20m = 20m AGL)。效果:
+        //     - WP1→WP2 段:飞机沿 WP1→WP2 直线飞,目标 z 钳到 20m AGL
+        //       → 用户口径:"沿 WP1→WP2 飞,到 AGL 20m 停"
+        //     - 到达 WP2 水平位置(20m AGL)时,YOLO 命中 → strike 接管;
+        //       YOLO 没命中 → 20m AGL hover 等
+        //   NED 下向=正,ned_z 越大=越低;ned_z > attack_min_altitude_ned_ 表示低于 20m AGL,需要钳到上限
+        double target_z_for_flight = target_wp.ned_z;
+        if (active_skill_type_ == 105 &&
+            segment_phase_ == SegmentPhase::SKILL_AREA &&
+            target_z_for_flight > attack_min_altitude_ned_) {
+            ROS_WARN_THROTTLE(5.0,
+                "[WaypointExecutor] Attack(105) flight path altitude clamp: target_wp.ned_z=%.2f -> %.2f (20m AGL floor)",
+                target_z_for_flight, attack_min_altitude_ned_);
+            target_z_for_flight = attack_min_altitude_ned_;
+        }
+        const double effective_target_z = target_z_for_flight + lidar_altitude_offset_;
         double dz_to_target = effective_target_z - current_ned_z_;
         double dist_to_target = sqrt(dx_to_target*dx_to_target +
                                      dy_to_target*dy_to_target +
@@ -785,11 +835,23 @@ public:
                 bearing = atan2(dy_la, dx_la);
             }
         }
-        // 打印当前位置、目标位置、距离、段方位角（5s 一次，状态变化另有日志）
-        ROS_INFO_THROTTLE(5.0, "[WaypointExecutor] SegmentPhase=%d, idx=%lu, cur=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), dist=%.2f, bearing=%.1fdeg",
+
+        // === Attack(105) SKILL_AREA 接近段(idx>=1):机头朝向 WP2(目标) ===
+        //   WP1 → WP2 段,L1 沿段方向算 lookahead,机头可能不正对目标;
+        //   对搜索/打击场景,YOLO 朝向必须朝目标,这里强制 bearing = 朝 WP2。
+        //   仅在非终段(< final_approach_threshold_)时不覆盖,终段 P-control 已经用直指目标。
+        if (active_skill_type_ == 105 &&
+            segment_phase_ == SegmentPhase::SKILL_AREA &&
+            skill_area_idx_ >= 1 &&
+            dist_h >= final_approach_threshold_) {
+            bearing = atan2(dy_to_target, dx_to_target);
+        }
+        // 打印当前位置、目标位置(原始 vs 钳后)、距离、段方位角(5s 一次,状态变化另有日志)
+        ROS_INFO_THROTTLE(5.0, "[WaypointExecutor] SegmentPhase=%d, idx=%lu, cur=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), target_z_flight=%.2f, dist=%.2f, bearing=%.1fdeg",
                            static_cast<int>(segment_phase_), *cur_idx,
                            current_ned_x_, current_ned_y_, current_ned_z_,
                            target_wp.ned_x, target_wp.ned_y, target_wp.ned_z,
+                           target_z_for_flight,
                            dist_to_target, bearing * 180.0 / M_PI);
 
         // === 垂直速度(参考 executeWaypointFlight 的限幅)===
@@ -805,7 +867,9 @@ public:
 
         // === 应用 AvoidanceCmd(横向严禁需要段方向来分解速度,清掉横向补偿)===
         applyAvoidanceCmd(vx, vy, vz, bearing);
-        applyBuildingAvoidance(vx, vy, vz, target_wp.ned_z);
+        // applyBuildingAvoidance 拿钳制后的 target_z_for_flight,避免 HOLD_HIGH 状态
+        //   以为目标是 WP2 真实高(可能是地面)而把飞机绕开到错误高度。
+        applyBuildingAvoidance(vx, vy, vz, target_z_for_flight);
 
         // === 距离判定 ===
         if (dist_to_target < arrival_threshold_) {
@@ -1231,23 +1295,42 @@ public:
                  msg->arrive_path.poses.size(),
                  msg->skill_area_path.poses.size());
 
+        // === 高度语义分流 ===
+        // Attack(105) 跨机协同,GS 发的是探测机记录的 MSL+绝对 GPS,接收机要按本机
+        // ref_alt_ 归算成本地 NED;其余 skill 由 GS 发相对 home 的米数。
+        const bool alt_is_msl = (msg->skill_type == 105);
+        if (alt_is_msl && !ref_initialized_) {
+            ROS_ERROR("[WaypointExecutor] Attack(105) Skill received but PX4 home "
+                      "(ref_alt_) not yet locked — refusing to convert MSL altitude. "
+                      "Dropping skill_id=%s", msg->skill_id.c_str());
+            return;
+        }
+
         active_flow_id_  = "";  // TaskFlow 里的 flow_id 需要额外下发,这里先用 skill_id
         active_skill_id_ = msg->skill_id;
+        active_skill_type_ = msg->skill_type;
         cruise_speed_    = msg->cruise_speed > 0.0 ? msg->cruise_speed : uav_speed_;
         task_speed_      = msg->task_speed > 0.0 ? msg->task_speed : uav_speed_;
 
         // arrive_path
         arrive_queue_.clear();
         for (const auto& pose : msg->arrive_path.poses) {
-            arrive_queue_.push_back(poseToWaypoint(pose));
+            arrive_queue_.push_back(poseToWaypoint(pose, alt_is_msl));
         }
         arrive_idx_ = 0;
 
         // skill_area_path
         skill_area_queue_.clear();
         for (const auto& pose : msg->skill_area_path.poses) {
-            skill_area_queue_.push_back(poseToWaypoint(pose));
+            skill_area_queue_.push_back(poseToWaypoint(pose, alt_is_msl));
         }
+        // === Attack(105) 高度钳制改为钳飞行轨迹 ===
+        //   旧逻辑在这里改 skill_area_queue_.back().ned_z(改 WP2 坐标);
+        //   新逻辑:不修改 WP2 坐标,在 executeSegmentFlight 中把 target_z 钳到
+        //   attack_min_altitude_ned_(默认 -20m = 20m AGL)。
+        //   效果:WP1→WP2 整段直线目标 z 都被钳到 20m AGL,飞机沿原航线飞到 20m AGL 时停,
+        //   然后等 YOLO(用户口径:"沿 WP1→WP2 飞,到 AGL 20m 停")。
+        //   WP2 真实高保持不变,后续 strike 由 guidance 接管。
         skill_area_idx_ = 0;
 
         // 段状态
@@ -1286,13 +1369,15 @@ public:
         publishWaypointStatus();
     }
 
-    /** PoseStamped(GPS in position) → Waypoint */
-    Waypoint poseToWaypoint(const geometry_msgs::PoseStamped& pose) {
+    /** PoseStamped(GPS in position) → Waypoint
+     *  @param alt_is_msl 透传给 gpsToNed;true 时 pose.position.z 解释为 MSL 绝对高(Attack 105 用) */
+    Waypoint poseToWaypoint(const geometry_msgs::PoseStamped& pose,
+                            bool alt_is_msl = false) {
         Waypoint wp;
         wp.lat = pose.pose.position.x;
         wp.lon = pose.pose.position.y;
         wp.alt = pose.pose.position.z;
-        gpsToNed(wp.lat, wp.lon, wp.alt, wp.ned_x, wp.ned_y, wp.ned_z);
+        gpsToNed(wp.lat, wp.lon, wp.alt, wp.ned_x, wp.ned_y, wp.ned_z, alt_is_msl);
 
         // orientation (四元数 → yaw)
         double qx = pose.pose.orientation.x;

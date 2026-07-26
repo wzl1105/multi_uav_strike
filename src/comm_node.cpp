@@ -112,6 +112,9 @@ private:
     double current_heartbeat_rate_; // 当前实际频率
     uint8_t current_typed_work_mode_;   // 来自 mission_manager 的 typed mode(占位)
     int32_t current_skill_type_;        // 当前 skill_type(占位)
+    uint64_t current_attack_arrival_time_us_ = 0;  // 来自 MissionState.attack_arrival_time_us
+    //   Attack(105) formation=2 协同:本机到达 attack_point 的微秒时间戳
+    //   partner 据此算全局 strike_sync_time
     std::string current_skill_id_;      // 当前 skill_id(占位)
     uint8_t current_phase_;             // 来自 mission_manager 的 MissionState.phase(uav_avoidance 仲裁用)
 
@@ -492,6 +495,8 @@ public:
         hs.vx            = self_velocity_ned_x_;
         hs.vy            = self_velocity_ned_y_;
         hs.vz            = self_velocity_ned_z_;
+        // Attack(105) formation=2 协同:本机到达 attack_point 的微秒时间戳(0=未到)
+        hs.attack_arrival_time_us = current_attack_arrival_time_us_;
         inter_uav_status_pub_.publish(hs);
 
         // 2. 清理超时心跳
@@ -531,6 +536,8 @@ public:
         current_skill_id_   = msg->skill_id;
         // phase 字段也灌进心跳,uav_avoidance 用 (work_mode, phase) 联合判定优先级
         current_phase_      = msg->phase;
+        // Attack(105) formation=2 协同专用:本机到达 attack_point 的微秒时间戳
+        current_attack_arrival_time_us_ = msg->attack_arrival_time_us;
     }
 
     /**

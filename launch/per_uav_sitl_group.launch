@@ -73,7 +73,7 @@
           pkg="multi_uav_strike"
           type="gimbal_simulator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -90,7 +90,7 @@
           pkg="multi_uav_strike"
           type="target_estimator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -106,7 +106,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -123,7 +123,7 @@
           pkg="multi_uav_strike"
           type="waypoint_executor_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -140,7 +140,7 @@
           pkg="multi_uav_strike"
           type="comm_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <param name="uav_name" value="$(arg uav_name)" />
@@ -156,7 +156,7 @@
           pkg="multi_uav_strike"
           type="mission_manager_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <param name="device_id" value="$(arg device_id)" />
       <param name="uav_device_sn" value="$(arg device_sn)" />
       <param name="world_ref_auto" value="$(arg world_ref_auto)" />
@@ -178,7 +178,7 @@
           pkg="multi_uav_strike"
           type="uav_avoidance_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"

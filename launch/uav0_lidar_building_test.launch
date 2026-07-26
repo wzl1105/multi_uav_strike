@@ -11,7 +11,7 @@
         pkg="multi_uav_strike"
         type="target_motion_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
     <rosparam command="load"
               file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
   </node>
@@ -32,5 +32,6 @@
         name="rviz"
         pkg="rviz"
         type="rviz"
+        respawn="true"
         args="-d $(find multi_uav_strike)/rviz/view_strike_triple.rviz" />
 </launch>

@@ -652,6 +652,8 @@ private:
         if (proj_ok) {
             tx = target_world.x();
             ty = target_world.y();
+            // 注: target_world.z() 数学上等于 target_z_prior_(射线与 prior 平面求交),
+            //   这里写 target_z_prior_ 与写 target_world.z() 完全等价,选前者更直观。
             tz = target_z_prior_;
         } else {
             tx = ty = tz = 0.0;

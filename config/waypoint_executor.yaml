@@ -24,3 +24,10 @@ lidar_max_relative_altitude: 500.0
 lidar_slowdown_distance: 300.0
 lidar_climb_trigger_distance: 100.0
 lidar_stop_distance: 20.0
+
+# === Attack(105) 专用参数(2026-07-26) ===
+# Attack(105) 飞行高度下限(NED)。
+# 注:此处只钳飞行轨迹(沿 WP1→WP2 直线钳到 attack_min_altitude_ned_),不修改 WP2 坐标本身。
+# 默认 -20m = 相对 home 20m AGL。若 GS 发目标 MSL=0(地面),UAV 飞 WP2 时
+# 实际以 20m AGL 直线飞向 WP2,水平方向对准目标,vertical strike 由 guidance 接管。
+attack_min_altitude_ned: -20.0

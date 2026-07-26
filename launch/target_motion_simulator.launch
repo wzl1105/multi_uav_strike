@@ -4,8 +4,8 @@
     <node name="target_motion_simulator_node" 
           pkg="multi_uav_strike" 
           type="target_motion_simulator_node" 
-          output="screen" 
-          respawn="false"> <!-- respawn=false：节点退出后不自动重启 -->
+          output="screen"
+          respawn="true"> <!-- respawn=true：节点退出后自动重启，提高鲁棒性 -->
 
         <!-- 核心参数配置（所有参数均显式声明，方便修改） -->
         <!-- 初始位置 -->
