@@ -3,8 +3,8 @@
     <node name="gimbal_simulator_node" 
           pkg="multi_uav_strike" 
           type="gimbal_simulator_node" 
-          output="screen" 
-          respawn="false">
+          output="screen"
+          respawn="true">
 
         <!-- 云台核心参数 -->
         <param name="image_width" value="1920" type="int" />

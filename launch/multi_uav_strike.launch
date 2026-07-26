@@ -4,7 +4,7 @@
         pkg="multi_uav_strike"
         type="target_motion_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
       <!-- 核心参数配置（所有参数均显式声明，方便修改） -->
       <!-- 初始位置 -->
       <param name="x_init" value="0.0" type="double" />
@@ -30,7 +30,7 @@
         pkg="multi_uav_strike"
         type="gimbal_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
       <param name="image_width" value="1920" type="int" />
       <param name="image_height" value="1080" type="int" />
       <param name="fov_deg" value="45.0" type="double" />
@@ -45,7 +45,7 @@
           pkg="multi_uav_strike"
           type="target_estimator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
         <param name="num_particles" value="500" type="int" />
         <param name="init_dist_std_dev" value="1.0" type="double" />
         <param name="process_noise_std_dev" value="0.2" type="double" />
@@ -65,7 +65,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
         <param name="guidance_strategy" value="intercept" type="str" />
         <param name="uav_speed" value="10.0" type="double" />
         <param name="intercept_time_horizon" value="5.0" type="double" />
@@ -90,7 +90,7 @@
         pkg="multi_uav_strike"
         type="gimbal_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
       <param name="image_width" value="1920" type="int" />
       <param name="image_height" value="1080" type="int" />
       <param name="fov_deg" value="45.0" type="double" />
@@ -105,7 +105,7 @@
           pkg="multi_uav_strike"
           type="target_estimator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
         <param name="num_particles" value="500" type="int" />
         <param name="init_dist_std_dev" value="1.0" type="double" />
         <param name="process_noise_std_dev" value="0.2" type="double" />
@@ -125,7 +125,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
         <param name="guidance_strategy" value="los" type="str" />
         <param name="uav_speed" value="10.0" type="double" />
         <param name="intercept_time_horizon" value="5.0" type="double" />
@@ -143,5 +143,5 @@
     </node>
   </group>
 
-  <node name="rviz" pkg="rviz" type="rviz" args="-d $(find multi_uav_strike)/rviz/view_strike.rviz" />
+  <node name="rviz" pkg="rviz" type="rviz" respawn="true" args="-d $(find multi_uav_strike)/rviz/view_strike.rviz" />
 </launch>

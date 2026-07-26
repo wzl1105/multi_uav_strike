@@ -11,3 +11,8 @@ int32   state
 #   5 = GUIDANCE_STRIKE, 6 = RETURNING, 7 = COMPLETE, 8 = FAILED, 9 = HOLDING,
 #   10 = OVERRIDDEN, 11 = TARGET_LOST_HOVER
 uint8   phase
+
+# Attack(105) 协同打击专用:
+#   本机到达 attack_point 的微秒时间戳(0 = 还没到)
+#   comm_node 从这里读并填进 InterUavStatus 心跳,partner 据此计算 strike_sync_time
+uint64 attack_arrival_time_us

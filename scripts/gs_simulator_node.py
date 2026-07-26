@@ -81,6 +81,7 @@ DEMO_FLOWS = {
             {
                 "skill_id": "attack_001",
                 "skill_type": 105,
+                "formation": 0,  # 默认 / 单机
                 "priority": 100,
                 "cruise_speed": 8.0,
                 "task_speed": 12.0,
@@ -100,6 +101,96 @@ DEMO_FLOWS = {
                 "arrive_path": [],
                 "skill_area_path": [
                     (0.0, 0.0, 30.0),  # 返航点(原点上空)
+                ],
+            },
+        ],
+    },
+
+    # ---------- Demo 4: 地面起飞 + Attack 惯序(formation=1) ----------
+    #   同 WP1/WP2 给所有 UAV,partner 名单 devices_sn 控制开火顺序
+    #   partner 顺序即 strike 顺序(各 UAV 在 attack_partners_ 中的索引)
+    "ground_attack_sequential": {
+        "flow_id": "demo_ground_attack_seq_001",
+        "work_mode": 5,  # SEARCH_STRIKE
+        "skills": [
+            {
+                "skill_id": "takeoff_001",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "attack_seq_001",
+                "skill_type": 105,
+                "formation": 1,  # 惯序
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 12.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (-30.0, 40.0, 30.0),  # WP1 = 发现点
+                    (-30.0, 60.0, 0.0),   # WP2 = 瞄准点
+                ],
+                # devices_sn 由 gs_simulator 在转换时注入(从 launch 传入 gather_partners)
+            },
+            {
+                "skill_id": "return_001",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 0.0, 30.0),
+                ],
+            },
+        ],
+    },
+
+    # ---------- Demo 5: 地面起飞 + Attack 协同(formation=2) ----------
+    #   实时规划每架 attack_point + 全局 strike_sync_time
+    "ground_attack_coordinated": {
+        "flow_id": "demo_ground_attack_coop_001",
+        "work_mode": 5,  # SEARCH_STRIKE
+        "skills": [
+            {
+                "skill_id": "takeoff_001",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "attack_coop_001",
+                "skill_type": 105,
+                "formation": 2,  # 协同
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 12.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (-30.0, 40.0, 30.0),  # WP1 = 发现点
+                    (-30.0, 60.0, 0.0),   # WP2 = 瞄准点(mission_manager 实时改写成本机 attack_point)
+                ],
+            },
+            {
+                "skill_id": "return_001",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 0.0, 30.0),
                 ],
             },
         ],
@@ -945,8 +1036,9 @@ class GroundStationSimulator:
             # === 注入 devices_sn 到 gather skill 的 params_json ===
             #   mission_manager 端 parseDevicesSnFromParamsJson() 解出来用作多机同步名单
             #   单机/未设置时,跳过注入 → 老 single_uav_arrived 路径不受影响
+            # === Attack(105) 多机协同:同样需要 devices_sn(惯序 / 协同 strike 名单)
             raw_params = skill_cfg.get("params_json", "")
-            if self.gather_partners and s.skill_type == 101:
+            if self.gather_partners and s.skill_type in (101, 105):
                 try:
                     params = json.loads(raw_params) if raw_params else {}
                 except ValueError:
@@ -956,8 +1048,11 @@ class GroundStationSimulator:
                     params = {}
                 params["devices_sn"] = list(self.gather_partners)
                 s.params_json = json.dumps(params)
-                rospy.loginfo("[GS_Simulator] Injected devices_sn=%s into gather skill %s",
-                              self.gather_partners, s.skill_id)
+                rospy.loginfo("[GS_Simulator] Injected devices_sn=%s into %s skill %s "
+                              "(formation=%u)",
+                              self.gather_partners,
+                              "gather" if s.skill_type == 101 else "attack",
+                              s.skill_id, s.formation)
             else:
                 s.params_json = raw_params
 

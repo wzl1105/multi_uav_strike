@@ -58,7 +58,7 @@
         pkg="multi_uav_strike"
         type="target_motion_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
     <rosparam command="load"
               file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
   </node>
@@ -71,7 +71,7 @@
           pkg="multi_uav_strike"
           type="gimbal_simulator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -87,7 +87,7 @@
           pkg="multi_uav_strike"
           type="target_estimator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -103,7 +103,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -119,7 +119,7 @@
           pkg="multi_uav_strike"
           type="waypoint_executor_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -135,7 +135,7 @@
           pkg="multi_uav_strike"
           type="comm_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <param name="uav_name" value="$(arg uav_name)" />
@@ -150,7 +150,7 @@
           pkg="multi_uav_strike"
           type="mission_manager_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <param name="device_id" value="0" />
       <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
       <rosparam command="load"
@@ -169,7 +169,7 @@
           pkg="multi_uav_strike"
           type="uav_avoidance_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -196,7 +196,7 @@
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->
   <!-- ====================================================================== -->
-  <node name="rviz" pkg="rviz" type="rviz"
+  <node name="rviz" pkg="rviz" type="rviz" respawn="true"
         args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
 
 </launch>

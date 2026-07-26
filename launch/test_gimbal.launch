@@ -56,7 +56,7 @@
         pkg="multi_uav_strike"
         type="target_motion_simulator_node"
         output="screen"
-        respawn="false">
+        respawn="true">
     <rosparam command="load"
               file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
   </node>
@@ -69,7 +69,7 @@
           pkg="multi_uav_strike"
           type="gimbal_simulator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -85,7 +85,7 @@
           pkg="multi_uav_strike"
           type="target_estimator_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -101,7 +101,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -117,7 +117,7 @@
           pkg="multi_uav_strike"
           type="waypoint_executor_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -133,7 +133,7 @@
           pkg="multi_uav_strike"
           type="comm_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <param name="uav_name" value="$(arg uav_name)" />
@@ -148,7 +148,7 @@
           pkg="multi_uav_strike"
           type="mission_manager_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <param name="device_id" value="0" />
       <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
       <rosparam command="load"
@@ -170,7 +170,7 @@
           pkg="multi_uav_strike"
           type="uav_avoidance_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -184,7 +184,7 @@
 
  
   <!--group ns="$(arg uav_name)"-->
-    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
+    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
       <param name="gcs_ip" value="192.168.43.17" />
       <param name="gcs_udp_port" value="14550" />
@@ -199,7 +199,7 @@
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->
   <!-- ====================================================================== -->
-  <node name="rviz" pkg="rviz" type="rviz"
+  <node name="rviz" pkg="rviz" type="rviz" respawn="true"
         args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
 
 </launch>

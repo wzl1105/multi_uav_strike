@@ -151,6 +151,13 @@ private:
     double strike_time_;                // 打击时间戳
     bool is_approaching_;               // 是否正在接近目标
     double prev_distance_;              // 上一时刻距离
+    // === 2026-07-26: strike_eval 总开关 (默认关闭) ===
+    //   现状 /target_position 是 target_motion_simulator 发的 ground truth,primary_index 配置错误
+    //   (yaml 里 primary_index: 10 超出范围,fallback 到 0 → x=60,y=-100 不是用户真目标),
+    //   evaluateStrike 算 min_dist 永远偏大,STRIKE EVAL 一直 FAILURE 但不是真没打中。
+    //   等 primary_index 修对 / 或者干脆删除此评估路径后再开。
+    //   真正任务完成判定走 attack_cmd 协议 (GS 收到 type=1 + fire action=0)。
+    bool enable_strike_evaluation_ = false;
 
     // 机间避障相关 — 邻居表用 /inter_uav/uav_status 心跳替代原 PoseArray,
     //   sn + lat/lon/alt 自带,自环过滤后直接迭代算距离(NED 转换在 applyInterUavAvoidance 内按需进行)
@@ -240,6 +247,7 @@ public:
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_attitude", flight_mode_attitude_, 1);
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);  // 2米内视为击中
+        nh_private_.param<bool>("enable_strike_evaluation",  enable_strike_evaluation_,  false);  // strike_eval 总开关(默认关闭,见字段注释)
 
         // TRACK模式专用参数
         nh_private_.param<double>("track_altitude", track_altitude_, 30.0);       // 固定跟踪高度
@@ -576,6 +584,9 @@ public:
 
     // 计算打击评估
     void evaluateStrike() {
+        if (!enable_strike_evaluation_) {
+            return;
+        }
         if (first_strike_evaluated_ || !is_real_target_received_) {
             return;
         }

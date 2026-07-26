@@ -21,3 +21,13 @@ partner_heartbeat_timeout: 3.0
 # 集结门限:到达伙伴数 / 期望伙伴数(去本机) ≥ 此值 → 推进下一条 skill
 # 1.0 = 全部到齐才推进;0.7 = 70% 到齐即可(降级兼容掉队 UAV)
 gather_threshold: 1.0
+
+# === Attack(105) 多机协同参数(2026-07-26) ===
+# formation=2 协同:每架 UAV attack_point 距目标保留的安全距离(避免贴脸,推荐 3m)
+attack_safety_margin_m: 3.0
+# formation=2 协同:UAV 距目标 < 此值时 attack_point = 当前位置(已在目标附近)
+attack_close_range_threshold_m: 5.0
+# formation=2 协同:strike_sync_time 相对最大飞行时间的额外缓冲秒数
+attack_sync_strike_buffer_sec: 1.0
+# formation=1/2 门控挂起 strike 的超时,超时则放弃当前 skill,转下一条
+attack_strike_pending_timeout_sec: 60.0

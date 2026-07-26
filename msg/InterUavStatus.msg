@@ -30,3 +30,9 @@ float32 yaw
 float32 vx
 float32 vy
 float32 vz
+
+# Attack(105) 协同打击专用:
+#   本机到达 attack_point 的微秒时间戳(0 = 还没到,还在飞)
+#   仅 Attack(105) formation=2(协同)使用,其它场景固定 0
+#   partner 据此计算全局 strike_sync_time
+uint64 attack_arrival_time_us
