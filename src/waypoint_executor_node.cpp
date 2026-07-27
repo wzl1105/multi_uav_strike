@@ -178,6 +178,12 @@ private:
     double decel_limit_;   // m/s²,刹车减速度上限 — 物理刹停 v²≤2ad 用这个值
     double last_v_mag_;    // 上周期 v_mag (accel_limit 用,跨航点平滑过渡)
 
+    // ===== Cross-track P-control(压线)=====
+    // L1 carrot-chase 缺 cross-track 显式反馈,小偏离时纯几何纠偏太弱,导致长周期摆动。
+    // 这里加一个 P-controller: 飞机到段线的垂直距离 → 横向速度,直接拉回线。
+    double k_ct_;          // 横向 P-control 增益(m/s per m),典型 0.6
+    double max_ct_ratio_;  // 横向分量上限占 v_mag 的比例(避免转弯期盖过 L1 切向),默认 0.5
+
     // 基准点参数(由 PX4 /mavros/home_position/home 自动填充,不再硬编码)
     double ref_lat_;
     double ref_lon_;
@@ -237,10 +243,12 @@ public:
         use_sim_(true),
         last_waypoint_reached_logged_(false),
         hold_kp_(0.8),
-        yaw_max_rate_(1.0),
+        yaw_max_rate_(0.8),
         accel_limit_(2.0),
         decel_limit_(2.0),
         last_v_mag_(0.0),
+        k_ct_(0.6),
+        max_ct_ratio_(0.5),
         current_work_mode_("SEARCH_ONLY"),
         segment_phase_(SegmentPhase::IDLE),
         arrive_idx_(0),
@@ -289,7 +297,7 @@ public:
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
-        nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
+        nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 0.8);
         // 水平速度门控(m/s):低于此值冻结 yaw 角速度输出,避免 CRITICAL 避让
         //   时身体几乎不动但 yaw 仍死追 bearing → 原地打转。默认 0.5 m/s,
         //   - PROXIMITY 边界(40m): scale=1.0 → v≈5 m/s > 0.5 → 正常跟踪
@@ -304,8 +312,11 @@ public:
         //   - 默认 1.5s:抗短时抖动的同时仍能在对方离开后较快下降
         nh_private_.param<double>("latch_release_delay", latch_release_delay_, 1.5);
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
-        nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
+        nh_private_.param<double>("accel_limit", accel_limit_, 3.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
+        // Cross-track P-control 增益 + 横向分量上限占比
+        nh_private_.param<double>("cross_track_kp", k_ct_, 0.6);
+        nh_private_.param<double>("cross_track_max_ratio", max_ct_ratio_, 0.5);
         nh_private_.param<bool>("lidar_building_avoidance_enabled",
                                 lidar_building_avoidance_enabled_, false);
         nh_private_.param<double>("lidar_climb_rate", lidar_climb_rate_, 1.0);
@@ -831,8 +842,26 @@ public:
                     vx = 0.0;
                     vy = 0.0;
                 }
-                // bearing 跟 lookahead: 段内朝段前方;偏离段时航向也跟着纠
-                bearing = atan2(dy_la, dx_la);
+                // ===== Cross-track P-control: 拉回段方向 =====
+                // L1 carrot-chase 缺 cross-track 显式反馈,小偏离时纯几何纠偏太弱。
+                // 沿段方向 (ux, uy) 的左法向量 (-uy, ux);cross_track > 0 表示飞机在段"左"侧。
+                // 仅在飞机已在段内(along >= 0)启用,刚切新段(along<0)不强行拉,
+                //   避免转弯瞬间被强拉回头。
+                if (along >= 0.0) {
+                    double cross_track = -uy * (current_ned_x_ - seg_x0)
+                                         + ux * (current_ned_y_ - seg_y0);
+                    double v_cross = -k_ct_ * cross_track;
+                    // 限幅:不让 cross-track 盖过 L1 切向分量(典型 ≤ 50%)
+                    double max_ct = max_ct_ratio_ * v_mag;
+                    if (v_cross >  max_ct) v_cross =  max_ct;
+                    if (v_cross < -max_ct) v_cross = -max_ct;
+                    // 叠加到速度:沿左法向量方向
+                    vx += -uy * v_cross;
+                    vy +=  ux * v_cross;
+                }
+                // bearing 跟实际速度方向(含 cross-track 项后),保持 yaw 与速度一致,
+                //   避免 PX4 内环 side-slip 补偿。
+                bearing = atan2(vy, vx);
             }
         }
 

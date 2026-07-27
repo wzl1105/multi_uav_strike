@@ -1608,7 +1608,22 @@ public:
         //      → 直接 return,新 flow 不入队(GS 应改为先发 50000)。
         //   3) suppress_recovery_=false,mavrosStateCallback 此时已把 is_fcu_overridden_ 刷成 false,
         //      未来回调 prev_override=false,不会再触发 recovery。
-        if (is_fcu_overridden_) {
+        //
+        // === 2026-07-28 扩展:接管场景覆盖 PHASE_HOLDING ===
+        //   原 is_fcu_overridden_ 在 mavrosStateCallback L1322-1335 把 PHASE_HOLDING 排除在
+        //   aircraft_live_phase 外(避免 setpoint publisher 切换瞬间的 PX4 mode 抖动误判),
+        //   代价:HOLDING 期间飞手真接管(PX4 mode 漂到 POSITION/AUTO.RTL/AUTO.LAND 等)
+        //   不会被识别,新 TaskFlow 不会主动 setMode,飞手持续控制。
+        //   业务上 HOLDING 本就是"等新 task_flow"状态,GS 一旦下发新 flow 即可视为接管信号,
+        //   无需等到 phase 翻 OVERRIDDEN。这里把 HOLDING + mode!=OFFBOARD + armed 也并入同一
+        //   setMode 路径;false positive 几乎不存在(HOLDING 期间 PX4 短暂漂移 + GS 同时下发
+        //   新 task 这种三连击,即使触发 setMode 也是"GS 想要控制权"的合理表现)。
+        const bool need_takeback_offboard =
+            is_fcu_overridden_ ||
+            (current_phase_ == MissionPhase::PHASE_HOLDING &&
+             current_mavros_state_.mode != "OFFBOARD" &&
+             current_mavros_state_.armed);
+        if (need_takeback_offboard) {
             if (!current_mavros_state_.armed) {
                 // 飞机已 disarm 落地(典型场景:AUTO.LAND 完成 / 飞手手动 disarm)。
                 // PX4 在 AUTO.LAND/AUTO.LOITER 等状态下不允许直接切 OFFBOARD。
@@ -1838,12 +1853,23 @@ public:
                 // 缓存起飞前的 phase 和 work_mode,performTakeoffHandoff 用
                 phase_before_takeoff_ = current_phase_;
                 work_mode_before_takeoff_ = current_work_mode_;
-                // 重置 takeoff_state_ 到 IDLE,支持 re-takeoff(前序 flow 结束后 HOLDING 状态再次起飞)
-                if (takeoff_state_ == TakeoffState::TAKEOFF_COMPLETE ||
-                    takeoff_state_ == TakeoffState::TAKEOFF_FAILED) {
-                    ROS_WARN("[MissionManager] Re-takeoff detected: resetting takeoff_state_ from %s to IDLE",
-                             (takeoff_state_ == TakeoffState::TAKEOFF_COMPLETE) ? "COMPLETE" : "FAILED");
-                    takeoff_state_ = TakeoffState::TAKEOFF_IDLE;
+                // === 2026-07-28 fix: 守卫从 COMPLETE/FAILED 二选一扩到所有非 IDLE 状态 ===
+                //   背景:前序 takeoff 在 HOVERING(等航点超时)、SETTING_OFFBOARD(setMode 死循环)等中间
+                //   状态卡住时,后续 taskFlowCallback 会进 L1820 takeoff 分支但守卫不命中,takeoff_state_
+                //   卡在中间状态 → runPx4TakeoffSequence switch 直接跳进 HOVERING 等"已完成"分支,
+                //   永远不走 triggerOffboardAndArm,PX4 卡在 AUTO.RTL/UAV 一直 disarm。
+                //   典型观察:mission_manager 报 "HOVERING waiting for waypoints" 但 PX4 还在 AUTO.RTL,
+                //   mission_state.phase=TAKING_OFF 但 takeoff_state_ 已是 HOVERING,被外层判定为"已起飞"。
+                if (takeoff_state_ != TakeoffState::TAKEOFF_IDLE) {
+                    ROS_WARN("[MissionManager] Re-takeoff detected: resetting takeoff_state_ "
+                             "(and retry/failed flags) from current to IDLE");
+                    takeoff_state_        = TakeoffState::TAKEOFF_IDLE;
+                    // 同步清掉上一次起飞尝试的可重入标志 ——
+                    // 修了 HOVERING 之后,"FLOW → HOVERING 卡死 → disarm → FLOW" 这条路能走通了,
+                    // 这些字段必须一起清,否则 retry_count 残留会让第二次起飞首次失败就撞 max_retries。
+                    takeoff_retry_count_   = 0;
+                    takeoff_failed_logged_ = false;
+                    takeoff_failed_time_   = ros::Time();
                 }
                 current_phase_ = MissionPhase::PHASE_TAKING_OFF;
                 ROS_WARN("[MissionManager] TaskFlow Takeoff skill to phase=TAKING_OFF "
@@ -3724,9 +3750,16 @@ public:
                 // is_landing_in_progress_ 仍为 true 的那一拍触发,易被并发回调抢先清掉而漏跑)。
                 // 这里直接落地=GROUND_IDLE,清接管标志,让下一条带 takeoff 的 task_flow 能正常起飞
                 // (否则 phase 残留在 RETURNING/OVERRIDDEN → isInFlight()==true → taskFlowCallback 剥/拒 takeoff)。
-                is_landing_in_progress_ = false;
-                is_fcu_overridden_      = false;
-                current_phase_          = MissionPhase::PHASE_GROUND_IDLE;
+                is_landing_in_progress_    = false;
+                is_fcu_overridden_         = false;
+                current_phase_             = MissionPhase::PHASE_GROUND_IDLE;
+                // === 2026-07-28 fix: 同时清 landing_already_triggered_,允许后续 task_flow 的
+                //   Return(103) 再次触发 AUTO.LAND。原版只清 is_landing_in_progress_,
+                //   导致 taskFlowCallback L1678 的清理块(if (is_landing_in_progress_))在第二次
+                //   起落时条件已为 false 而被跳过,landing_already_triggered_ 残留为 true,
+                //   advanceSkillStateMachine L4607 的双标志守卫永远 false,triggerPx4Landing()
+                //   不会被调用,Return skill 静默吞掉 → PX4 OFFBOARD 失流 → failsafe 进 position。
+                landing_already_triggered_ = false;
                 // 不再切回 PHASE_HOLDING (UAV 已在地面,setpoint publisher 不需要再起)
                 // GS 通过 MissionState.phase=GROUND_IDLE + state.armed=false 即可判定任务结束
             }
