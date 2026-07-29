@@ -5450,7 +5450,8 @@ public:
     void gimbalCommandTimerCallback(const ros::TimerEvent&) {
         if (gimbal_command_pub_.getNumSubscribers() == 0) return;
         std_msgs::Float32 msg;
-        msg.data = static_cast<float>(current_gimbal_pitch_);
+        // 地面站发送45度，云台需要-45完成下偏
+        msg.data = -static_cast<float>(current_gimbal_pitch_);
         gimbal_command_pub_.publish(msg);
     }
 
