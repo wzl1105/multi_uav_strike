@@ -376,6 +376,68 @@ DEMO_FLOWS = {
         ],
     },
 
+    # ---------- Demo: 地面起飞 + 蛇形搜索 (来自用户真实任务数据, 2026-07-29) ----------
+    # 原始 GS 上行日志的两条独立 task_flow 已合并为单条:
+    #   1) takeoff (type=106, takeoff_altitude=30, takeoff_speed=5)
+    #   2) search  (type=102, 14 个航点蛇形覆盖,30m 高,15m/s)
+    #
+    # 14 个搜索航点原 GPS (WGS84) 来自用户 CMC 上行日志:
+    #   pt[0..13] 在 (36.0575198~36.0590048 N, 114.5493231~114.5516002 E, alt=30)
+    # 已按 NED 偏移换算,参考点 ≈ uav0_home = (36.058011, 114.549111)
+    # (PX4 home 实际值与上述近似偏差 > 1m 时,需重新换算下面 14 行 NED)
+    #
+    # 覆盖范围:行距 ~27.5m (7 行),东西覆盖 ~205m
+    # 航点排列:蛇形 (boustrophedon),偶数点 → 西,奇数点 → 东
+    #
+    # 用法: roslaunch gs_simulator.launch flow:=groupac4f uav_name:=uav0
+    "groupac4f": {
+        "flow_id": "groupac4f",
+        "work_mode": 3,  # SEARCH_ONLY — 仅搜索,无打击
+        "skills": [
+            # 1) Takeoff — 地面起飞到 30m (与原独立 task_flow 一致)
+            {
+                "skill_id": "takeoff_001",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "takeoff_speed": 5.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            # 2) Search — 14 个航点蛇形,30m 高,15m/s
+            #    与原 CMC 日志字段对齐:search_speed=15, search_height=30,
+            #    safe_distance=10, formation=Line(0)
+            {
+                "skill_id": "search_001",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 15.0,
+                "task_speed": 15.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (-54.5,  19.0, 30.0),   # pt[0]  SW 起点
+                    (-54.5, 223.4, 30.0),   # pt[1]  东端
+                    (-27.0, 223.4, 30.0),   # pt[2]  折返
+                    (-27.0,  19.0, 30.0),   # pt[3]  西端
+                    (  0.4,  19.0, 30.0),   # pt[4]  home 纬度 (≈ 起飞点纬度)
+                    (  0.4, 223.4, 30.0),   # pt[5]  东端
+                    ( 27.9, 223.4, 30.0),   # pt[6]  折返
+                    ( 27.9,  19.0, 30.0),   # pt[7]  西端
+                    ( 55.4,  19.0, 30.0),   # pt[8]
+                    ( 55.4, 223.4, 30.0),   # pt[9]
+                    ( 82.8, 223.4, 30.0),   # pt[10]
+                    ( 82.8,  19.0, 30.0),   # pt[11]
+                    (110.3,  19.0, 30.0),   # pt[12]
+                    (110.3, 223.4, 30.0),   # pt[13] NE 终点
+                ],
+                "params_json": '{"max_duration":15.0,"safe_distance":10.0,"search_height":30.0,"search_speed":15.0}',
+            },
+        ],
+    },
+
     # ---------- Demo 6: 真实任务数据 — 起飞+集结+搜索+返航 ----------
     # 数据来自真实 GS 下发的 TaskFlow,航点为绝对 GPS 坐标
     # 参考点 (ref) = 起飞点 WP1: (36.0962811N, 114.3922342E, alt=0)

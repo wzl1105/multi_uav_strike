@@ -14,9 +14,9 @@ targets:
   # ===== 静止人员 (基础回归:hit_count 晋升 + 多目标不串) =====
   - {label: "person", x_init:  60.0, y_init: -100.0, max_speed: 0.0}    # 原:静止人 1 (116m)
   - {label: "person", x_init:   0.0, y_init: -205.0, max_speed: 1.0, max_normal_acc: 0.5}  # 原:慢速人 (205m)
-  # - {label: "person", x_init:  90.0, y_init:  -50.0, max_speed: 0.0}    # 静止人 2 (NE 102m)
-  # - {label: "person", x_init: -50.0, y_init: -150.0, max_speed: 0.0}    # 静止人 3 (SW 158m)
-  # - {label: "person", x_init: 130.0, y_init: -100.0, max_speed: 0.0}    # 静止人 4 (E 164m)
+  - {label: "person", x_init:  90.0, y_init:  -50.0, max_speed: 0.0}    # 静止人 2 (NE 102m)
+  - {label: "person", x_init: -50.0, y_init: -150.0, max_speed: 0.0}    # 静止人 3 (SW 158m)
+  - {label: "person", x_init: 130.0, y_init: -100.0, max_speed: 0.0}    # 静止人 4 (E 164m)
 
   # # ===== 移动人员 (验证 EMA 世界域跟随相机机动) =====
   # - {label: "person", x_init:  30.0, y_init: -120.0, max_speed: 2.0, max_tangential_acc: 1.0, max_normal_acc: 0.8}   # 行人 2m/s

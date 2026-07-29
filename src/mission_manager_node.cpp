@@ -425,6 +425,16 @@ private:
     //   解决 "到了 WP1 没目标,但 stale cluster(13.8s)反复触发 strike → guidance
     //   ping-pong(0.4s 内 5 个 cycle,heading 抖、velocity 跳)" 的根因。
     double max_strike_cluster_age_sec_;
+    // 上报 cluster 新鲜度门槛(2026-07-29):只要 cluster.last_seen_age <= 此值,就允许任何一次
+    //   派发里走 publish DetectTarget 流程(无论 type=1/3);超过即仅 skip 上报,不 erase 去重,
+    //   这样绿球还能保留;超过 max_strike_cluster_age_sec_(0.5s) 时再 erase strike_dispatched_
+    //   允许重新派发 strike。两个阈值并存,避免上报被 0.5s 误杀(B1)。
+    double max_report_cluster_age_sec_;
+    // GS 上报位置栅格去重半径(2026-07-29):C2 — 同一物理目标因投影抖动生成多个 cluster_id 时,
+    //   走 cluster_id dedup 会漏掉。我们额外维护 reported_to_gs_ (cluster_id → ned_x,ned_y),
+    //   新待上报 cluster 与已上报位置距离 < 此值 且 label 相同 → 视为同一目标,跳过上报。
+    //   默认 40m — 介于单个目标聚类抖动(<25m)与目标间最小间距(58m)之间,既不漏也不串。
+    double report_dedup_radius_m_;
     double obstacle_distance_;
 
     // 螺旋接近参数
@@ -580,7 +590,21 @@ private:
     // === Cluster 事件订阅状态(从 cluster_states 10Hz 快照中提炼) ===
     // dedup: 同一 cluster_id 在同 task_flow 内只触发一次"上报/锁定"
     // (cluster_states 是周期发布,若不用 dedup 就会 10Hz 重复上报同一目标)
-    std::unordered_map<uint64_t, int> reported_clusters_;
+    //
+    // 2026-07-29: 拆成两个独立容器。
+    //   - reported_to_gs_: 上报给 GS 的去重集合(只在新 task_flow 切换、attack_cmd ignore/stash
+    //     时整体清空,**不在 stale 时 erase**);键 = cluster_id,值 = 上报时记录的 (label, ned_x, ned_y)
+    //     用于 C2 位置栅格去重(检查新 cluster 是否与已上报位置 < report_dedup_radius_m_ 且 label 一致)。
+    //   - strike_dispatched_: 打击派发记录,仅用于 dedup 重复 lock transfer/strike 触发;
+    //     stale 跳过时 erase(允许新检测重新派发)。原本混在一起导致 stale erase 同时把
+    //     上报去重也废了,航向扫掠每次 pass 都重发同一条 → C1 多报。
+    struct ReportedTarget {
+        std::string label;
+        double ned_x;
+        double ned_y;
+    };
+    std::unordered_map<uint64_t, ReportedTarget> reported_to_gs_;
+    std::unordered_map<uint64_t, int>            strike_dispatched_;
     ros::Time last_reported_cleanup_;   // 1Hz 节流清理开关(暂无过期清理,保留作 hook)
 
     // 当前已锁定的 cluster 快照位置(NWU 米,降级用于 triggerStrike 桥接到 current_target_)
@@ -674,7 +698,9 @@ public:
         is_guidance_active_(false),
         guidance_speed_(10.0),    // 默认 10 m/s,可在 mission_manager.yaml 的 ~max_speed 覆盖
         min_guidance_speed_(2.0), // 兜底最低下发速度(2026-07-26),见字段注释
-        max_strike_cluster_age_sec_(0.5), // strike cluster 新鲜度门槛(2026-07-26),见字段注释
+        max_strike_cluster_age_sec_(0.5),   // strike cluster 新鲜度门槛(2026-07-26),见字段注释
+        max_report_cluster_age_sec_(5.0),   // 上报 cluster 新鲜度门槛(2026-07-29),见字段注释
+        report_dedup_radius_m_(40.0),       // GS 上报位置栅格去重半径(2026-07-29),见字段注释
         strike_distance_threshold_(2.0),
         mission_loop_rate_(50.0),
         target_lock_confidence_(0.7),
@@ -874,6 +900,10 @@ public:
         nh_private_.param<double>("min_guidance_speed", min_guidance_speed_, 2.0);
         // strike cluster 新鲜度门槛(2026-07-26),见 max_strike_cluster_age_sec_ 字段注释
         nh_private_.param<double>("max_strike_cluster_age_sec", max_strike_cluster_age_sec_, 0.5);
+        // 上报 cluster 新鲜度门槛(2026-07-29),见 max_report_cluster_age_sec_ 字段注释
+        nh_private_.param<double>("max_report_cluster_age_sec", max_report_cluster_age_sec_, 5.0);
+        // GS 上报位置栅格去重半径(2026-07-29),见 report_dedup_radius_m_ 字段注释
+        nh_private_.param<double>("report_dedup_radius_m", report_dedup_radius_m_, 40.0);
     }
 
     void initSubscribers() {
@@ -1282,7 +1312,7 @@ public:
         lat = ref_lat_ + ned_x / EARTH_R * DEG_PER_RAD;
         double cos_lat = std::cos(ref_lat_ * RAD_PER_DEG);
         if (cos_lat < 1e-6) cos_lat = 1e-6;  // 防止 cos(90°)=0 除零
-        lon = ref_lon_ + ned_y / (EARTH_R * cos_lat) * DEG_PER_RAD;
+        lon = ref_lon_ - ned_y / (EARTH_R * cos_lat) * DEG_PER_RAD;  // NWU +y=西 → 经度东向 = -y
         alt = ref_alt_ - ned_z;  // NED z 下向 → AMSL 上向
     }
 
@@ -1717,14 +1747,16 @@ public:
         has_task_flow_    = true;
 
         // === 新 TaskFlow 到达:清空 cluster dedup 状态 + 锁定目标,允许新一轮上报/锁定 ===
-        //   - reported_clusters_ 清空:之前 task_flow 上报过的 cluster_id 在新 flow 中可重新上报
-        //     (实际 cluster 已 TTL 或飞离,新 flow 重新看到也大概率是不同目标,但语义上保持独立)
+        //   - reported_to_gs_ / strike_dispatched_ 清空:之前 task_flow 上报/派发过的
+        //     cluster_id 在新 flow 中可重新上报/派发(实际 cluster 已 TTL 或飞离,新 flow
+        //     重新看到也大概率是不同目标,但语义上保持独立)
         //   - ignored_targets_ 清空:新 task_flow 给个干净黑名单起点,避免上一个 flow 的
         //     "忽略/暂存" 状态泄漏到新 flow;同一个黑名单项(物理目标)在 flow 之间可能已经
         //     不再相关(cluster_estimator 重启或换搜索区)
         //   - locked_cluster_id_ = 0:cluster_states 缓存失效
         //   - tracked_target_ 的清空见下方 preserve_track 分支(Attack(105)首发时不清)
-        reported_clusters_.clear();
+        reported_to_gs_.clear();
+        strike_dispatched_.clear();
         ignored_targets_.clear();
         locked_cluster_id_     = 0;
         locked_cluster_ned_x_  = 0.0;
@@ -2332,9 +2364,10 @@ public:
                     disableGuidance();
                     ROS_WARN("[MissionManager]   - guidance DISABLED (was active before ignore)");
                 }
-                // 清掉 reported_clusters_,让下一个新 cluster(包括同 label 不同位置的目标 2)
-                //   可以重新进入 dispatch 流程,而不是被 dedup 跳过。
-                reported_clusters_.clear();
+                // 清掉 reported_to_gs_ / strike_dispatched_,让下一个新 cluster(包括同 label
+                //   不同位置的目标 2) 可以重新进入 dispatch 流程,而不是被 dedup 跳过。
+                reported_to_gs_.clear();
+                strike_dispatched_.clear();
                 // 清掉 TargetState,避免 handleSearchTrack/Strike 误以为"仍锁定"再次触发 guidance
                 current_target_.is_locked   = false;
                 current_target_.is_detected = false;
@@ -2379,8 +2412,10 @@ public:
                     disableGuidance();
                     ROS_WARN("[MissionManager]   - guidance DISABLED (was active before stash)");
                 }
-                // 清掉 reported_clusters_,让目标 2(同 label 不同位置)可以重新进入 dispatch。
-                reported_clusters_.clear();
+                // 清掉 reported_to_gs_ / strike_dispatched_,让目标 2(同 label 不同位置)
+                //   可以重新进入 dispatch。
+                reported_to_gs_.clear();
+                strike_dispatched_.clear();
                 current_target_.is_locked   = false;
                 current_target_.is_detected = false;
                 current_target_.is_shared   = false;
@@ -2505,7 +2540,8 @@ public:
      *   3. skill.state 必须 == IN_TASK(UAV 已进入 skill_area_path,正在执行)
      *   4. skill.skill_type ∈ {102 SEARCH, 105 ATTACK}
      *   5. cluster.label 不在 ignored_targets_ 黑名单内(label-only 匹配)
-     *   6. cluster.cluster_id 未在 reported_clusters_ 内(dedup)
+     *   6. cluster.cluster_id 未在 reported_to_gs_ / strike_dispatched_ 内(dedup by id)
+     *   7. cluster 与 reported_to_gs_ 已有位置 < report_dedup_radius_m_ 且 label 同 → 跳过(dedup by pos)
      */
     void clusterStatesCallback(const multi_uav_strike::ClusterState::ConstPtr& msg) {
         if (current_work_mode_ == WorkMode::IDLE) {
@@ -2532,6 +2568,13 @@ public:
         //   所以 skill_idx >= 1 = "至少到过第一条"
         //   skill_total=0(空 skill_area)跳过此门控,按 SEARCH 无搜索区场景处理
         if (!latest_wp_status_ || latest_wp_status_->skill_id != sr.msg.skill_id) {
+            // 2026-07-29 B3:之前这里静默 return,排查时无法判断为什么 cluster_states
+            //   全部被丢。加 WARN_THROTTLE 一眼看到 skill_id 不匹配窗口期。
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster callback gated: wp_status "
+                              "skill_id mismatch (wp=%s vs expected=%s), "
+                              "skip lock/report (typical during skill transition)",
+                              (latest_wp_status_ ? latest_wp_status_->skill_id.c_str() : "<none>"),
+                              sr.msg.skill_id.c_str());
             return;
         }
         if (latest_wp_status_->skill_total > 0 &&
@@ -2557,7 +2600,7 @@ public:
                 continue;
             }
 
-            // === Stale gate by cluster.last_seen_us (2026-07-26)===
+            // === Stale gate by cluster.last_seen_us (2026-07-26, 2026-07-29 拆分阈值) ===
             //   真正能反映"目标是否还在视野里"的判据是 cluster.last_seen_us
             //   (target_estimator 在 YOLO 命中时刷新,见 target_estimator_node.cpp:285)。
             //   cluster_states 10Hz 持续把 cluster 当 alive,但 UAV 飞过目标位置后
@@ -2570,23 +2613,40 @@ public:
             //     2. handleSearchStrike 每 tick 看 is_guidance_active_=false +
             //        current_target_.is_locked=true → 反复 startGuidanceApproach,
             //        触发 100ms 一次的 GUIDANCE_STRIKE ↔ TARGET_LOST_HOVER ping-pong
-            //   修法:对每个 cluster 派发前检查 last_seen_us,超过阈值:
-            //     - 从 reported_clusters_ 移除(让下一次新检测能进 dispatch)
-            //     - skip(不锁、不报、不触发 strike,避免拉 UAV 飞向旧位置)
+            //   === 2026-07-29 改造:两个阈值分立 ===
+            //     - max_strike_cluster_age_sec_ (0.5s):超过 → skip strike 触发(stale 会让
+            //       UAV 飞向旧位置),并 erase strike_dispatched_(允许新检测重新派发)
+            //     - max_report_cluster_age_sec_ (5.0s):超过 → skip 全部上报(绿球已失去导航
+            //       意义,GS 看到也没用),但**不 erase** reported_to_gs_/strike_dispatched_,
+            //       避免航向扫掠反复触发重发(C1)
+            //   原版 bug B1:0.5s 阈值同时挡上报,导致绿球持久亮但永远报不出去(典型时序:
+            //     目标在过第一个 skill_area 点前晋升 → 等 UAV 飞过去 → age 已经 > 0.5s → 永远 skip)
+            bool is_strike_stale = false;
             if (cluster.last_seen_us != 0) {
                 const ros::Time now_ros = ros::Time::now();
                 const double    cluster_age_sec =
                     (now_ros.toNSec() / 1000ULL - cluster.last_seen_us) / 1e6;
                 if (cluster_age_sec > max_strike_cluster_age_sec_) {
-                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE "
+                    is_strike_stale = true;
+                    // erase strike_dispatched_ 仅此一项,reported_to_gs_ 保留
+                    strike_dispatched_.erase(cluster.cluster_id);
+                }
+                if (cluster_age_sec > max_report_cluster_age_sec_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-report "
                                       "(last_seen_age=%.2fs > max=%.2fs, pose=%.1f,%.1f,%.1f) "
-                                      "→ skip dispatch (let waypoint continue)",
+                                      "→ skip both report and strike",
+                                      cluster.cluster_id, cluster.label.c_str(),
+                                      cluster_age_sec, max_report_cluster_age_sec_,
+                                      cluster.ned_x, cluster.ned_y, cluster.ned_alt);
+                    continue;
+                }
+                if (is_strike_stale) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-strike "
+                                      "(last_seen_age=%.2fs > strike_max=%.2fs, "
+                                      "≤ report_max=%.2fs) → skip strike, keep report",
                                       cluster.cluster_id, cluster.label.c_str(),
                                       cluster_age_sec, max_strike_cluster_age_sec_,
-                                      cluster.ned_x, cluster.ned_y, cluster.ned_alt);
-                    // 从 dedup 集合移除,允许下一次新检测(last_seen_us 刷新后)重新派发
-                    reported_clusters_.erase(cluster.cluster_id);
-                    continue;
+                                      max_report_cluster_age_sec_);
                 }
             }
 
@@ -2612,8 +2672,8 @@ public:
                 locked_cluster_id_            = cluster.cluster_id;
                 locked_cluster_time_          = ros::Time::now();
                 locked_cluster_last_seen_us_  = cluster.last_seen_us;
-                // 当前 cluster_id 也加入 reported(避免同一 cluster 反复 transfer 触发 startGuidanceApproach)
-                reported_clusters_[cluster.cluster_id] = -1;
+                // 当前 cluster_id 加入 strike_dispatched_(C1 拆分容器),避免同一 cluster 反复 transfer 触发 startGuidanceApproach
+                strike_dispatched_[cluster.cluster_id] = -1;
                 // === 多目标: 通知 estimator 主目标 cluster_id 转移 ===
                 publishPrimaryTarget(cluster.cluster_id);
                 continue;  // 本次循环内此 cluster 处理完,不去 dispatch
@@ -2625,13 +2685,44 @@ public:
             //   否则 advanceSkillStateMachine 算 (now - locked_cluster_time_)
             //   永远 = "首次派发以来秒数",2.0s 后必然误判 TARGET_LOST_HOVER,
             //   而此时 cluster 实际 YOLO 命中可能一直很新。 (2026-07-26)
-            if (reported_clusters_.count(cluster.cluster_id)) {
+            // === 2026-07-29:合并 reported_to_gs_ + strike_dispatched_ ===
+            //   同一 cluster_id 已在任何一个 dex 中均视为已处理过。
+            if (reported_to_gs_.count(cluster.cluster_id) ||
+                strike_dispatched_.count(cluster.cluster_id)) {
                 if (cluster.cluster_id == locked_cluster_id_ &&
                     cluster.last_seen_us != 0) {
                     locked_cluster_time_         = ros::Time::now();
                     locked_cluster_last_seen_us_ = cluster.last_seen_us;
                 }
                 continue;
+            }
+
+            // === C2 位置栅格去重(2026-07-29) ===
+            //   同一物理目标因投影抖动产生多个 cluster_id 时,cluster_id dedup 漏掉。
+            //   额外检查:与 reported_to_gs_ 已有位置距离 < report_dedup_radius_m_ 且 label
+            //   相同 → 视为同一目标,跳过(不 publish、不 dispatch、不写 dedup)。
+            //   这条放在 cluster_id dedup 之后:同一 cluster_id 永远不会双发。
+            //   放在 dispatch 之前:还没准备 publish 时就拦截,避免 buildDetectTarget 浪费 +
+            //   ROS_WARN 噪音。
+            {
+                bool dedup_hit = false;
+                const double r2 = report_dedup_radius_m_ * report_dedup_radius_m_;
+                for (const auto& kv : reported_to_gs_) {
+                    if (kv.second.label != cluster.label) continue;
+                    const double dx = cluster.ned_x - kv.second.ned_x;
+                    const double dy = cluster.ned_y - kv.second.ned_y;
+                    if (dx*dx + dy*dy < r2) {
+                        dedup_hit = true;
+                        break;
+                    }
+                }
+                if (dedup_hit) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s dedup "
+                                      "by POSITION (within %.1fm of reported cluster) → skip",
+                                      cluster.cluster_id, cluster.label.c_str(),
+                                      report_dedup_radius_m_);
+                    continue;
+                }
             }
 
             // === 多目标: SEARCH_TRACK/STRIKE 模式若已锁定(主目标已就位),
@@ -2647,7 +2738,8 @@ public:
                     batch.targets.push_back(dt);
                     detect_targets_pub_.publish(batch);
                 }
-                reported_clusters_[cluster.cluster_id] = 3;
+                // 只记 reported_to_gs_,不进 strike_dispatched_(没触发 strike)
+                reported_to_gs_[cluster.cluster_id] = {cluster.label, cluster.ned_x, cluster.ned_y};
                 ROS_WARN("[MissionManager] Cluster[%lu] label=%s %s → non-primary, published type=3",
                          cluster.cluster_id, cluster.label.c_str(),
                          (current_work_mode_ == WorkMode::SEARCH_TRACK ? "SEARCH_TRACK" : "SEARCH_STRIKE"));
@@ -2673,7 +2765,7 @@ public:
                     batch.targets.push_back(dt);
                     detect_targets_pub_.publish(batch);
                 }
-                reported_clusters_[cluster.cluster_id] = 3;
+                reported_to_gs_[cluster.cluster_id] = {cluster.label, cluster.ned_x, cluster.ned_y};
                 ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_ONLY → published type=3",
                          cluster.cluster_id, cluster.label.c_str());
                 break;
@@ -2692,7 +2784,9 @@ public:
                 setLockState(TrackLockState::LOCKED_WAIT_CONFIRM);
                 tracked_target_.locked_at  = ros::Time::now();
 
-                reported_clusters_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
+                // SEARCH_TRACK 首次锁:仅记 strike_dispatched_,不进 reported_to_gs_
+                //   (GS 端会从 tracking_state 看到锁定状态)
+                strike_dispatched_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
                 // task_speed=0(GS 漏发 / 老 Skill 模板默认值)时会被 guidance_control
                 //   报"non-positive uav_speed"忽略,plane 不动,改成 std::max 兜底,见
                 //   min_guidance_speed_ 字段注释(2026-07-26)
@@ -2731,7 +2825,7 @@ public:
                         batch.targets.push_back(dt_w);
                         detect_targets_pub_.publish(batch);
                     }
-                    reported_clusters_[cluster.cluster_id] = 3;
+                    reported_to_gs_[cluster.cluster_id] = {cluster.label, cluster.ned_x, cluster.ned_y};
                     attack_strike_pending_             = true;
                     attack_strike_pending_cluster_id_  = cluster.cluster_id;
                     attack_strike_pending_time_        = ros::Time::now();
@@ -2746,13 +2840,30 @@ public:
                     break;
                 }
 
+                // B1:strike stale(>0.5s) 但 report 上限内(≤5s) → 仍 publish type=1 给 GS,
+                //   skip strike 触发,避免 UAV 飞向旧位置。后续等下一帧/下一次新检测触发 strike。
+                if (is_strike_stale) {
+                    detect_target_pub_.publish(dt);
+                    {
+                        multi_uav_strike::DetectTargets batch;
+                        batch.targets.push_back(dt);
+                        detect_targets_pub_.publish(batch);
+                    }
+                    reported_to_gs_[cluster.cluster_id] = {cluster.label, cluster.ned_x, cluster.ned_y};
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s SEARCH_STRIKE "
+                                      "strike-SKIP (stale), but published type=1 for GS",
+                                      cluster.cluster_id, cluster.label.c_str());
+                    break;
+                }
+
                 detect_target_pub_.publish(dt);
                 {
                     multi_uav_strike::DetectTargets batch;
                     batch.targets.push_back(dt);
                     detect_targets_pub_.publish(batch);
                 }
-                reported_clusters_[cluster.cluster_id] = 1;
+                reported_to_gs_[cluster.cluster_id]    = {cluster.label, cluster.ned_x, cluster.ned_y};
+                strike_dispatched_[cluster.cluster_id] = 1;
                 // task_speed=0(GS 漏发 / 老 Skill 模板默认值)时会被 guidance_control
                 //   报"non-positive uav_speed"忽略,plane 不动,改成 std::max 兜底,见
                 //   min_guidance_speed_ 字段注释(2026-07-26)
@@ -2787,7 +2898,7 @@ public:
     }
 
     /**
-     * 1Hz 节流清理 reported_clusters_ 过期项
+     * 1Hz 节流清理 reported_to_gs_ / strike_dispatched_ 过期项
      * TTL = ignored_retention_sec_(默认 20s)— 与 ignored_targets_ 对齐
      * 实际语义:同一 cluster_id 在 20s 内只上报一次;20s 后允许重新上报
      * (正常情况下 cluster_ttl 在 target_estimator 是 60s,这里 20s 已经足够防止快速重复)
@@ -2796,8 +2907,9 @@ public:
         ros::Time now = ros::Time::now();
         if ((now - last_reported_cleanup_).toSec() < 1.0) return;
         last_reported_cleanup_ = now;
-        // 注:reported_clusters_ 暂不主动清(键只是 cluster_id,占用很小);
-        //     当新 TaskFlow 到达时 taskFlowCallback 会整体清空。
+        // 注:reported_to_gs_ / strike_dispatched_ 暂不主动清(键只是 cluster_id,占用很小);
+        //     当新 TaskFlow 到达时 taskFlowCallback 会整体清空。stale gate 单独
+        //     erase strike_dispatched_(但不动 reported_to_gs_)—见 clusterStatesCallback 注释。
         // 此处函数保留为空 hook,以便未来需要 TTL 时启用。
     }
 

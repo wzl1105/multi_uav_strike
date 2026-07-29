@@ -32,6 +32,7 @@
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <mavros_msgs/HomePosition.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/UInt64.h>
@@ -151,6 +152,11 @@ public:
                                             &TargetClusterer::uavPoseCallback, this);
         self_gps_sub_       = nh_.subscribe("mavros/global_position/global", 10,
                                             &TargetClusterer::selfGpsCallback, this);
+        // === 2026-07-28: 锁 PX4 home (启动后 stable 不更新),用于 GPS 输出的绝对参考 ===
+        //   原版用 current_gps_ + (target - uav) 偏移, UAV 飞行过程中 ground_station 收到的
+        //   GPS 会随 UAV 当前位置漂移,目标不再原地。改成 home 一次性锁定 + target 绝对 NED。
+        home_position_sub_  = nh_.subscribe("mavros/home_position/home", 10,
+                                            &TargetClusterer::homePositionCallback, this);
         primary_target_sub_ = nh_.subscribe("mission/primary_target", 10,
                                             &TargetClusterer::primaryTargetCallback, this);
 
@@ -425,6 +431,24 @@ public:
         }
     }
 
+    // === 2026-07-28: PX4 home GPS 锁一次,作为 cluster 绝对 GPS 输出的参考原点 ===
+    //   PX4 的 LOCAL_POSITION_NED 在启动时由 EKF2 锁定 origin,后续 home 更新不会重置 NED,
+    //   此处只锁一次避免和后续 ground_station 地图使用的 home 原点不一致。
+    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
+        if (is_home_locked_) return;
+        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
+            return;  // PX4 home 未稳定前发 0/0,忽略
+        }
+        home_gps_.latitude  = msg->geo.latitude;
+        home_gps_.longitude = msg->geo.longitude;
+        home_gps_.altitude  = msg->geo.altitude;
+        home_gps_.status.status  = sensor_msgs::NavSatStatus::STATUS_FIX;
+        home_gps_.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
+        is_home_locked_ = true;
+        ROS_WARN_THROTTLE(5.0, "[TargetClusterer] PX4 home GPS locked: (%.7f, %.7f, %.2f)",
+                          home_gps_.latitude, home_gps_.longitude, home_gps_.altitude);
+    }
+
     // ============ 周期任务 ============
 
     // 10Hz:publish 所有 alive cluster 快照 + 可视化 + primary GPS / pose
@@ -550,6 +574,7 @@ private:
     ros::Subscriber camera_pose_sub_;
     ros::Subscriber uav_pose_sub_;
     ros::Subscriber self_gps_sub_;
+    ros::Subscriber home_position_sub_;
     ros::Subscriber primary_target_sub_;
 
     ros::Publisher cluster_event_pub_;
@@ -564,6 +589,8 @@ private:
 
     geometry_msgs::PoseStamped  current_uav_pose_;
     sensor_msgs::NavSatFix      current_gps_;
+    sensor_msgs::NavSatFix      home_gps_;     // PX4 home, 锁一次作为 GPS 输出的参考原点
+    bool                       is_home_locked_ = false;
     double                      current_gimbal_pitch_ = 0.0;
     // === 2026-07-16: 稳像世界 quat,直接来自 gimbal 的 camera/pose ===
     Eigen::Quaterniond          current_camera_world_quat_{1.0, 0.0, 0.0, 0.0};
@@ -863,25 +890,26 @@ private:
         msg.header.stamp = ros::Time::now();
         msg.header.frame_id = "wgs84";
 
-        if (!is_gps_received_ || !is_uav_pose_received_) {
+        // === 2026-07-28: 必须用 PX4 home 作为参考,不是 UAV 当前 GPS ===
+        //   c.ned_x/ned_y 已经是反投影到 map 系的绝对坐标(与 publishPrimaryPose 一致),
+        //   原版减去 UAV 当前位置再叠加 current_gps_,会导致 UAV 飞行时地面站目标跟着飘。
+        if (!is_home_locked_ || !is_uav_pose_received_) {
             publishEmptyGps();
             return;
         }
-        const double dx = c.ned_x - current_uav_pose_.pose.position.x;
-        const double dy = c.ned_y - current_uav_pose_.pose.position.y;
-        const double dz = c.ned_alt - current_uav_pose_.pose.position.z;
-        const double north_m = dx;       // NWU x = 北
-        const double east_m  = -dy;      // NWU y = 西 → 东 = -y
-        const double up_m    = dz;
+        // 当前 UAV 姿态的 (lat, lon) 也只能用作 fallback;主参考必须是 locked home。
+        const double north_m = c.ned_x;     // NWU x = 北向 (相对 home)
+        const double east_m  = -c.ned_y;    // NWU y = 西 → 东 = -y
+        const double up_m    = c.ned_alt;   // NWU z = 上向 (相对 home altitude)
         const double DEG_PER_M_LAT = 1.0 / 111320.0;
-        const double uav_lat_rad = current_gps_.latitude * M_PI / 180.0;
-        const double DEG_PER_M_LON = 1.0 / (111320.0 * std::cos(uav_lat_rad));
+        const double home_lat_rad = home_gps_.latitude * M_PI / 180.0;
+        const double DEG_PER_M_LON = 1.0 / (111320.0 * std::cos(home_lat_rad));
 
         msg.status.status  = sensor_msgs::NavSatStatus::STATUS_FIX;
         msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
-        msg.latitude  = current_gps_.latitude  + north_m * DEG_PER_M_LAT;
-        msg.longitude = current_gps_.longitude + east_m  * DEG_PER_M_LON;
-        msg.altitude  = current_gps_.altitude  + up_m;
+        msg.latitude  = home_gps_.latitude  + north_m * DEG_PER_M_LAT;
+        msg.longitude = home_gps_.longitude + east_m  * DEG_PER_M_LON;
+        msg.altitude  = home_gps_.altitude  + up_m;
         target_est_gps_pub_.publish(msg);
     }
 
