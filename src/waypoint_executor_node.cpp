@@ -178,6 +178,19 @@ private:
     double decel_limit_;   // m/s²,刹车减速度上限 — 物理刹停 v²≤2ad 用这个值
     double last_v_mag_;    // 上周期 v_mag (accel_limit 用,跨航点平滑过渡)
 
+    // ===== L1 横向控制(压线)=====
+    // L1 = max(L1_min_, cur_speed * L1_period_) — 决定飞机在段方向上的"超前看"距离(m)
+    // L1 越大 → 横向纠偏越平滑,但弯道/扰动下超调越大("画龙"感越强)
+    // L1 越小 → 横向响应越尖锐,贴线越紧,但 < 2m 易高频抖动
+    double L1_min_;        // m,低速段最小 lookahead,默认 3.0(原硬编码 5.0 偏长→压线响应慢)
+    double L1_period_;     // s,高速段 lookahead = cur_speed * L1_period_,默认 0.6(原硬编码 1.0)
+
+    // ===== 航向 P-control(机头跟踪 L1 bearing)=====
+    // yaw_rate = yaw_kp_ * yaw_error,饱和在 yaw_max_rate_
+    // yaw_kp 越大 → 航向跟踪越紧,但过大会震荡
+    double yaw_kp_;        // rad/s per rad,航向跟踪增益,默认 3.0(原硬编码 2.0 → 转弯期 yaw 跟不上速度方向)
+    double yaw_deadband_;  // rad,航向误差死区,默认 0.05(~3°)避免小幅抖动
+
     // 基准点参数(由 PX4 /mavros/home_position/home 自动填充,不再硬编码)
     double ref_lat_;
     double ref_lon_;
@@ -241,6 +254,10 @@ public:
         accel_limit_(2.0),
         decel_limit_(2.0),
         last_v_mag_(0.0),
+        L1_min_(3.0),
+        L1_period_(0.6),
+        yaw_kp_(3.0),
+        yaw_deadband_(0.05),
         current_work_mode_("SEARCH_ONLY"),
         segment_phase_(SegmentPhase::IDLE),
         arrive_idx_(0),
@@ -288,8 +305,23 @@ public:
         nh_private_.param<double>("reverse_speed", reverse_speed_, 1.0);
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
+        // L1 横向控制(压线)。
+        //   L1_min: lookahead 距离下限(m),低速段使用。
+        //     减小 → 横向响应更尖锐,但 < 2m 易高频抖动;
+        //     增大 → 响应更平滑,但"画龙"超调更明显。
+        //   L1_period: 高速段 lookahead = cur_speed * L1_period_(m)。
+        //     减小 → 高速时贴线更紧;增大 → 高速时更平滑但超调大。
+        nh_private_.param<double>("L1_min", L1_min_, 3.0);
+        nh_private_.param<double>("L1_period", L1_period_, 0.6);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
+        // 航向 P-control 增益 + 死区:
+        //   yaw_kp: 转弯期 yaw 跟踪 L1 bearing 的紧度。
+        //     增大 → 航向跟踪更紧(转弯期 yaw 更快对齐速度方向,减小侧滑);
+        //     过大会震荡。
+        //   yaw_deadband: 航向误差死区(rad),低于此值不旋转,避免小幅抖动。
+        nh_private_.param<double>("yaw_kp", yaw_kp_, 3.0);
+        nh_private_.param<double>("yaw_deadband", yaw_deadband_, 0.05);
         // 水平速度门控(m/s):低于此值冻结 yaw 角速度输出,避免 CRITICAL 避让
         //   时身体几乎不动但 yaw 仍死追 bearing → 原地打转。默认 0.5 m/s,
         //   - PROXIMITY 边界(40m): scale=1.0 → v≈5 m/s > 0.5 → 正常跟踪
@@ -792,8 +824,9 @@ public:
                 double along = rx * ux + ry * uy;
 
                 // ===== Lookahead 距离(PX4 mc_pos_control 同款) =====
-                const double L1_min = 5.0;     // m(低速段最小 lookahead,避免抖动)
-                const double L1_period = 1.0;  // s(PX4 默认 ~1)
+// 来自字段 L1_min_/L1_period_,可在 yaml 调:减小→贴线更紧;过大→"画龙"超调。
+                const double L1_min = L1_min_;     // m,低速段最小 lookahead,避免抖动
+                const double L1_period = L1_period_;  // s,高速段 lookahead 系数
                 double L1 = std::max(L1_min, cur_speed * L1_period);
                 // lookahead 投影点夹在 [0, seg_len](不过段端、不倒退)
                 double target_along = along + L1;
@@ -1054,8 +1087,9 @@ public:
         while (yaw_error_ned >  M_PI) yaw_error_ned -= 2.0 * M_PI;
         while (yaw_error_ned < -M_PI) yaw_error_ned += 2.0 * M_PI;
         // P 控制 + 死区 + 速度门控 + 限幅
-        const double yaw_kp       = 2.0;   // 比例增益(典型 1.0~3.0)
-        const double yaw_deadband = 0.05;  // ~3° 死区,避免小幅抖动
+        // 来自字段 yaw_kp_/yaw_deadband_,可在 yaml 调:kp↑ → 航向跟踪更紧
+        const double yaw_kp       = yaw_kp_;       // 比例增益(典型 1.0~3.0)
+        const double yaw_deadband = yaw_deadband_; // ~3° 死区,避免小幅抖动
         double yaw_rate_ned = 0.0;
         // 水平速度门控:水平速度过低(典型场景:CRITICAL 避让中 vx≈vy≈0)时冻结 yaw,
         //   否则身体几乎不动但 yaw 仍死追 L1 bearing → 看起来"原地自由旋转"。

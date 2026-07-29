@@ -15,6 +15,25 @@ hold_kp: 0.8
 # 避障 reverse_allowed 生效时(critical 冲突)沿段方向后退的速度（m/s）
 reverse_speed: 1.0
 
+# ===== L1 横向控制(压线)=====
+#   L1_min: look-ahead 距离下限(m),低速段使用。
+#     减小 → 横向响应更尖锐、贴线更紧,但 < 2m 易高频抖动;
+#     增大 → 响应更平滑,但"画龙"超调更明显(原硬编码 5.0 → 推荐 3.0)。
+#   L1_period: 高速段 L1 = cur_speed * L1_period(m)。
+#     减小 → 高速时贴线更紧;增大 → 高速时更平滑但超调大(原 1.0 → 推荐 0.6)。
+L1_min: 3.0
+L1_period: 0.6
+
+# ===== 航向 P-controller(机头跟踪 L1 bearing)=====
+#   yaw_max_rate: 角速度饱和上限(rad/s),避免 P 输出过旋转。
+#   yaw_kp: 转弯期 yaw 跟踪 L1 bearing 的紧度。
+#     增大 → 航向跟踪更紧(转弯期 yaw 更快对齐速度方向,减小侧滑);
+#     过大会震荡(原硬编码 2.0 → 推荐 3.0)。
+#   yaw_deadband: 航向误差死区(rad),低于此值不旋转,避免小幅抖动(保持 0.05 ~3°)。
+yaw_max_rate: 1.0
+yaw_kp: 3.0
+yaw_deadband: 0.05
+
 # 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
 lidar_building_avoidance_enabled: false
 lidar_climb_rate: 1.0
