@@ -333,6 +333,16 @@ private:
     ros::Publisher primary_target_pub_;      // 主目标 cluster_id → target_estimator (UInt64)
                                              // 0 = mission 未指定主目标(estimator 回退最高置信度)
 
+    // === Search(102) 云台俯仰角下发(2026-07-29) ===
+    //   102 IN_TASK 期间:publish sr.msg.gimbal_pitch(度)
+    //   其余时间(其它 skill_type / 非 IN_TASK / 新 task_flow):publish gimbal_pitch_default_
+    //   topic: /<ns>/mission/gimbal_command (Float32),由 gimbal_control_node 订阅闭环
+    ros::Publisher gimbal_command_pub_;
+    ros::Timer     gimbal_command_timer_;
+    double         gimbal_pitch_default_     = 0.0;   // 非搜索期间下发的"归位"俯仰角
+    double         gimbal_command_rate_hz_   = 5.0;   // 下发频率(Hz),5Hz 够云台伺服响应
+    double         current_gimbal_pitch_     = 0.0;   // 当前正下发到 gimbal_command 的值
+
     // ============== 定时器 ==============
     ros::Timer mission_timer_;
     ros::Timer mission_state_timer_;   // Phase 2: 1Hz MissionState 定频上报
@@ -904,6 +914,13 @@ public:
         nh_private_.param<double>("max_report_cluster_age_sec", max_report_cluster_age_sec_, 5.0);
         // GS 上报位置栅格去重半径(2026-07-29),见 report_dedup_radius_m_ 字段注释
         nh_private_.param<double>("report_dedup_radius_m", report_dedup_radius_m_, 40.0);
+
+        // === 云台俯仰角下发参数(2026-07-29) ===
+        // 搜索任务结束后 gimbal_command 下发的归位俯仰角(度)。典型搜索场景用 -15~-45,
+        //   默认 0.0 = 水平(云台归位、不影响起飞/集结/返航段的视线)。
+        nh_private_.param<double>("gimbal_pitch_default",   gimbal_pitch_default_,   0.0);
+        // gimbal_command topic 下发频率(Hz)。详见 mission_manager.yaml 注释。
+        nh_private_.param<double>("gimbal_command_rate_hz", gimbal_command_rate_hz_, 5.0);
     }
 
     void initSubscribers() {
@@ -1092,6 +1109,13 @@ public:
         // 最高置信度在目标间跳变。
         primary_target_pub_ = nh_.advertise<std_msgs::UInt64>(
             "mission/primary_target", 10);
+
+        // === 云台俯仰角下发(2026-07-29) ===
+        //   102 Search IN_TASK → publish sr.msg.gimbal_pitch(度)
+        //   其余 skill_type 或非 IN_TASK → publish gimbal_pitch_default_
+        //   topic: /<ns>/mission/gimbal_command (Float32)
+        gimbal_command_pub_ = nh_.advertise<std_msgs::Float32>(
+            "mission/gimbal_command", 10);
     }
 
     void initTimers() {
@@ -1122,6 +1146,14 @@ public:
             ros::Duration(30.0),
             &MissionManager::vizTfTimerCallback, this);
         viz_tf_timer_.stop();  // 等 home 锁定后再 start()
+
+        // === 云台俯仰角下发(2026-07-29) ===
+        // 频率从 yaml ~gimbal_command_rate_hz 读取(默认 5Hz);callback 内只读
+        //   current_gimbal_pitch_ 并 publish,状态值由 advanceSkillStateMachine
+        //   在 102 Search 进入/退出 IN_TASK 时改写,不在 callback 里改,避免 timer 抢占。
+        gimbal_command_timer_ = nh_.createTimer(
+            ros::Duration(1.0 / gimbal_command_rate_hz_),
+            &MissionManager::gimbalCommandTimerCallback, this);
     }
 
     void initTargetState() {
@@ -1768,6 +1800,17 @@ public:
 
         // 重置航点接收标志(避免前序 flow 的 is_waypoints_received_ 残留误导 performTakeoffHandoff)
         is_waypoints_received_ = false;
+
+        // === 新 TaskFlow 到达:云台俯仰角复位到默认值(2026-07-29) ===
+        //   上一条 flow 的 102 Search 可能在 IN_TASK 设了 non-default gimbal_pitch,
+        //   新 flow 到达后这条 skill 流会被替换,如果不显式复位,timer 会继续用旧值发布,
+        //   直到下一条 102 IN_TASK 才覆盖(若新 flow 没有 102 则永远不复位)。
+        //   兜底语义:任何新 flow 到达 = "上一段搜索结束" → gimbal 归位。
+        if (current_gimbal_pitch_ != gimbal_pitch_default_) {
+            ROS_WARN("[MissionManager] New TaskFlow: gimbal_pitch %.2f -> default %.2f deg",
+                     current_gimbal_pitch_, gimbal_pitch_default_);
+            current_gimbal_pitch_ = gimbal_pitch_default_;
+        }
 
         // 把 skill 流拷进运行时队列
         skill_queue_.clear();
@@ -4479,6 +4522,15 @@ public:
                             // 101 集结合:记录进入时刻,等待其他 UAV 或 timeout
                             sr.gather_enter_time = now;
                         }
+                        // === 102 Search IN_TASK 入口(2026-07-29):下发 gimbal_pitch ===
+                        //   gimbal_command_timer_callback 不读 skill_state,只读 current_gimbal_pitch_,
+                        //   所以状态值在 transition 一次性写一次即可,timer 5Hz 会自动续发。
+                        if (sr.msg.skill_type == 102) {
+                            current_gimbal_pitch_ = sr.msg.gimbal_pitch;
+                            ROS_WARN("[MissionManager] Search(102) IN_TASK: gimbal_pitch -> %.2f deg "
+                                     "(will publish on /<ns>/mission/gimbal_command @%.1fHz)",
+                                     current_gimbal_pitch_, gimbal_command_rate_hz_);
+                        }
                         sr.last_event = "TRANSIT to IN_TASK (skill_area empty, skip ENTRY_PENDING)";
                         ROS_WARN("[MissionManager] Skill[%zu] id=%s to IN_TASK "
                                  "(type=%u, skill_area empty, skipping ENTRY_PENDING)",
@@ -4532,6 +4584,15 @@ public:
                         current_work_mode_ = WorkMode::SEARCH_STRIKE;
                         ROS_WARN("[MissionManager] Attack(105) skill IN_TASK: promoting work_mode %s -> SEARCH_STRIKE",
                                  workModeToString(old_mode).c_str());
+                    }
+                    // === 102 Search IN_TASK 入口(2026-07-29):下发 gimbal_pitch ===
+                    //   同 TRANSIT→IN_TASK(skill_area 空)分支,这里覆盖"非空 skill_area"主路径。
+                    //   放在 work_mode promote 之后,顺序无关,只为保证 state 切完再 publish。
+                    if (sr.msg.skill_type == 102) {
+                        current_gimbal_pitch_ = sr.msg.gimbal_pitch;
+                        ROS_WARN("[MissionManager] Search(102) IN_TASK: gimbal_pitch -> %.2f deg "
+                                 "(will publish on /<ns>/mission/gimbal_command @%.1fHz)",
+                                 current_gimbal_pitch_, gimbal_command_rate_hz_);
                     }
 
                     sr.last_event = "ENTRY_PENDING to IN_TASK";
@@ -4687,6 +4748,15 @@ public:
                     }
                     // Attack(105) 不进 EXIT_PENDING(已在上面分支完成 hover 起步);其余 skill_type 沿用旧行为
                     if (sr.msg.skill_type != 105) {
+                        // === 102 Search IN_TASK 出口(2026-07-29):gimbal 归位 ===
+                        //   skill_area_path 走完,自然收尾:把 current_gimbal_pitch_ 复位到
+                        //   gimbal_pitch_default_(默认 0,水平),gimbal_command_timer 继续 5Hz
+                        //   把"水平"姿态推下去,gimbal_control_node 收到后会回正视线。
+                        if (sr.msg.skill_type == 102) {
+                            ROS_WARN("[MissionManager] Search(102) EXIT_PENDING: gimbal_pitch %.2f -> default %.2f deg",
+                                     current_gimbal_pitch_, gimbal_pitch_default_);
+                            current_gimbal_pitch_ = gimbal_pitch_default_;
+                        }
                         sr.state = SkillState::EXIT_PENDING;
                         sr.state_enter_time = now;
                         sr.last_event = "IN_TASK to EXIT_PENDING (skill area done)";
@@ -4730,6 +4800,15 @@ public:
                 // in_task_timeout 检查
                 if (in_task_timeout_ > 0.0 &&
                     (now - sr.in_task_enter_time).toSec() > in_task_timeout_) {
+                    // === 102 Search IN_TASK 超时(2026-07-29):gimbal 同样归位 ===
+                    //   与上面 IN_TASK→EXIT_PENDING(skill area done)同语义,
+                    //   只是这里是 timeout 强切 FAILED,云台也要回正避免下一条 skill 进来时
+                    //   gimbal 还卡在原搜索俯仰角。
+                    if (sr.msg.skill_type == 102) {
+                        ROS_WARN("[MissionManager] Search(102) IN_TASK TIMEOUT: gimbal_pitch %.2f -> default %.2f deg",
+                                 current_gimbal_pitch_, gimbal_pitch_default_);
+                        current_gimbal_pitch_ = gimbal_pitch_default_;
+                    }
                     sr.state = SkillState::FAILED;
                     sr.state_enter_time = now;
                     sr.last_event = "IN_TASK to FAILED (timeout)";
@@ -5357,6 +5436,22 @@ public:
                                                   : (1.0 / TRACKING_STATE_IDLE_RATE_HZ));  // 1Hz
         tracking_state_timer_.setPeriod(want_period);
         publishTrackingState(is_locked ? 1 : 0);
+    }
+
+    /**
+     * 云台俯仰角下发(2026-07-29)
+     *   - 频率:~gimbal_command_rate_hz (默认 5Hz)
+     *   - 内容:current_gimbal_pitch_(度)
+     *     * 102 Search IN_TASK → sr.msg.gimbal_pitch(在 advanceSkillStateMachine IN_TASK
+     *       入口改写,本 callback 只读)
+     *     * 其它 skill_type / 非 IN_TASK → gimbal_pitch_default_(默认 0,水平)
+     *   - 兜底:有订阅者才 publish,避免空订阅时刷日志
+     */
+    void gimbalCommandTimerCallback(const ros::TimerEvent&) {
+        if (gimbal_command_pub_.getNumSubscribers() == 0) return;
+        std_msgs::Float32 msg;
+        msg.data = static_cast<float>(current_gimbal_pitch_);
+        gimbal_command_pub_.publish(msg);
     }
 
     std::string taskStatusToString() {

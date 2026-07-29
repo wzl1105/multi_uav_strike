@@ -89,6 +89,10 @@ float32  task_speed
 # 0 = 默认,1 = 顺序惯序,2 = 编队
 uint8    formation
 
+# 搜索技能的云台俯仰角(度)
+# 负值 = 向下,0 = 水平,正值 = 向上
+float32  gimbal_pitch
+
 # 进场航点(沿此段飞行至任务区,不触发任务执行)
 nav_msgs/Path arrive_path
 

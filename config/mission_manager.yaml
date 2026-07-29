@@ -53,3 +53,12 @@ max_report_cluster_age_sec: 5.0
 #   否则 EMA 漂移会让 C2 漏抓造成重复上报。
 # 推荐:40 ~ 60(默认值 40,适配 YOLO 投影抖动 + EMA 时间常数 0.23s)
 report_dedup_radius_m: 40.0
+
+# === 云台俯仰角控制(2026-07-29) ===
+# Search(102) 任务激活期间,把 Skill.gimbal_pitch 持续低频下发到 /<ns>/mission/gimbal_command
+#   (Float32,度)。任务结束后(进入 EXIT_PENDING/FAILED 或新 task_flow 覆盖)恢复该默认值。
+# 推荐:0.0(水平,云台归位);典型搜索场景 -15 ~ -45(下俯)
+gimbal_pitch_default: 0.0
+# mission/gimbal_command 下发频率(Hz)。不需要高频(云台伺服惯性大),5Hz 已够响应
+#   gimbal_control_node 的闭环,过低(<2)会让 gimbal 抖动时显得"延迟大"
+gimbal_command_rate_hz: 5.0
