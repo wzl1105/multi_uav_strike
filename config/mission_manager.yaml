@@ -31,3 +31,25 @@ attack_close_range_threshold_m: 5.0
 attack_sync_strike_buffer_sec: 1.0
 # formation=1/2 门控挂起 strike 的超时,超时则放弃当前 skill,转下一条
 attack_strike_pending_timeout_sec: 60.0
+
+# === Cluster 上报新鲜度门槛(2026-07-29,可调) ===
+# UAV 安全门:cluster.last_seen_us 距今 > 此值 → 拒绝触发 strike(stale 坐标会让
+#   UAV 飞向错位置),同时 erase strike_dispatched_ 允许下一帧重新派发。
+#   无差别应用,不受"是否已上报过"影响。
+# 推荐:0.3 ~ 1.0(太短会 GUIDANCE_STRIKE ↔ TARGET_LOST_HOVER 频繁跳变,太长会飞 stale 坐标)
+max_strike_cluster_age_sec: 0.5
+
+# GS 上报门:cluster.last_seen_us 距今 > 此值 → 拒绝**重复上报**(已上报过的 cluster
+#   再报一次必须是新鲜坐标,避免 GS 反复收到 stale 数据)。
+#   首次上报豁免(stale 也允许先报一次,免得永久漏报)。
+# 推荐:3.0 ~ 10.0(默认 5.0,适配 8m/s × 10m 目标视野 ~1.5~3s 出 FOV,留 2x 余量)
+# 测试时可放宽到 30.0+ 看是否首次上报真的能补回老目标
+max_report_cluster_age_sec: 5.0
+
+# === Cluster 位置栅格去重半径(2026-07-29,可调) ===
+# 同 label 新 cluster 与 reported_to_gs_ 中某条记录 2D 距离 < 此值 → 视为同一物理
+#   目标,跳过(弥补 C1 cluster_id dedup 在 60s cluster TTL 重建后的漏洞)。
+# 必须 ≥ target_estimator.merge_radius_m(target_estimator.yaml,默认 30m),
+#   否则 EMA 漂移会让 C2 漏抓造成重复上报。
+# 推荐:40 ~ 60(默认值 40,适配 YOLO 投影抖动 + EMA 时间常数 0.23s)
+report_dedup_radius_m: 40.0

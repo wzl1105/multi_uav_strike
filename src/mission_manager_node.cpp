@@ -2614,13 +2614,17 @@ public:
             //        current_target_.is_locked=true → 反复 startGuidanceApproach,
             //        触发 100ms 一次的 GUIDANCE_STRIKE ↔ TARGET_LOST_HOVER ping-pong
             //   === 2026-07-29 改造:两个阈值分立 ===
-            //     - max_strike_cluster_age_sec_ (0.5s):超过 → skip strike 触发(stale 会让
-            //       UAV 飞向旧位置),并 erase strike_dispatched_(允许新检测重新派发)
-            //     - max_report_cluster_age_sec_ (5.0s):超过 → skip 全部上报(绿球已失去导航
-            //       意义,GS 看到也没用),但**不 erase** reported_to_gs_/strike_dispatched_,
-            //       避免航向扫掠反复触发重发(C1)
-            //   原版 bug B1:0.5s 阈值同时挡上报,导致绿球持久亮但永远报不出去(典型时序:
-            //     目标在过第一个 skill_area 点前晋升 → 等 UAV 飞过去 → age 已经 > 0.5s → 永远 skip)
+            //     - max_strike_cluster_age_sec_ (0.5s):UAV 安全门,**无差别应用** —
+            //       stale 会让 UAV 飞向旧位置,必须 skip strike 触发,并 erase
+            //       strike_dispatched_(允许新检测重新派发)
+            //     - max_report_cluster_age_sec_ (5.0s):GS 上报门,**只对"已上报过"的 cluster
+            //       生效** — 重复上报必须新鲜,避免 GS 反复收到旧坐标;首次上报豁免,
+            //       即使 stale 也比漏报强(典型时序:短暂遮挡/边缘掠过 → 目标晋升后
+            //       last_seen_us 已超 5s,但 gating 一旦开放(wp_status 到位 / 锁转移 /
+            //       skill 切换)就该立刻上报,不该被永久屏蔽)
+            //   原版 bug B1:0.5s 阈值同时挡上报 → 绿球持久亮但永远报不出去
+            //   二次 bug(同日):5s 阈值无差别拦首次上报 → 同样导致"绿了但从未上报过的
+            //     目标永远报不出"(5 目标只报 2 的根因之一)
             bool is_strike_stale = false;
             if (cluster.last_seen_us != 0) {
                 const ros::Time now_ros = ros::Time::now();
@@ -2631,14 +2635,29 @@ public:
                     // erase strike_dispatched_ 仅此一项,reported_to_gs_ 保留
                     strike_dispatched_.erase(cluster.cluster_id);
                 }
-                if (cluster_age_sec > max_report_cluster_age_sec_) {
-                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-report "
-                                      "(last_seen_age=%.2fs > max=%.2fs, pose=%.1f,%.1f,%.1f) "
-                                      "→ skip both report and strike",
+                // === stale gate 仅对"已上报过"的 cluster 生效 ===
+                //   C1 dedup 检查(下方)在 stale 之后,但这里**提前**用同样的查询
+                //   避免把 stale 判断推迟到 dedup 通过后,导致 stale 计算结果被覆盖
+                const bool already_reported =
+                    reported_to_gs_.count(cluster.cluster_id) > 0 ||
+                    strike_dispatched_.count(cluster.cluster_id) > 0;
+                if (cluster_age_sec > max_report_cluster_age_sec_ && already_reported) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-republish "
+                                      "(last_seen_age=%.2fs > max=%.2fs, already_reported=true, "
+                                      "pose=%.1f,%.1f,%.1f) → skip both report and strike",
                                       cluster.cluster_id, cluster.label.c_str(),
                                       cluster_age_sec, max_report_cluster_age_sec_,
                                       cluster.ned_x, cluster.ned_y, cluster.ned_alt);
                     continue;
+                }
+                if (cluster_age_sec > max_report_cluster_age_sec_) {
+                    // Stale 但从未上报过:首次上报豁免,GS 看到比漏报强
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-first-report "
+                                      "(last_seen_age=%.2fs > max=%.2fs, already_reported=false, "
+                                      "pose=%.1f,%.1f,%.1f) → allow first publish",
+                                      cluster.cluster_id, cluster.label.c_str(),
+                                      cluster_age_sec, max_report_cluster_age_sec_,
+                                      cluster.ned_x, cluster.ned_y, cluster.ned_alt);
                 }
                 if (is_strike_stale) {
                     ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s STALE-strike "
@@ -2984,14 +3003,20 @@ public:
             dt.dev_yaw = std::atan2(siny_cosp, cosy_cosp);
         }
 
-        // 目标 GPS — 优先 live target_estimated_gps;其次 cluster ned 转 GPS;最后退化
-        if (current_target_.has_gps) {
+        // 目标 GPS — 优先 cluster 自身的 NED 转 GPS(2026-07-29:不再优先
+        //   current_target_.gps,该字段是 target_estimated_gps 的缓存,
+        //   而 target_estimated_gps 在 target_estimator_node.cpp:498-518 只发
+        //   PRIMARY 一个 cluster 的 GPS。clusterStatesCallback 在 10Hz 快照里
+        //   遍历所有 promoted cluster,若优先用 current_target_.gps,
+        //   非 primary 全部拿到 PRIMARY 的旧坐标 → GS 看到 N 个 cluster 同一坐标)
+        //   current_target_.gps 仅在 ref_initialized_=false(罕见,home 未锁)时兜底
+        if (ref_initialized_) {
+            nedToGps(cluster.ned_x, cluster.ned_y, cluster.ned_alt,
+                     dt.obj_lat, dt.obj_lon, dt.obj_alt);
+        } else if (current_target_.has_gps) {
             dt.obj_lat = current_target_.gps.latitude;
             dt.obj_lon = current_target_.gps.longitude;
             dt.obj_alt = current_target_.gps.altitude;
-        } else if (ref_initialized_) {
-            nedToGps(cluster.ned_x, cluster.ned_y, cluster.ned_alt,
-                     dt.obj_lat, dt.obj_lon, dt.obj_alt);
         } else {
             dt.obj_lat = dt.dev_lat;
             dt.obj_lon = dt.dev_lon;
