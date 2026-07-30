@@ -62,3 +62,22 @@ gimbal_pitch_default: 0.0
 # mission/gimbal_command 下发频率(Hz)。不需要高频(云台伺服惯性大),5Hz 已够响应
 #   gimbal_control_node 的闭环,过低(<2)会让 gimbal 抖动时显得"延迟大"
 gimbal_command_rate_hz: 5.0
+
+# === Attack(105) WP2-gate(2026-07-30) ===
+# cluster 必须落在 WP2 周围此半径内才允许 strike/锁定,
+#   避免飞向 WP2 途中被远处的"伪目标"抢先锁走、UAV 飞离攻击方向。
+# 推荐 20~40;过大容易混进临近目标,过小会错过 YOLO 反投影抖动(默认 30m)
+wp2_strike_radius_m: 30.0
+# UAV 到 attack_point 后,从未找到任何 WP2 范围内目标时的长悬停上限(秒)。
+# 用于"确实没有目标就悬停"的语义,远大于 attack_hover_timeout_sec_(30s)。
+# 推荐 120~600;过短会"还没看清就放弃",过长会卡死仿真
+attack_no_target_hold_sec: 300.0
+
+# === Attack(105) 云台联动(2026-07-30) ===
+# 105 阶段从 WP1 到达开始,延时 N 秒后云台才开始朝 WP2 看。
+# 避免在 WP1 短暂悬停时云台就转头乱抖。
+# 推荐 1~3;过短会在 WP1 悬停时云台就乱抖,过长会错过 WP1→WP2 段目标搜索时机
+attack_wp2_look_delay_sec: 2.0
+# 105 阶段尚未到达 WP1 或延时内时的云台默认俯仰角(度,正值=下视,GS 语义)。
+# 默认 0=水平;非零可让云台保持搜索姿态等 WP1
+attack_gimbal_look_default_pitch_deg: 0.0
