@@ -2404,16 +2404,17 @@ public:
     }
 
     /**
-     * label 是否匹配 GS 下发的 target_type 位掩码(2026-07-30 新增)
+     * label 是否匹配 GS 下发的 target_type 位掩码(2026-07-30 新增,2026-07-30 车类合一)
      *
      * 语义:
      *   target_type == 0                  → 任意 label 匹配(保持旧行为)
      *   bit 0 (0x01) 置位                → "person" 匹配
-     *   bit 1 (0x02) 置位                → "car"    匹配
+     *   bit 1 (0x02) 置位                → 整个"车类" 匹配(car/truck/bus/van/vehicle)
+     *                                       与 buildDetectTarget labelToClassId 对齐(车类都报 2)
      *   0x03 (人+车)                    → 两者都匹配
      *   0x04+ 仅有未定义 bit 置位        → 视为 0(任意 label,防御性)
      *
-     * 例:GS 下发 1 → 只挑 person;下发 2 → 只挑 car;下发 0/3/4+ → 不限
+     * 例:GS 下发 1 → 只挑 person;下发 2 → 只挑车类(含 truck);下发 0/3/4+ → 不限
      */
     bool labelMatchesTargetType(const std::string& label, uint32_t target_type) const {
         const uint32_t known = target_type & 0x03u;
@@ -2421,8 +2422,20 @@ public:
             return true;  // 0 或 仅未定义位 → 任意
         }
         if ((known & 0x01u) && label == "person") return true;
-        if ((known & 0x02u) && label == "car")    return true;
+        if ((known & 0x02u) && isVehicleLabel(label)) return true;
         return false;
+    }
+
+    /**
+     * 是否属于"车类"(2026-07-30 与 labelToClassId 保持一致)
+     * 集中放这里是为了 target_type 路由与 buildDetectTarget 上报语义对齐:
+     *   labelToClassId 把 car/truck/bus/van/vehicle 全报 class_id=2(车),
+     *   所以 target_type bit1(0x02)也要覆盖这五个,否则机载选了 truck 但
+     *   GS 端看到上报是"车"会出现"打哪个"的歧义
+     */
+    static bool isVehicleLabel(const std::string& label) {
+        return label == "car"     || label == "vehicle" || label == "truck" ||
+               label == "bus"     || label == "van";
     }
 
     /**
