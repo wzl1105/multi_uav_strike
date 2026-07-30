@@ -15,8 +15,26 @@ targets:
   - {label: "person", x_init:  60.0, y_init: -100.0, max_speed: 0.0}    # 原:静止人 1 (116m)
   - {label: "person", x_init:   0.0, y_init: -205.0, max_speed: 1.0, max_normal_acc: 0.5}  # 原:慢速人 (205m)
   - {label: "person", x_init:  90.0, y_init:  -50.0, max_speed: 0.0}    # 静止人 2 (NE 102m)
-  - {label: "person", x_init: -50.0, y_init: -150.0, max_speed: 0.0}    # 静止人 3 (SW 158m)
+  - {label: "person", x_init: -50.0, y_init: -150.0, max_speed: 0.0}    # 静止人 3 (SW 158m) — attack_point 命中测试用
   - {label: "person", x_init: 130.0, y_init: -100.0, max_speed: 0.0}    # 静止人 4 (E 164m)
+
+  # ===== 多目标扎堆测试(2026-07-30,以 attack_point (NWU -49.87,-149.87) 为中心) =====
+  # 8 个静止人散布在 ~15m 半径圆周上,模拟"目标聚集"场景,验证 strike 是否正确
+  #   选一个(应该按 cluster_id 第一次晋升的触发 strike,WP2-gate 30m 内全部放行)。
+  # 注意:15m 间距要求 target_estimator.yaml 的 merge_radius_m ≤ 10,
+  #   默认 30 会把这一圈全部合并成一个 cluster。
+  - {label: "person", x_init: -35.0, y_init: -150.0, max_speed: 0.0}    # E   (~15m)
+  - {label: "person", x_init: -65.0, y_init: -150.0, max_speed: 0.0}    # W   (~15m)
+  - {label: "person", x_init: -50.0, y_init: -135.0, max_speed: 0.0}    # N   (~15m)
+  - {label: "person", x_init: -50.0, y_init: -165.0, max_speed: 0.0}    # S   (~15m)
+  - {label: "person", x_init: -39.0, y_init: -139.0, max_speed: 0.0}    # NE  (~15.6m)
+  - {label: "person", x_init: -61.0, y_init: -161.0, max_speed: 0.0}    # SW  (~15.6m)
+  - {label: "person", x_init: -39.0, y_init: -161.0, max_speed: 0.0}    # NW  (~15.6m)
+  - {label: "person", x_init: -61.0, y_init: -139.0, max_speed: 0.0}    # SE  (~15.6m)
+
+  # 1 个 car(测 label-only 匹配) + 1 个超 WP2-gate 的 person(测 gate 拒绝)
+  - {label: "car",    x_init: -30.0, y_init: -130.0, max_speed: 0.0}    # NE car (~28.5m,gate 边界)
+  - {label: "person", x_init: -15.0, y_init: -130.0, max_speed: 0.0}    # NE far (~40m,**超 gate 应被拒**)
 
   # # ===== 移动人员 (验证 EMA 世界域跟随相机机动) =====
   # - {label: "person", x_init:  30.0, y_init: -120.0, max_speed: 2.0, max_tangential_acc: 1.0, max_normal_acc: 0.8}   # 行人 2m/s

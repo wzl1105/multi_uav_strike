@@ -101,3 +101,22 @@ nav_msgs/Path skill_area_path
 
 # 兜底参数(预留 JSON 字符串,具体字段后续追加)
 string   params_json
+
+# ============================================================================
+# 目标类型位掩码(2026-07-30 新增,GS 端 skill_params.target_type 透传)
+# 仅 skill_type=105 (Attack) 生效;其他 skill 忽略
+# 位定义:
+#   bit 0 (0x01) = person(人)
+#   bit 1 (0x02) = car(车)
+#   bit 2+       = 协议未定义,按 0 处理(任意 label 匹配)
+# 取值示例:
+#   0          = 任意 label(保持旧行为,GS 漏发 / 老 Skill 也走这里)
+#   1          = 仅 person
+#   2          = 仅 car
+#   3          = person + car(人车都打,选距 WP2 最近)
+#   4+         = 仅未定义 bit 置位,回退到 0(任意 label)
+#
+# 路由语义:WP2-gate 内的 cluster 中,label 匹配此掩码的候选,挑距 WP2 最近
+#   的那个作 primary 触发 strike;其他全部走 type=3 被动上报
+# ============================================================================
+uint32   target_type

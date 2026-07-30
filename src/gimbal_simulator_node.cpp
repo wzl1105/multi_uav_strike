@@ -7,6 +7,7 @@
 #include <sensor_msgs/Range.h>
 #include <visualization_msgs/Marker.h>
 #include <tf/transform_datatypes.h>
+#include <std_msgs/Float32.h>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <cmath>
@@ -58,6 +59,13 @@ private:
     // 订阅
     ros::Subscriber target_sub_;
     ros::Subscriber uav_pose_sub_;
+    // === 2026-07-30: 外部俯仰角指令(由 mission_manager 5Hz 下发) ===
+    //   单位:度,正值=上仰,负值=下视(ROS 约定)。
+    //   收到后立即用作 desired_pitch,纯跟随 mission 的解算。
+    //   0.5s 内没新消息 → 失效,回退到原自主逻辑。
+    ros::Subscriber gimbal_command_sub_;
+    double          external_pitch_deg_    = 0.0;
+    ros::Time       last_external_pitch_time_;
 
     // 发布
     ros::Publisher los_angle_pub_;     // 目标 LOS (保持)
@@ -237,6 +245,11 @@ public:
                                     &GimbalSimulator::targetsCallback, this);
         uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10,
                                       &GimbalSimulator::uavPoseCallback, this);
+        // === 2026-07-30: 外部 gimbal_command 订阅(mission_manager 解算后的俯仰角) ===
+        //   gimbal_simulator 不再做 GPS→俯仰角解算,纯跟随。
+        //   没收到消息 → 维持原"自主跟最近可见目标"行为作为兜底。
+        gimbal_command_sub_ = nh_.subscribe("mission/gimbal_command", 10,
+                                            &GimbalSimulator::gimbalCommandCallback, this);
 
         // 发布(保持)
         los_angle_pub_   = nh_.advertise<geometry_msgs::Point>("target_los_angle", 10);
@@ -302,6 +315,14 @@ public:
         is_target_received_ = !targets_.empty();
     }
 
+    // === 2026-07-30: 外部 gimbal_command 回调 ===
+    //   msg.data 单位度,负值=下视(ROS 约定,与 mission_manager 的取反逻辑对齐)。
+    //   仅缓存最新值与时间戳,实际切换在 controlLoopCallback 顶部按超时判断。
+    void gimbalCommandCallback(const std_msgs::Float32::ConstPtr& msg) {
+        external_pitch_deg_      = static_cast<double>(msg->data);
+        last_external_pitch_time_ = ros::Time::now();
+    }
+
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         // 与原版保持一致:NED/ENU → NWU
         if (use_sim_) {
@@ -357,9 +378,21 @@ public:
             return;
         }
 
-        // === 2. 决定 desired_pitch(指向主目标;无主目标则回退默认角) ===
+        // === 2. 决定 desired_pitch ===
+        //   优先级(2026-07-30):
+        //     1) mission_manager 下发的外部 gimbal_command(0.5s 内有效):
+        //        纯跟随 mission 解算,不再自己算 GPS→俯仰角。
+        //     2) 否则,沿用原逻辑:有主目标 → 指向主目标,无主目标 → 回退默认角。
+        //   保留原"自主跟最近目标"作为兜底,确保 mission_manager 没启动/失联时云台仍合理。
+        const bool external_valid = (last_external_pitch_time_.isZero() == false) &&
+            ((ros::Time::now() - last_external_pitch_time_).toSec() < 0.5);
         bool has_primary = (primary_idx_ >= 0);
-        if (has_primary) {
+        if (external_valid) {
+            // msg.data 是度,负值=下视(ROS 约定);内部 current_gimbal_pitch_ 是弧度,
+            //   范围 [0, π/2],正值=下视 — 需要取反 + 度→弧度。
+            double pitch_rad = -external_pitch_deg_ * M_PI / 180.0;
+            desired_pitch = clampv(pitch_rad, 0.0, M_PI/2.0);
+        } else if (has_primary) {
             const TargetProj& p = projections_[primary_idx_];
             desired_pitch = computePitchAndYawToTarget(p.pos.x, p.pos.y);
             ROS_INFO_THROTTLE(5.0, "[GimbalSim] primary target id=%u label=%s in view: "
