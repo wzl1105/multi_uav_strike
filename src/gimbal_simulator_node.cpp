@@ -93,6 +93,7 @@ private:
     double yolo_pub_freq_;      // yolo_results / yolo (单条) 实际发布频率 Hz(默认 10)
     bool use_sim_;
     double image_noise_std_dev_;
+    // 上面的 image_noise_std_dev_ 加在世界坐标位置(米),只影响 gimbal 控制,不改 u_px/v_px
     std::string uav_pose_topic_;
     double desired_pitch, desired_yaw;
 
@@ -119,7 +120,9 @@ private:
 
     // 噪声
     std::default_random_engine rng_;
-    std::normal_distribution<double> noise_dist_;
+    std::normal_distribution<double> noise_dist_;       // 世界坐标 (米),作用于 gimbal 控制
+    double pixel_noise_std_dev_;                        // 像素,作用于 u_px/v_px
+    std::normal_distribution<double> pixel_noise_dist_;
 
     // === 状态 ===
     std::vector<multi_uav_strike::SimTarget> targets_;   // 全部仿真目标(来自 /sim_targets)
@@ -172,6 +175,7 @@ public:
         }
         nh_private_.param<bool>("use_sim", use_sim_, true);
         nh_private_.param<double>("image_noise_std_dev", image_noise_std_dev_, 0.0);
+        nh_private_.param<double>("pixel_noise_std_dev", pixel_noise_std_dev_, 0.0);
         nh_private_.param<bool>("lidar_enabled", lidar_enabled_, false);
         nh_private_.param<double>("lidar_min_range", lidar_min_range_, 0.2);
         nh_private_.param<double>("lidar_max_range", lidar_max_range_, 300.0);
@@ -226,6 +230,7 @@ public:
         // 噪声
         rng_.seed(std::chrono::system_clock::now().time_since_epoch().count());
         noise_dist_ = std::normal_distribution<double>(0.0, image_noise_std_dev_);
+        pixel_noise_dist_ = std::normal_distribution<double>(0.0, pixel_noise_std_dev_);
 
         // 订阅
         target_sub_ = nh_.subscribe("/sim_targets", 10,
@@ -610,6 +615,15 @@ public:
                 double v_ndc = -t_cam.x() / t_cam.z();
                 pr.u_px = u_ndc * focal_x_ + image_width_  / 2.0;
                 pr.v_px = v_ndc * focal_y_ + image_height_ / 2.0;
+                // === 2026-07-30: 图像层像素噪声 ===
+                //   模拟真实相机的识别/检测抖动: u_px/v_px 偏离真值后,
+                //   FOV 判定、bbox 中心、target_estimator 反投影全部继承抖动
+                //   (bbox 中心 = (u_px, v_px),下游 EMA/聚类会看到目标横漂)。
+                //   注: image_noise_std_dev_ 是世界坐标噪声,这里互不干扰。
+                if (pixel_noise_std_dev_ > 0.0) {
+                    pr.u_px += pixel_noise_dist_(rng_);
+                    pr.v_px += pixel_noise_dist_(rng_);
+                }
                 bool u_ok = (pr.u_px >= 0.0 && pr.u_px < image_width_);
                 bool v_ok = (pr.v_px >= 0.0 && pr.v_px < image_height_);
                 pr.visible = u_ok && v_ok;

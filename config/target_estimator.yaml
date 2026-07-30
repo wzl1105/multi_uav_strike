@@ -19,6 +19,15 @@
 merge_radius_m: 30.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
                               # 同 label + 同区域才算同一实例;不同类别天然不会合并。
 cluster_ttl_sec: 60.0         # 多久无新命中 → 释放 cluster (秒)
+min_hit_count: 20             # 同 cluster 被检测到这么多次才晋升为正式目标
+                              # === 2026-07-16: 误检门禁 ===
+                              # 10Hz yolo 下 20 hits ≈ 2s 持续命中,误检基本进不来;
+                              # 真目标在视野停留 3~5s 时稳定晋升。
+                              # 单次或零星命中被门禁过滤,不会触发 mission_manager 上报/跟踪。
+                              # 设 ≤ 1 关闭门禁(每次命中都晋升,等价于老版行为)。
+tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后多久丢弃 (秒)
+                              # 比 cluster_ttl_sec 短得多 — tentative 没有发过 cluster_event,
+                              # mission_manager 不感知,过期丢弃对上游无影响。
 ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全用新值)
                               # === 2026-07-16: Plan B 世界空间 EMA ===
                               # EMA 直接作用于 cand 世界坐标 (米),相机机动零滞后。
