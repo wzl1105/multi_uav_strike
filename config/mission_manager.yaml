@@ -49,10 +49,11 @@ max_report_cluster_age_sec: 5.0
 # === Cluster 位置栅格去重半径(2026-07-29,可调) ===
 # 同 label 新 cluster 与 reported_to_gs_ 中某条记录 2D 距离 < 此值 → 视为同一物理
 #   目标,跳过(弥补 C1 cluster_id dedup 在 60s cluster TTL 重建后的漏洞)。
-# 必须 ≥ target_estimator.merge_radius_m(target_estimator.yaml,默认 30m),
+# 必须 ≥ target_estimator.merge_radius_m(target_estimator.yaml,默认 10m),
 #   否则 EMA 漂移会让 C2 漏抓造成重复上报。
-# 推荐:40 ~ 60(默认值 40,适配 YOLO 投影抖动 + EMA 时间常数 0.23s)
-report_dedup_radius_m: 40.0
+# === 2026-07-31: 40 → 25 ===
+# 跟随 target_estimator.merge_radius_m=10, 留 2.5x EMA 噪声 + WP2-gate 余量
+report_dedup_radius_m: 25.0
 
 # === 云台俯仰角控制(2026-07-29) ===
 # Search(102) 任务激活期间,把 Skill.gimbal_pitch 持续低频下发到 /<ns>/mission/gimbal_command

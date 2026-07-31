@@ -459,6 +459,10 @@ private:
     //   是否曾有 cluster 通过 WP2-gate。驱动上面两个超时的选择:
     //     - false: 一直悬停 attack_no_target_hold_sec_(长)
     //     - true:  兜底 attack_hover_timeout_sec_(短,30s)
+    //   === 2026-07-31 严格化 ===
+    //   置位条件: WP2 距离门内 + (SEARCH_TRACK 任意) / (SEARCH_STRIKE labelMatchesTargetType) + 非 stale
+    //   旧版在 WP2 距离门过就置位, 会让 wrong-label / stale cluster 错误地把
+    //   300s 长超时降级到 30s 短超时。
     bool attack_wp2_target_seen_;
     //   taskFlowCallback 中清零
     //   105 IN_TASK 到达 WP1 的时刻(上升沿触发一次);用于延时后云台开始朝 WP2 看。
@@ -738,7 +742,7 @@ public:
         min_guidance_speed_(2.0), // 兜底最低下发速度(2026-07-26),见字段注释
         max_strike_cluster_age_sec_(0.5),   // strike cluster 新鲜度门槛(2026-07-26),见字段注释
         max_report_cluster_age_sec_(5.0),   // 上报 cluster 新鲜度门槛(2026-07-29),见字段注释
-        report_dedup_radius_m_(40.0),       // GS 上报位置栅格去重半径(2026-07-29),见字段注释
+        report_dedup_radius_m_(25.0),       // GS 上报位置栅格去重半径(2026-07-29,2026-07-31 40→25),见字段注释
         strike_distance_threshold_(2.0),
         mission_loop_rate_(50.0),
         target_lock_confidence_(0.7),
@@ -941,7 +945,7 @@ public:
         // 上报 cluster 新鲜度门槛(2026-07-29),见 max_report_cluster_age_sec_ 字段注释
         nh_private_.param<double>("max_report_cluster_age_sec", max_report_cluster_age_sec_, 5.0);
         // GS 上报位置栅格去重半径(2026-07-29),见 report_dedup_radius_m_ 字段注释
-        nh_private_.param<double>("report_dedup_radius_m", report_dedup_radius_m_, 40.0);
+        nh_private_.param<double>("report_dedup_radius_m", report_dedup_radius_m_, 25.0);
 
         // === 云台俯仰角下发参数(2026-07-29) ===
         // 搜索任务结束后 gimbal_command 下发的归位俯仰角(度)。典型搜索场景用 -15~-45,
@@ -3006,7 +3010,12 @@ public:
                         d_wp2, wp2_strike_radius_m_);
                     continue;
                 }
-                attack_wp2_target_seen_ = true;
+                // === 2026-07-31: 严格化 seen 判定 ===
+                //   旧版: WP2 距离门过就 attack_wp2_target_seen_ = true
+                //         → wrong-label / stale cluster 也把 300s 长超时降级到 30s 短超时
+                //   新版: 仅当 target_type 匹配 + 非 stale 时才置位
+                //   注意: attack_wp2_target_seen_ 现在延后到 target_type 路由 + 候选收集
+                //         之后才置位(分别见下方 SEARCH_STRIKE / SEARCH_TRACK 两个分支末尾)
 
                 // === Attack(105) target_type 路由(2026-07-30) ===
                 //   WP2-gate 内的 cluster 若 label 不匹配 target_type 位掩码 → 标 type=3 走非主路径
@@ -3054,7 +3063,15 @@ public:
                         attack_best_d_wp2 = d_wp2;
                         attack_best       = &cluster;
                     }
+                    // === 2026-07-31: 见到"可打目标"才置位 seen ===
+                    //   到此步已通过: WP2 距离门 + target_type 路由 + !is_strike_stale
+                    attack_wp2_target_seen_ = true;
                     continue;  // 不进 work_mode switch,由 loop 外的 post-process 处理
+                }
+
+                // === 2026-07-31: SEARCH_TRACK 模式 (非 SEARCH_STRIKE 分支) 也仅在 fresh 时置位 ===
+                if (!is_strike_stale) {
+                    attack_wp2_target_seen_ = true;
                 }
             }
 
@@ -3176,6 +3193,21 @@ public:
         tracked_target_.yolo_label = cluster.label;
         setLockState(TrackLockState::LOCKED_AUTO);
         tracked_target_.locked_at  = ros::Time::now();
+
+        // === 2026-07-31: 同步 locked_cluster_* 给 triggerStrike 用 ===
+        //   triggerStrike() 入口按 locked_cluster_last_seen_us_ 做 stale 守门。
+        //   若不刷成 best 的值, 用的是上一次 SEARCH_TRACK 锁的 cluster 时间
+        //   (e.g. 16.71s 前 stale), triggerStrike 会 abort, 之后 processSearchStrikeStrike
+        //   仍 publishPrimaryTarget + 发 type=1, GS 误以为 strike 成功, 但 UAV 没真飞。
+        //   同步后 triggerStrike 看到 best 的 last_seen_us, deferred-pick 已经过滤了
+        //   !is_strike_stale, 所以一定 fresh, 不再 abort。
+        //   原则: 尽量打对的 (best 是 deferred-pick 选出来的, label_ok + fresh + 距 WP2 最近)
+        locked_cluster_ned_x_         = cluster.ned_x;
+        locked_cluster_ned_y_         = cluster.ned_y;
+        locked_cluster_ned_alt_       = cluster.ned_alt;
+        locked_cluster_id_            = cluster.cluster_id;
+        locked_cluster_time_          = ros::Time::now();
+        locked_cluster_last_seen_us_  = cluster.last_seen_us;
 
         // === Attack(105) formation=1/2:strike gating ===
         //   sequential:等前一架 partner 进 GUIDANCE_STRIKE

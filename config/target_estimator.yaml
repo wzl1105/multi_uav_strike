@@ -16,7 +16,9 @@
 # ============================================================================
 
 # ---- 聚类参数 ----
-merge_radius_m: 30.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
+merge_radius_m: 10.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
+                              # === 2026-07-31: 30 → 10 ===
+                              # 8 个 15m 间距的 person 各成独立 cluster, 不再被吞
                               # 同 label + 同区域才算同一实例;不同类别天然不会合并。
 cluster_ttl_sec: 60.0         # 多久无新命中 → 释放 cluster (秒)
 min_hit_count: 20             # 同 cluster 被检测到这么多次才晋升为正式目标
@@ -28,6 +30,16 @@ min_hit_count: 20             # 同 cluster 被检测到这么多次才晋升为
 tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后多久丢弃 (秒)
                               # 比 cluster_ttl_sec 短得多 — tentative 没有发过 cluster_event,
                               # mission_manager 不感知,过期丢弃对上游无影响。
+                              # === 2026-07-31: Attack 阶段用 attack_tentative_ttl_sec(2.0) ===
+                              # 飞向 WP2 过程中目标停留时间短, 1s TTL 过紧,
+                              # 6 hit 还没攒够就被 DROP
+# === 2026-07-31: Attack(105) 阶段专享聚类门槛 ===
+#   搜索阶段 (非 Attack) 保持 min_hit_count=20 抗误检
+#   Attack 阶段 (skill_type==105 && phase GUIDANCE_TRACK/STRIKE) 切到 attack_min_hit_count=6
+#   原因: Attack 飞向 WP2 过程中目标停留时间短, 20 hit (~2s) 门槛过高导致 tentative TTL 满
+#   还没攒够就被 DROP. 6 hit (~0.6s) 已足够抗单帧 YOLO 误检
+attack_min_hit_count: 6
+attack_tentative_ttl_sec: 2.0
 ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全用新值)
                               # === 2026-07-16: Plan B 世界空间 EMA ===
                               # EMA 直接作用于 cand 世界坐标 (米),相机机动零滞后。
