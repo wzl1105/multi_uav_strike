@@ -44,12 +44,14 @@
 #include <multi_uav_strike/ClusterEvent.h>
 #include <multi_uav_strike/ClusterTarget.h>
 #include <multi_uav_strike/ClusterState.h>
+#include <multi_uav_strike/MissionState.h>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <tf/transform_datatypes.h>
 
 #include <cmath>
+#include <cctype>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -113,6 +115,13 @@ public:
         //          真目标在视野停留 3~5s 时稳定晋升。
         p.param<int>("min_hit_count", min_hit_count_, 20);
         p.param<double>("tentative_ttl_sec", tentative_ttl_sec_, 1.0);
+        // === 2026-07-31: Attack(105) 阶段专享聚类门槛 ===
+        //   搜索阶段保持 min_hit_count=20/tentative_ttl_sec=1.0 抗误检;
+        //   Attack 阶段 (skill_type==105 && phase GUIDANCE_TRACK/STRIKE)
+        //   切到 attack_min_hit_count/attack_tentative_ttl_sec,避免飞行过程中
+        //   短停留目标被 1s TTL + 20 hit 门槛组合提早 DROP。
+        p.param<int>   ("attack_min_hit_count",     attack_min_hit_count_,     6);
+        p.param<double>("attack_tentative_ttl_sec", attack_tentative_ttl_sec_, 2.0);
         // === 2026-07-16: Plan B — 世界空间 EMA ===
         //   现在 EMA 直接作用于 cand_tx/cand_ty(米),不再有相机机动滞后问题。
         //   - alpha=0.3 + 10Hz → 时间常数 ≈ 0.23s,稳态世界噪声衰减 ~70%
@@ -159,6 +168,11 @@ public:
                                             &TargetClusterer::homePositionCallback, this);
         primary_target_sub_ = nh_.subscribe("mission/primary_target", 10,
                                             &TargetClusterer::primaryTargetCallback, this);
+        // === 2026-07-31: 订阅 mission_state 触发 Attack 模式降门槛 ===
+        //   mission_manager 已在 1Hz 发布 mission/mission_state(skill_type + phase)
+        //   这里只读不写,无新 publisher / timer / launch 改动
+        mission_state_sub_   = nh_.subscribe("mission/mission_state", 10,
+                                            &TargetClusterer::missionStateCallback, this);
 
         // 发布
         // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
@@ -217,7 +231,11 @@ public:
         const double raw_cy = (det.y_min + det.y_max) * 0.5 * image_height_;
 
         std::lock_guard<std::mutex> g(clusters_mtx_);
-        const std::string& label = det.label;
+        // === 2026-07-31: 归一化 label (YOLO 数字串 → 语义串) ===
+        //   同一份代码同时服务真机 YOLO ("0"/"1") 和仿真云台 ("person"/"car")
+        //   聚类匹配、新建 cluster、raw marker text 全部用归一化后的 label
+        const std::string norm_label = normalizeYoloLabel(det.label);
+        const std::string& label = norm_label;
 
         // 实例聚类:把当前帧的 raw 像素先投影成世界点(临时),与已有 cluster 的
         //   上一次稳定位置 c.ned_x/ned_y 算 2D 距离 → 选最近且 <merge_radius_m_ 的。
@@ -261,9 +279,9 @@ public:
             }
             if (min_id != 0 && min_dist > std::max(50.0, merge_radius_m_ * 2.0)) {
                 ROS_ERROR_THROTTLE(2.0,
-                    "[ProjDiag] STEP6 raw 投影远离同 label cluster (%.1fm, 阈值 %.1fm) | "
+                    "[ProjDiag] STEP6 raw projection far from same-label cluster (%.1fm, threshold %.1fm) | "
                     "label=%s cand=(%.1f,%.1f) nearest_cluster_id=%lu pos=(%.1f,%.1f) | "
-                    "可能: R/target_z_prior_/cam_pos 之一有问题, 但每步几何自洽 -> 偏差来自累积",
+                    "Possible: R/target_z_prior_/cam_pos issue, but each step is self-consistent -> error accumulates",
                     min_dist, std::max(50.0, merge_radius_m_ * 2.0),
                     label.c_str(), cand_tx, cand_ty, min_id,
                     clusters_[min_id].ned_x, clusters_[min_id].ned_y);
@@ -290,8 +308,12 @@ public:
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = det.stamp_us;
             // === 2026-07-16: 命中计数 + 晋升门禁 ===
+            // === 2026-07-31: Attack 阶段降低 hit 门槛 ===
+            //   is_attack_active_ 由 mission_state_cb 维护 (skill_type==105 && phase 4/5)
+            //   搜索阶段仍走原 min_hit_count_ 抗误检
             c.hit_count++;
-            if (!c.is_promoted && static_cast<int>(c.hit_count) >= min_hit_count_) {
+            const int cur_min_hit = is_attack_active_ ? attack_min_hit_count_ : min_hit_count_;
+            if (!c.is_promoted && static_cast<int>(c.hit_count) >= cur_min_hit) {
                 c.is_promoted = true;
                 emitClusterEvent(c);
             }
@@ -328,7 +350,9 @@ public:
                            clusters_.size());
 
         // 若 min_hit_count_ ≤ 1 (关闭门禁),立即晋升并发 event
-        if (min_hit_count_ <= 1) {
+        //   === 2026-07-31: Attack 阶段门槛也参与判断 ===
+        const int cur_min_hit_new = is_attack_active_ ? attack_min_hit_count_ : min_hit_count_;
+        if (cur_min_hit_new <= 1) {
             clusters_[nc.id].is_promoted = true;
             emitClusterEvent(clusters_[nc.id]);
         }
@@ -389,6 +413,24 @@ public:
         primary_cluster_id_ = msg->data;
         ROS_INFO_THROTTLE(2.0, "[TargetClusterer] primary_target → cluster_id=%lu",
                           primary_cluster_id_);
+    }
+
+    // === 2026-07-31: 订阅 mission/mission_state 维护 Attack 模式位 ===
+    //   判定条件(2026-07-31 修正):
+    //     skill_type == 105 && state == 1 (EXECUTING)
+    //   === 2026-07-31 修正原因 ===
+    //   旧版用 phase == GUIDANCE_TRACK(4) / GUIDANCE_STRIKE(5) 触发, 但整个
+    //   WP1→WP2 飞行段 mission_manager 报的 phase 一直是 3 (WAYPOINT_FOLLOW),
+    //   只在 strike 真正触发后才进 4/5 — 时序错位, Attack 阶段降门槛从未生效。
+    //   改用 state==1 (EXECUTING) 后, IN_TASK 整个段 (phase 2/3/4/5 都算) 都激活降门槛,
+    //   Cluster 能在 0.6s 内 promote, 而不是等 2s 攒到 20 hit 时已经 stale。
+    void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        const bool is_105       = (msg->skill_type == 105);
+        const bool is_executing = (msg->state == 1 /*EXECUTING*/);
+        is_attack_active_ = is_105 && is_executing;
+        ROS_INFO_THROTTLE(5.0,
+            "[TargetClusterer] mission_state: skill_type=%d state=%d phase=%d → is_attack_active=%s",
+            msg->skill_type, msg->state, msg->phase, is_attack_active_ ? "true" : "false");
     }
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -528,7 +570,13 @@ public:
             last_seen.fromNSec(c.last_seen_us * 1000ULL);
             double age = (now - last_seen).toSec();
             // === 2026-07-16: tentative 用更短 TTL,promoted 用 cluster_ttl_sec_ ===
-            double ttl = c.is_promoted ? cluster_ttl_sec_ : tentative_ttl_sec_;
+            // === 2026-07-31: Attack 阶段 tentative 用更长 TTL,防短停留目标被提前 DROP ===
+            double ttl;
+            if (c.is_promoted) {
+                ttl = cluster_ttl_sec_;
+            } else {
+                ttl = is_attack_active_ ? attack_tentative_ttl_sec_ : tentative_ttl_sec_;
+            }
             if (age > ttl) {
                 if (c.is_promoted) {
                     ROS_INFO("[TargetClusterer] EXPIRED cluster id=%lu label=%s "
@@ -555,6 +603,10 @@ private:
     double cluster_ttl_sec_  = 60.0;
     int    min_hit_count_    = 3;       // 同 cluster 被检测到这么多次才晋升
     double tentative_ttl_sec_ = 1.0;    // 未晋升的 tentative 在这么久没刷新就丢弃
+    // === 2026-07-31: Attack 阶段专享聚类门槛 ===
+    int    attack_min_hit_count_     = 6;
+    double attack_tentative_ttl_sec_ = 2.0;
+    bool   is_attack_active_         = false;  // mission_state_cb 维护
     double ema_alpha_        = 0.6;
     double target_z_prior_   = 0.0;
     double states_publish_freq_ = 10.0;
@@ -576,6 +628,7 @@ private:
     ros::Subscriber self_gps_sub_;
     ros::Subscriber home_position_sub_;
     ros::Subscriber primary_target_sub_;
+    ros::Subscriber mission_state_sub_;
 
     ros::Publisher cluster_event_pub_;
     ros::Publisher cluster_states_pub_;
@@ -625,6 +678,26 @@ private:
         uint32_t h = 2166136261u;
         for (unsigned char c : s) { h ^= c; h *= 16777619u; }
         return h;
+    }
+
+    // === 2026-07-31: 数字→语义 归一化 ===
+    //   YOLO 真机 (starling_gimbal) 发的是 class_id 字符串 ("0"/"1"/...)
+    //   仿真 gimbal_simulator 发的是语义字符串 ("person"/"car"/...)
+    //   target_estimator 内部统一用语义字符串, 聚类匹配不再受部署源影响
+    //   协议:
+    //     "0"            → "person"
+    //     "1"            → "car"
+    //     "2" 及以上数字 → "car"  // 兜底: 用户已确认, 等 YOLO 开发者收紧协议
+    //   其他字符串 → 原样返回(已语义,例如 "person"/"car"/"truck")
+    static std::string normalizeYoloLabel(const std::string& raw) {
+        if (raw == "0") return "person";
+        if (raw == "1") return "car";
+        // 2+ 数字串兜底为 car(防 YOLO 漏报 0/1 时被当 unknown 误过滤)
+        if (!raw.empty() && std::all_of(raw.begin(), raw.end(),
+                                        [](unsigned char c){ return std::isdigit(c); })) {
+            return "car";
+        }
+        return raw;
     }
 
     // Per-detection bbox 反投影: 与 gimbal 的 forward projection 完全互逆。
@@ -713,17 +786,17 @@ private:
             ROS_ERROR_THROTTLE(1.0,
                 "[ProjDiag] STEP1 cam_ray.z=%.3f (<0.4) | "
                 "cx=%.0f cy=%.0f u_ndc=%.3f v_ndc=%.3f | "
-                "可能: 像素离光轴太远, 或 u_ndc/v_ndc 没归一化到 tan(FOV/2)≈%.3f",
+                "Possible: pixel too far from optical axis, or u_ndc/v_ndc not normalized to tan(FOV/2) ~ %.3f",
                 cam_ray.z(), cx, cy, u_ndc, v_ndc,
                 std::tan(fov_h_rad_ / 2.0));
             return;
         }
 
-        // (2) 光轴方向: 目标在下方时光轴 z 必须 < 0
+        // (2) Optical axis direction: when target is below, axis z must be < 0
         if (opt_axis.z() > -0.05) {
             ROS_ERROR_THROTTLE(1.0,
-                "[ProjDiag] STEP2 光轴 opt.z=%.3f (>=0) | "
-                "光轴朝上! 检查 uav_yaw 提取 / gimbal_pitch 符号 / R 构造 | "
+                "[ProjDiag] STEP2 optical axis opt.z=%.3f (>=0) | "
+                "Axis points UP! Check uav_yaw extraction / gimbal_pitch sign / R construction | "
                 "cam quat (wxyz)=(%.3f,%.3f,%.3f,%.3f) | "
                 "R.col(2)=(%.3f,%.3f,%.3f)",
                 opt_axis.z(),
@@ -733,11 +806,11 @@ private:
             return;
         }
 
-        // (3) world_ray.z 应 < 0 (射线打地面)
+        // (3) world_ray.z should be < 0 (ray hits ground)
         if (world_ray.z() > 0.0) {
             ROS_ERROR_THROTTLE(1.0,
-                "[ProjDiag] STEP3 world_ray.z=%.3f > 0 (射线朝上) | "
-                "光轴朝下但射线朝上, cam_ray.x 或 v_ndc 符号可能反了 | "
+                "[ProjDiag] STEP3 world_ray.z=%.3f > 0 (ray points UP) | "
+                "Axis points DOWN but ray points UP, sign of cam_ray.x or v_ndc may be flipped | "
                 "cam_ray=(%.3f,%.3f,%.3f) R=\n"
                 "[%.3f %.3f %.3f\n %.3f %.3f %.3f\n %.3f %.3f %.3f]",
                 world_ray.z(),
@@ -749,23 +822,23 @@ private:
         }
 
         if (!proj_ok) {
-            // world_ray.z 接近 0 或 t < 0 已经让上面拦截, 这里 proj_ok=false 但射线向下 -> 极端几何
+            // world_ray.z near 0 or t < 0 already caught above; here proj_ok=false but ray points down -> extreme geometry
             ROS_ERROR_THROTTLE(1.0,
-                "[ProjDiag] STEP3b 投影退化 (proj_ok=false) | "
+                "[ProjDiag] STEP3b projection degenerated (proj_ok=false) | "
                 "world_ray.z=%.3f dz=%.2f cam_z=%.2f tgt_z_prior=%.2f",
                 world_ray.z(), dz, cam_pos.z(), target_z_prior_);
             return;
         }
 
-        // (4) 水平投影距离合理性: 对向下看的相机, 水平距离应 < cam_z * 20 (≈ 偏角 87°)
+        // (4) Horizontal projection range sanity: for downward-looking camera, horizontal range should be < cam_z * 20 (~ 87 deg off-axis)
         double horiz = std::hypot(target_world.x() - cam_pos.x(),
                                   target_world.y() - cam_pos.y());
         if (horiz > cam_pos.z() * 20.0 && cam_pos.z() > 5.0) {
             ROS_ERROR_THROTTLE(1.0,
-                "[ProjDiag] STEP4 水平投影 %.1fm 异常大 (cam_z=%.1fm 上限 ≈%.0fm) | "
+                "[ProjDiag] STEP4 horizontal projection %.1fm abnormally large (cam_z=%.1fm cap ~%.0fm) | "
                 "cam=(%.1f,%.1f,%.1f) tgt=(%.1f,%.1f,%.1f) | "
                 "t=%.1f dz=%.1f u_ndc=%.3f v_ndc=%.3f | "
-                "可能: target_z_prior_/cam_pos/world_ray 三者之一错",
+                "Possible: one of target_z_prior_/cam_pos/world_ray is wrong",
                 horiz, cam_pos.z(), cam_pos.z() * 20.0,
                 cam_pos.x(), cam_pos.y(), cam_pos.z(),
                 target_world.x(), target_world.y(), target_world.z(),
@@ -773,18 +846,18 @@ private:
             return;
         }
 
-        // (5) 中心像素一致性: cx/cy ≈ image 中心时, target 应在 cam 正下方的 bearing 上
-        //   |u_ndc| < 0.05 且 |v_ndc| < 0.05 时, 检查水平距离与 cam_z 的比值是否合理
+        // (5) Center pixel consistency: when cx/cy ~ image center, target should be on the bearing directly below cam
+        //   |u_ndc| < 0.05 and |v_ndc| < 0.05 -> check ratio of horizontal range to cam_z
         if (std::fabs(u_ndc) < 0.05 && std::fabs(v_ndc) < 0.05 && cam_pos.z() > 5.0) {
-            // 中心像素射线 ≈ 光轴方向, 水平距离应 ≈ cam_z * tan(elevation)
-            // elevation = asin(-opt_axis.z()), 对于向下看: tan(elev) = -opt_axis.z / sqrt(1-opt_axis.z^2)
+            // Center-pixel ray ~ optical-axis direction, horizontal range should ~ cam_z * tan(elevation)
+            // elevation = asin(-opt_axis.z()); for downward look: tan(elev) = -opt_axis.z / sqrt(1-opt_axis.z^2)
             double horiz_z = std::sqrt(std::max(0.0, 1.0 - opt_axis.z() * opt_axis.z()));
             double expected_horiz = cam_pos.z() * horiz_z / (-opt_axis.z());
-            // 容差 50%
+            // 50% tolerance
             if (horiz > expected_horiz * 1.5 + 5.0) {
                 ROS_ERROR_THROTTLE(2.0,
-                    "[ProjDiag] STEP5 中心像素一致性 | "
-                    "实际水平 %.1fm vs 期望 %.1fm (差距 %.1fm) | "
+                    "[ProjDiag] STEP5 center-pixel consistency | "
+                    "actual horizontal %.1fm vs expected %.1fm (delta %.1fm) | "
                     "cam=(%.1f,%.1f,%.1f) tgt=(%.1f,%.1f,%.1f) opt.z=%.3f",
                     horiz, expected_horiz, horiz - expected_horiz,
                     cam_pos.x(), cam_pos.y(), cam_pos.z(),
