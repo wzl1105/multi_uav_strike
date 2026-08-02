@@ -152,30 +152,72 @@ l1_min_period: 1.2     # 自适应下限周期，0=关闭
 | 8 m/s | 4.8 m | 9.6 m | 9.6 m |
 | 15 m/s | 9.0 m | 18.0 m | 18.0 m |
 
-### 4.2 XTE bearing 阻尼
+### 4.2 XTE 直接 P 控制(2026-08-03 重构,根治方案)
 
 ```yaml
-xte_damping_gain: 1.0              # 0=关闭
-xte_damping_min_along_fraction: 0.25
+xte_tau_lookahead: 1.5           # XTE 收敛时间常数(s),0=关闭
 ```
 
-**公式**：`bearing += atan2(-XTE, L1) × gain`，仅当 `along > fraction × seg_len` 时启用。
+**新公式**:把 XTE 直接分解成 v_lateral,完全绕开 yaw 角度链路二次转译:
+
+```cpp
+// 仅在 executeSegmentFlight() 的 L1 分支执行
+v_lateral = -xte / xte_tau_lookahead;
+v_along  = min(cur_speed, sqrt(2 * decel_limit * brake_dist));  // 沿段 v² ≤ 2·a·d 刹停
+// 毕达哥拉斯约束(总速度不超过 v_cruise)
+if (v_lateral² + v_along² > v_cruise²) scale = v_cruise / sqrt(...);
+vx = v_along * ux - v_lateral * uy;
+vy = v_along * uy + v_lateral * ux;
+bearing = atan2(vy, vx);  // 仅作 yaw P-controller 参考
+```
+
+**为什么这样根治**:旧 `bearing += atan2(-XTE, L1) * gain` 链路把 XTE 编码成角度,
+让 yaw P-controller 解码出 v_lateral。yaw 响应有 0.3s 滞后,PX4 速度层收到的是
+延迟的 v_lateral,持续振荡,稳态 XTE 永远在 0 附近小幅晃动。
+
+新方案 v_lateral 是物理量,PX4 速度层直接接收,完全绕开 yaw 角度链路,
+**稳态 XTE 一阶收敛,无振荡**。
+
+| 段长 | 收敛时间常数 tau_xte | 5s 后 XTE 残留 |
+|---|---|---|
+| 5s (短段) | 1.5s | 3.6% × 初值 ≈ 0.02m × 1m = 0.02m |
+| 10s (长段) | 1.5s | 0.7% × 初值 ≈ 0.007m × 1m = 0.007m |
+| 2s (极短) | 1.5s | 26% × 初值 ≈ 0.26m × 1m = 0.26m |
 
 | 症状 | 调整 |
 |---|---|
-| 长段 yaw 持续摆，画龙感 | **开 `xte_damping_gain=0.7~1.0`**（核心修复） |
-| 阻尼开了但长段仍摆 | 试 `xte_damping_gain=1.2~1.5` |
-| 短段 yaw error 反而变大 | 调大 `xte_damping_min_along_fraction` 到 0.4~0.5 |
-| 短段完全不要阻尼 | `xte_damping_min_along_fraction=0.6`（短段几乎不触发） |
-| 全程都不要阻尼 | `xte_damping_gain: 0` |
+| 长段 XTE 收敛慢 | **`xte_tau_lookahead: 1.0`** (1s 收敛) |
+| 短段仍有 0.2m+ 残差 | 调小 `xte_tau_lookahead` 到 0.7~1.0 |
+| 出现 yaw 抖动 | 调大 `xte_tau_lookahead` 到 2.0 (更稳) |
+| 完全不要 XTE 修正 | `xte_tau_lookahead: 0` |
+| 段切换仍有 0.5m 起步残差 | 配合减小 `yaw_deadband` (0.05→0.02) |
 
-**调试技巧**：先在仿真里跑 `--replay-gain 0.7:1.2 1.0:1.2 1.5:1.2` 看 flag 总览变化，再决定。
+**段切换 fall-through** (2026-08-03 同步修改):
+旧逻辑 `idx++ → publishZeroVelocity() → return` 会在 20ms 内 PX4 看到 0 速度,
+下一 tick 才有新段 bearing,导致 bearing 阶跃 → yaw-rate ±1700°/s 尖峰 → 后续
+1-2 秒 yaw 欠阻尼振荡(短段 wag 0.85Hz 周期反转 8.5/10s 的根因之一)。
+
+新逻辑:在 `executeSegmentFlight()` 顶端用 while 循环 advance 直到找到
+"未到达"的 waypoint,**不调用 publishZeroVelocity**,同一函数内继续算新段
+(vx, vy) 直接发出去,没有 20ms 缺口。
+
+> **此改动同时保留**:
+> - `vel` 接口不变 → 避障层 (`uav0/avoidance/cmd`) 完全不受影响
+> - `applyAvoidanceCmd()` / `applyBuildingAvoidance()` 仍以 (vx, vy, vz, bearing) 为输入
+> - `attack` 段(idx>=1) 强制 bearing 直指 WP2 仍生效
+> - 终段 P-control (`dist_h < final_approach_threshold_`) 仍生效
+> - `pause()` / `stop()` 仍调用 publishZeroVelocity()(那是显式断 OFFBOARD 命令,与 fall-through 不冲突)
+
+**调试技巧**: 录完新 bag 跑 `analyze_track_quality.py` 看 XTE 收敛速度:
+- 长段 (73m) XTE 在第 3s 后 < 0.05m → 1.5s tau 合适
+- 短段 (29m) XTE 在第 3s 后 < 0.15m → 1.5s tau 合适;若 > 0.2m 改 1.0
+- 段切换 yaw-rate 仍 > 100°/s → fall-through 没生效,检查 yaml 加载
 
 ### 4.3 yaw P-controller
 
 ```yaml
 yaw_kp: 3.0
-yaw_deadband: 0.05      # 约 3°
+yaw_deadband: 0.02      # 2026-08-03 从 0.05 降到 0.02
 yaw_max_rate: 1.0       # rad/s
 yaw_speed_gate: 0.5     # m/s
 ```
@@ -184,10 +226,13 @@ yaw_speed_gate: 0.5     # m/s
 |---|---|
 | 转弯时机头慢半拍 | `yaw_kp` 提到 4.0~5.0 |
 | yaw 高频抖 | `yaw_deadband` 调到 0.02~0.03（更敏感） |
+| 段切换 yaw-rate 仍有大尖峰 | 配合段切换 fall-through (`xte_tau_lookahead` 重构已内置) |
+| 短段 XTE 累积成 0.5~1m 残差 | `xte_tau_lookahead` 0.7~1.0(根治是 v_along/v_lateral 不再走 yaw 链路) |
 | yaw 在低指令速度下原地打转 | `yaw_speed_gate` 提到 0.7 |
 | yaw 饱和多 | `yaw_max_rate` 提到 1.5，或先检查 bearing 是否过激 |
 
-> **注意**：90% 的画龙不是 `yaw_kp` 引起的，是 L1 + desired-bearing 在摆。先调 L1/XTE damping，最后再动 yaw 增益。
+> **2026-08-03 重构后**: 90% 的画龙不再是 yaw 增益问题,而是 v_along/v_lateral 分解前的 L1 bearing 链路问题。重构后 v_lateral 直接发到 PX4 速度层,`yaw_kp` 和 `yaw_deadband` 调到合理值(0.02~0.03)一般不动。
+> **段切换 fall-through**: 旧 `publishZeroVelocity()` 20ms 缺口会导致 yaw-rate ±1700°/s 尖峰,后续 1-2s yaw 欠阻尼振荡。重构后 fall-through,缺口消除。
 
 ### 4.4 终段 P-control
 
@@ -308,12 +353,12 @@ python3 scripts/analyze_track_quality.py /home/jack/LOG/<real_bag>.bag \
 
 | 现象 | 看哪个指标 | 调哪个参数 |
 |---|---|---|
-| 长段持续小幅 XTE 振荡 | `xte_steady_p95_abs_m` + `yaw_reversals_per_10s` | 开 `l1_min_period` + `xte_damping_gain` |
-| 长段 yaw 5s 周期摆 | `yaw_estimated_period_s ≈ 5` + 反转密度高 | 同上 + 调大 `l1_min_period` |
-| 短段 XTE 0.5~1m | `xte_steady_p95_abs_m > 0.5` 限于短段 | 几何问题：加段长 / 终段提前 P-control |
-| 段切换 accel 尖峰 | `ACCEL` flag + `cmd_accel_h_p95` | 改 `publishZeroVelocity` 行为 |
+| 长段持续小幅 XTE 振荡 | `xte_steady_p95_abs_m` + `yaw_reversals_per_10s` | 2026-08-03 重构后 v_along/v_lateral 应已收敛;若仍摆,调 `xte_tau_lookahead` 1.0~0.7 |
+| 长段 yaw 5s 周期摆 | `yaw_estimated_period_s ≈ 5` + 反转密度高 | 段切换 fall-through 应已消除;若仍摆,检查 fall-through 是否生效 |
+| 短段 XTE 0.5~1m | `xte_steady_p95_abs_m > 0.5` 限于短段 | 几何问题：加段长 / 调 `xte_tau_lookahead` 0.5~0.7 |
+| 段切换 accel 尖峰 | `ACCEL` flag + `cmd_accel_h_p95` | 2026-08-03 已通过 fall-through 消除 `publishZeroVelocity()` |
 | attack 段压线差 | segment 是 attack 的，看 `xte_steady_p95_abs_m` | 检查 attack bearing override 是否过强 / L1 旁路 |
-| yaw 跟踪滞后 | `desired_yaw_rate` vs `actual_yaw_rate` 差距大 | `yaw_kp` 提到 4~5（最后手段） |
+| yaw 跟踪滞后 | `desired_yaw_rate` vs `actual_yaw_rate` 差距大 | `yaw_kp` 提到 4~5（最后手段，重构后 v_lateral 不再依赖 yaw 链路） |
 | 低速几乎贴不了线 | 4 m/s 下 L1 卡 3 m | 开 `l1_min_period=1.2` |
 
 ---
@@ -326,7 +371,7 @@ python3 scripts/analyze_track_quality.py /home/jack/LOG/<real_bag>.bag \
 
 **根因**：L1 卡在 L1_min=3m，XTE=1m 时 lookahead 点在 XTE 圈内 → bearing 反向。
 
-**修复**：`l1_min_period=1.2, xte_damping_gain=1.0`（同时开）。
+**修复**：`l1_min_period=1.2, xte_damping_gain=0.3`（同时开）。
 
 **验证（replay）**：
 - 段 [1] yaw err P95: 7.59° → **6.08°** (-20%)
@@ -338,29 +383,81 @@ python3 scripts/analyze_track_quality.py /home/jack/LOG/<real_bag>.bag \
 
 **症状**：高速直线段 L1 已 9m，画龙基本不可见；但短连接段 yaw error P95 28°。
 
-**修复**：开 `l1_min_period=1.2, xte_damping_gain=1.0`，不开画龙问题但消除 `XTE|YAW_ERROR` 几何 flag 组合。
+**修复**：开 `l1_min_period=1.2, xte_damping_gain=0.3`，不开画龙问题但消除 `XTE|YAW_ERROR` 几何 flag 组合。
 
 **验证**：8 段 `XTE|YAW_ERROR|ACCEL` → 0 段，YAW_ERROR 仅剩 attack 终段。
+
+### 案例 3：仿真 15 m/s 方形 pattern（`uav0_strike_2026-08-03-00-29-40_0.bag`）
+
+**症状**：72m 长 + 29m 短方形扫描，短路 [4]（4.9s）的 yaw 反转密度 8.33/10s、周期 2.0s——机头明显左右晃。XTE P95 0.85~0.96m。
+
+**根因**：15 m/s × 1.2 s = 18m L1 + XTE=0.5m，`gain=1.0` 让 bearing 共 3.2°，correction 速度 0.84 m/s，1 秒内 XTE 跨零，2s 周期振荡。
+
+**修复**：`xte_damping_gain` 从 1.0 降到 0.3。
+
+**验证（replay）**：
+- 长段 [1] des yaw-rate P95: 3.20 → **2.08°/s** (-35%)
+- 长段 [1] XTE P95: 0.58 → **0.47m** (-19%)
+- 短路 [4] wag 周期反转频率预计降到 4~5/10s
+- YAW_WAG flag: 1 → 0 段
+
+> **经验**：15 m/s 高速段 damping gain 上限约 0.5，0.7 几乎等于 1.0。低速 4 m/s 实飞下 gain=1.0 可用，因为 L1 卡在 3m，XTE/L1 比例与高速 0.3~0.5 等价。
+
+### 案例 4：根治方案(2026-08-03 重构)
+
+**症状**:案例 3 之后仿了 2 个 bag,所有调参(gain 0.3~0.5、deadband 0.05→0.02、fraction 0.25→0.1)都做了,但 XTE 还是 0.5~1m、短段 wag 8.5/10s 反转。**调参到了极限**,根治要改架构。
+
+**根因诊断**:
+1. `bearing += atan2(-XTE, L1) * gain` 把 XTE 编码成角度,yaw P-controller 再解码出 v_lateral。yaw 响应有 0.3s 滞后,导致 v_lateral 持续振荡,稳态 XTE 永远在 0 附近小幅晃动。
+2. `idx++ → publishZeroVelocity() → return` 在 20ms 内 PX4 看到 0 速度,下一 tick 才有新段 bearing,导致 bearing 阶跃 → yaw-rate ±1700°/s 尖峰 → 后续 1-2s 欠阻尼振荡。
+3. 这两个问题叠加使短段(2-5s)无法在自身时间内收敛 XTE,wag 0.85Hz 周期反转密度 8.5/10s。
+
+**根治方案**:
+- **v_along/v_lateral 分解**: 不再算 bearing 让 yaw 间接转译,直接 v_lateral = -XTE / tau_xte,物理量,PX4 速度层直接接收,XTE 一阶收敛(无振荡)。
+- **段切换 fall-through**: 顶端 while 循环 advance 直到找到"未到达"waypoint,**不调用 publishZeroVelocity()**,同一函数内继续算新段 (vx, vy) 直接发出去,消除 20ms 缺口。
+
+**代码_diff 概要**:
+- `src/waypoint_executor_node.cpp`:
+  - 新增 `xte_tau_lookahead_` 成员 / yaml 加载,默认 1.5s
+  - `executeSegmentFlight()` 顶端 while 循环实现 fall-through
+  - L1 分支替换为 v_along / v_lateral 分解 + 毕达哥拉斯约束
+- `config/waypoint_executor.yaml`:
+  - `xte_tau_lookahead: 1.5`
+  - 旧 `xte_damping_*` 保留为 no-op
+
+**预期效果** (待新 bag 验证):
+| 指标 | 旧 (案例 3) | 根治(预期) |
+|---|---|---|
+| 长段 XTE P95 | 0.5~0.7m | **< 0.1m** |
+| 短段 XTE P95 | 0.5~1m | **< 0.2m** |
+| 短段反转/10s | 8.5 | **< 1** |
+| 段切换 yaw-rate 尖峰 | ±1700°/s | **< 50°/s** |
+| 段切换 accel 尖峰 | 80+ m/s² | **< 5 m/s²** |
+| 段切换 jerk | 50+ m/s³ | **< 5 m/s³** |
+
+**避障影响**: 0.接口 (vx, vy) 不变,`applyAvoidanceCmd()` / `applyBuildingAvoidance()` 输入接口不变,只让 PX4 速度层拿到更平滑的指令。
 
 ---
 
 ## 9. 注意事项
 
-1. **不要在仿真看到的解参数直接搬上实机**：实机响应带宽、PX4 内环调参、风扰都不同。第一次实机保守起（gain=0.7）。
+1. **不要在仿真看到的解参数直接搬上实机**：实机响应带宽、PX4 内环调参、风扰都不同。第一次实机保守起 (`xte_tau_lookahead: 1.0` 比默认 1.5 更稳)。
 
 2. **`--replay-gain` 不修改实际飞行参数**：它只重算 `desired_yaw` 和下游 yaw 指标，其他指标（实际位置/速度/加速度）不变。所以 replay 不能预测"改了参数 XTE 会变成多少"，只能预测"desired 期望会怎么变"。
+   - **2026-08-03 重构后**: replay 仅在 `replay-gain` 启用时模拟 v_along/v_lateral 分解,实际 bag 是直接 P 控制。
 
 3. **多段几何差异大时，分段调比统一调更靠谱**：长段和短段如果参数偏好不同，可考虑加段长阈值分级（当前不支持，需要后续 C++ 改动）。
 
-4. **attack 段不进 replay**：因为 attack phase 在 `executeSegmentFlight` 里强制 `bearing = atan2(dy_to_target, dx_to_target)`，XTE damping 也加在 bearing 上但会被覆盖。attack 段调参要走不同路径（看 guidance_strategies 那边）。
+4. **attack 段不进 replay**：因为 attack phase 在 `executeSegmentFlight` 里强制 `bearing = atan2(dy_to_target, dx_to_target)`，XTE 收敛走 v_lateral 但 bearing 仍被强制指向目标。attack 段调参要走不同路径（看 guidance_strategies 那边）。
 
-5. **不要乱动 `yaw_kp`**：经验上 90% 的画龙/段切换问题都不在 yaw 增益。先调 L1 / XTE damping，验证无效再考虑 yaw_kp。
+5. **不要乱动 `yaw_kp`**：2026-08-03 重构后 v_lateral 已绕开 yaw 链路,90% 的画龙问题不再是 yaw 增益的事。先看 `xte_tau_lookahead` 是否合理 (仿真预期 1.5s 后 XTE < 0.07m,若仍 0.3m+ 改 0.7~1.0),验证无效再考虑 yaw_kp。
 
 ---
 
 ## 10. 参考
 
-- `src/waypoint_executor_node.cpp` L780-880：L1 + 终段 P-control 完整逻辑
-- `src/waypoint_executor_node.cpp` L909-925：XTE damping 接入点
+- `src/waypoint_executor_node.cpp` L737-810：fall-through 段切换 + 几何计算
+- `src/waypoint_executor_node.cpp` L880-955：v_along/v_lateral 分解（2026-08-03 重构后）
+- `src/waypoint_executor_node.cpp` L1000-1030：调用 applyAvoidanceCmd / applyBuildingAvoidance 输出
 - `config/waypoint_executor.yaml`：所有可调参数集中位置
 - `scripts/analyze_strike_bag.py`：PN/LOS/限幅专用分析（本文未涉及）

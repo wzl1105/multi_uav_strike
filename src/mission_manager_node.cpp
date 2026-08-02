@@ -4589,40 +4589,60 @@ public:
     bool triggerOffboardAndArm() {
         ros::Time t0 = ros::Time::now();
 
-        // -------- Step 1: SET_MODE service (MAVLink SET_MODE) --------
-        mavros_msgs::SetMode set_mode;
-        set_mode.request.custom_mode = "OFFBOARD";
+        // === 2026-07-30: 逐项判断当前状态,只在需要时发 ===
+        //   场景:PX4 已经在 OFFBOARD+armed (飞手手动接管后又下发新 task_flow 进入接管场景,
+        //   或前序 triggerOffboardAndArm 已成功)时,旧的"无脑 4 步"会刷屏:
+        //     - DO_SET_MODE result=1 TEMP_REJ
+        //     - FCU: Arming denied! Already armed
+        //   飞机本身正常,executor 在飞,但日志噪音大。
+        //   改成:mode==OFFBOARD 跳过 SET_MODE+DO_SET_MODE,armed==true 跳过 ARM+重试。
+        //   返回值语义不变 (true = 当前已 OFFBOARD+armed,可起飞)。
+        //   注意:**不**用 early-return,因为这样会丢掉"手动 ARM 但 mode 还在 LOITER"
+        //   这种半状态的接管能力 — 应该只切 mode、不再发 ARM。
+        const bool need_set_mode = (current_mavros_state_.mode != "OFFBOARD");
+        const bool need_arm      = !current_mavros_state_.armed;
+
+        // -------- Step 1+2: SET_MODE service → 50ms → COMMAND_LONG DO_SET_MODE --------
+        // 命中 PX4 commander handle_command 路径 — 某些固件版本对这条路径更稳定
         bool set_mode_sent = false;
-        if (set_mode_client_.call(set_mode)) {
-            set_mode_sent = set_mode.response.mode_sent;
+        if (need_set_mode) {
+            mavros_msgs::SetMode set_mode;
+            set_mode.request.custom_mode = "OFFBOARD";
+            if (set_mode_client_.call(set_mode)) {
+                set_mode_sent = set_mode.response.mode_sent;
+            } else {
+                ROS_WARN("[MissionManager] >>>> SET_MODE service: RPC call FAILED");
+            }
+            ros::Duration(0.05).sleep();
+            sendSetModeCommandLong("OFFBOARD");
+            ros::Duration(0.05).sleep();
         } else {
-            ROS_WARN("[MissionManager] >>>> SET_MODE service: RPC call FAILED");
+            ROS_INFO_THROTTLE(5.0,
+                "[MissionManager] triggerOffboardAndArm: mode already OFFBOARD, skip SET_MODE/DO_SET_MODE");
         }
 
-        // -------- Step 2: 50ms 后 COMMAND_LONG DO_SET_MODE --------
-        // 命中 PX4 commander handle_command 路径 — 某些固件版本对这条路径更稳定
-        ros::Duration(0.05).sleep();
-        sendSetModeCommandLong("OFFBOARD");
-
-        // -------- Step 3: 50ms 后 直接 ARM，不等 mode 确认 --------
-        // 这是关键时机 — ARM 必须在 commander 还没 revert 之前到达
-        ros::Duration(0.05).sleep();
-        bool armed = armVehicle(true);
-
-        // -------- Step 4: ARM 失败重试最多 3 次（每次 50ms） --------
-        // PX4 commander 可能在 OFFBOARD transition 中，ARM 会被暂缓一会儿
-        for (int i = 0; i < 3 && !armed && ros::ok(); ++i) {
-            ros::Duration(0.05).sleep();
+        // -------- Step 3+4: ARM + 最多 3 次重试(每步都查 armed,已在 armed 直接视为成功) --------
+        bool armed = !need_arm;   // 不需要 ARM → 视为已成功,跳过整个 ARM 段
+        if (need_arm) {
+            // 关键时机 — ARM 必须在 commander 还没 revert 之前到达
             armed = armVehicle(true);
+            for (int i = 0; i < 3 && !armed && ros::ok(); ++i) {
+                ros::Duration(0.05).sleep();
+                armed = armVehicle(true);
+            }
+        } else {
+            ROS_INFO_THROTTLE(5.0,
+                "[MissionManager] triggerOffboardAndArm: already armed, skip ARM");
         }
 
         ros::Duration(0.05).sleep();
         ROS_WARN("[MissionManager] >>>> [%4.0fms] triggerOffboardAndArm DONE: armed=%d, "
-                 "PX4 mode=%s armed=%d sys_status=%d",
+                 "PX4 mode=%s armed=%d sys_status=%d (need_set_mode=%d need_arm=%d)",
                  (ros::Time::now() - t0).toSec() * 1000.0, armed ? 1 : 0,
                  current_mavros_state_.mode.c_str(),
                  current_mavros_state_.armed ? 1 : 0,
-                 current_mavros_state_.system_status);
+                 current_mavros_state_.system_status,
+                 need_set_mode ? 1 : 0, need_arm ? 1 : 0);
         return armed;
     }
 
