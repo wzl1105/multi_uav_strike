@@ -37,7 +37,11 @@ attack_strike_pending_timeout_sec: 60.0
 #   UAV 飞向错位置),同时 erase strike_dispatched_ 允许下一帧重新派发。
 #   无差别应用,不受"是否已上报过"影响。
 # 推荐:0.3 ~ 1.0(太短会 GUIDANCE_STRIKE ↔ TARGET_LOST_HOVER 频繁跳变,太长会飞 stale 坐标)
-max_strike_cluster_age_sec: 0.5
+max_strike_cluster_age_sec: 1.5   # 2026-08-02: 0.5 → 1.5. target_estimator 10Hz
+#                                       下 0.5s 内常因 NPU 卡顿漏帧, STALE-strike 把
+#                                       strike 掐死在 2~3s 内(分析 09:18 bag 验证),
+#                                       1.5s 给 15 帧冗余窗口, 仍远小于 stale 坐标的
+#                                       误触发风险
 
 # GS 上报门:cluster.last_seen_us 距今 > 此值 → 拒绝**重复上报**(已上报过的 cluster
 #   再报一次必须是新鲜坐标,避免 GS 反复收到 stale 数据)。

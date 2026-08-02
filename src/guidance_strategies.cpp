@@ -5,34 +5,56 @@ namespace multi_uav_strike {
 
 //==============================================================================
 // InterceptGuidance Implementation
+//   === 2026-07-31: 替换为比例导引 (PN) 实现, 来源 guidance_strategies_PN.cpp ===
+//   算法要点:
+//     1) 计算 NED LOS 方位/俯仰角, yaw 先解包裹为连续角再 2 阶 Butterworth 低通 (2 Hz)
+//     2) 差分得到 los_rate, 期望消除 (los_rate → 0)
+//     3) LOS 角速度反馈生成横向/垂直速度修正，使 los_rate → 0
+//     4) 前置角钳到 30° (防过冲)
+//     5) limitVelocityVector 联合约束水平/垂直上限
 //==============================================================================
 
 InterceptGuidance::InterceptGuidance(ros::NodeHandle& nh)
-    : GuidanceStrategy(nh, "Intercept") {
-    nh.param<double>("uav_speed", uav_speed_, 10.0);
-    nh.param<double>("intercept_time_horizon", intercept_time_horizon_, 5.0);
-    ROS_INFO("[Intercept] uav_speed=%.2f m/s, time_horizon=%.2f s",
-             uav_speed_, intercept_time_horizon_);
+    : GuidanceStrategy(nh, "Intercept"),
+      radial_speed_(10.0),
+      nav_ratio_(1.5),
+      max_horizontal_speed_(20.0),
+      max_vertical_speed_(3.0),
+      max_lead_angle_rad_(30.0 * M_PI / 180.0),
+      los_filter_cutoff_hz_(2.0),
+      desired_los_yaw_rate_(0.0),
+      prev_los_yaw_filtered_(0.0),
+      prev_los_pitch_filtered_(0.0),
+      los_filter_initialized_(false),
+      los_yaw_unwrapped_prev_(0.0),
+      los_yaw_unwrap_initialized_(false),
+      dt_(0.02) {  // 50Hz default
+
+    nh.param<double>("strike_max_speed", radial_speed_, 20.0);
+    nh.param<double>("nav_ratio", nav_ratio_, 1.5);
+    nh.param<double>("strike_max_speed", max_horizontal_speed_, 20.0);
+    nh.param<double>("strike_max_vertical_speed", max_vertical_speed_, 3.0);
+    nh.param<double>("max_lead_angle_deg", max_lead_angle_rad_, 30.0);
+    max_lead_angle_rad_ = max_lead_angle_rad_ * M_PI / 180.0;  // deg → rad
+    nh.param<double>("los_filter_cutoff_hz", los_filter_cutoff_hz_, 2.0);
+
+    // 初始化 LOS 角低通滤波器
+    los_yaw_filter_.configure(1.0 / dt_, los_filter_cutoff_hz_);
+    los_pitch_filter_.configure(1.0 / dt_, los_filter_cutoff_hz_);
+
+    last_update_time_ = ros::Time::now();
+
+    ROS_INFO("[Intercept PN] N=%.2f, max_lead=%.1f deg, los_filter=%.1f Hz, speed=%.2f m/s",
+             nav_ratio_, max_lead_angle_rad_ * 180.0 / M_PI,
+             los_filter_cutoff_hz_, radial_speed_);
 }
 
-Eigen::Vector3d InterceptGuidance::computeInterceptPoint(
-    const Eigen::Vector3d& uav_pos,
-    const Eigen::Vector3d& target_pos,
-    const Eigen::Vector3d& target_vel) {
-
-    // Relative position from UAV to target
-    Eigen::Vector3d rel_pos = target_pos - uav_pos;
-
-    // Time to intercept (assuming constant target velocity and UAV speed)
-    double t_intercept = rel_pos.norm() / uav_speed_;
-
-    // Limit prediction horizon
-    t_intercept = std::min(t_intercept, intercept_time_horizon_);
-
-    // Predicted target position
-    Eigen::Vector3d intercept_point = target_pos;// + target_vel * t_intercept;
-
-    return intercept_point;
+void InterceptGuidance::resetLosFilter() {
+    los_yaw_filter_.reset();
+    los_pitch_filter_.reset();
+    los_filter_initialized_ = false;
+    los_yaw_unwrap_initialized_ = false;
+    ROS_INFO_THROTTLE(2.0, "[Intercept PN] LOS filter reset");
 }
 
 VelocityCommand InterceptGuidance::computeCommand(
@@ -42,26 +64,150 @@ VelocityCommand InterceptGuidance::computeCommand(
 
     VelocityCommand cmd;
 
-    // Extract positions
-    Eigen::Vector3d uav_pos(uav_pose.pose.position.x,
-                             uav_pose.pose.position.y,
-                             uav_pose.pose.position.z);
-    Eigen::Vector3d target_pos(target_pose.pose.position.x,
-                                target_pose.pose.position.y,
-                                target_pose.pose.position.z);
+    // ===== 1. 计算 LOS 角 (NED 地理系) =====
+    // 节点内部约定 NWU (uavPoseCallback 已转换), 先转回 NED 再算 LOS:
+    //   NED N = NWU N, NED E = -NWU W, NED D = -NWU U
+    // los_yaw:   左负右正, 0=北, +π/2=东
+    // los_pitch: 下负上正, 0=水平, +π/2=目标在上方
+    double dx = (target_pose.pose.position.x - uav_pose.pose.position.x);    // NED N 差
+    double dy = -(target_pose.pose.position.y - uav_pose.pose.position.y);   // NED E = -NWU W
+    double dz = -(target_pose.pose.position.z - uav_pose.pose.position.z);   // NED D = -NWU U
 
-    // Direction to target (直接指向目标，忽略速度预测)
-    Eigen::Vector3d direction = target_pos - uav_pos;
-    double dist = direction.norm();
+    double horiz = sqrt(dx*dx + dy*dy);
+    double los_yaw   = atan2(dy, dx);              // 左负右正
+    double los_pitch = atan2(-dz, horiz);          // 下负上正
+    double distance  = sqrt(dx*dx + dy*dy + dz*dz);
 
-    if (dist > 0.1) {
-        direction.normalize();
-        cmd.velocity = direction * uav_speed_;  // Constant speed to target
-        cmd.intercept_point = target_pos;  // 用于可视化
+    // ===== 2. LOS 角低通滤波 (先滤波角度, 再差分) =====
+    ros::Time now = ros::Time::now();
+    double dt = (now - last_update_time_).toSec();
+    if (dt <= 0.0 || dt > 1.0) dt = dt_;  // 防御
+    last_update_time_ = now;
+
+    // 先把 yaw 解包裹成连续角, 再低通. 否则 +179°→-179° 会被普通线性
+    // 滤波错误地拉向 0°, 制造一个并不存在的大 LOS 角速度
+    double los_yaw_unwrapped = los_yaw;
+    if (los_yaw_unwrap_initialized_) {
+        los_yaw_unwrapped = los_yaw_unwrapped_prev_ +
+                            wrap_pi(los_yaw - wrap_pi(los_yaw_unwrapped_prev_));
+    }
+    los_yaw_unwrapped_prev_ = los_yaw_unwrapped;
+    los_yaw_unwrap_initialized_ = true;
+
+    double los_yaw_filtered   = los_yaw_filter_.apply(los_yaw_unwrapped);
+    double los_pitch_filtered = los_pitch_filter_.apply(los_pitch);
+
+    // ===== 3. LOS 角速度 (差分) =====
+    double los_yaw_rate   = 0.0;
+    double los_pitch_rate = 0.0;
+
+    if (los_filter_initialized_) {
+        double dyaw   = wrap_pi(los_yaw_filtered   - prev_los_yaw_filtered_);
+        double dpitch =             los_pitch_filtered - prev_los_pitch_filtered_;
+
+        los_yaw_rate   = dyaw   / dt;
+        los_pitch_rate = dpitch / dt;
     }
 
-    ROS_DEBUG_THROTTLE(1.0, "[Intercept] dist=%.2f, vel=(%.2f, %.2f, %.2f)",
-                       dist, cmd.velocity.x(), cmd.velocity.y(), cmd.velocity.z());
+    prev_los_yaw_filtered_   = los_yaw_filtered;
+    prev_los_pitch_filtered_ = los_pitch_filtered;
+    los_filter_initialized_  = true;
+
+    // 保存到 cmd (可视化和调试用)
+    cmd.los_yaw        = los_yaw;
+    cmd.los_pitch      = los_pitch;
+    cmd.los_yaw_rate   = los_yaw_rate;
+    cmd.los_pitch_rate = los_pitch_rate;
+
+    // ===== 4. P 控制: 让 LOS 角速度 → 0 =====
+    // 期望: UAV 速度方向应该消除 LOS 旋转
+    // los_yaw_rate > 0 (LOS 向右转) → 飞机向右飞 (vy > 0)
+    // los_pitch_rate > 0 (LOS 向上转) → 飞机向上飞 (vz < 0, NED)
+
+    // LOS 方向单位向量 (NED)
+    double cos_yaw   = cos(los_yaw);
+    double sin_yaw   = sin(los_yaw);
+
+    // 水平面: LOS 水平方向
+    double los_xy_x = cos_yaw;   // NED North
+    double los_xy_y = sin_yaw;   // NED East
+
+    // 垂直于 LOS 水平方向 (左旋 90°, 向右)
+    double los_xy_perp_x = -los_xy_y;
+    double los_xy_perp_y =  los_xy_x;
+
+    // 横向速度: 消除 yaw_rate, 向右为正
+    const double los_yaw_rate_error = los_yaw_rate - desired_los_yaw_rate_;
+    double v_lateral  = nav_ratio_ * los_yaw_rate_error * horiz;
+
+    // 垂直速度: 消除 pitch_rate, 向上为负 (NED)
+    double v_vertical = -nav_ratio_ * los_pitch_rate * distance;
+
+    // ===== 5. 前向/横向速度分配 =====
+    // 横向钳位 (≤ 0.4 * radial_speed_, 防越界导致合速度被压缩失去 d/tmax 同步)
+    double max_lateral = 0.4 * radial_speed_;
+    v_lateral = std::max(-max_lateral, std::min(max_lateral, v_lateral));
+    double v_forward = radial_speed_;  // mission task_speed 的语义是水平速度
+
+    // ===== 6. 合成速度矢量 (NED) =====
+    // task_speed / radial_speed_ 是水平速度，不是三维合速度。因此沿真实 3D LOS
+    // 飞行时应满足 vz / v_horizontal = dz / horiz = -tan(los_pitch)。旧实现用
+    // -v_forward*sin(pitch)，45° LOS 只给出 35.3° 航迹角，越接近正下方偏差越大。
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
+    constexpr double kMinHorizontalRange = 0.1;
+    if (distance < 1e-3) {
+        // 已到目标点：避免 atan2(0,0) 后仍沿 North 发速度。
+    } else if (horiz < kMinHorizontalRange) {
+        // LOS 近乎竖直时 yaw 退化；只沿竖直方向接近，限速器会保持该方向。
+        vz = (dz >= 0.0) ? max_vertical_speed_ : -max_vertical_speed_;
+    } else {
+        vx = los_xy_x       * v_forward + los_xy_perp_x * v_lateral;
+        vy = los_xy_y       * v_forward + los_xy_perp_y * v_lateral;
+        vz = v_forward * (dz / horiz) + v_vertical;
+    }
+
+    // ===== 7. 前置角约束 (仅水平面) =====
+    double vel_yaw = atan2(vy, vx);
+    double lead_angle = wrap_pi(vel_yaw - los_yaw);
+
+    if (fabs(lead_angle) > max_lead_angle_rad_) {
+        double clamped_yaw = los_yaw +
+            (lead_angle > 0 ? max_lead_angle_rad_ : -max_lead_angle_rad_);
+        double speed = sqrt(vx*vx + vy*vy);
+        vx = speed * cos(clamped_yaw);
+        vy = speed * sin(clamped_yaw);
+
+        ROS_DEBUG_THROTTLE(0.5, "[Intercept PN] Lead angle clamped: %.1f → %.1f deg",
+                          lead_angle * 180.0 / M_PI,
+                          max_lead_angle_rad_ * 180.0 / M_PI);
+    }
+
+    // 水平/垂直上限共同约束整个三维速度矢量, 保持合成方向不变
+    limitVelocityVector(vx, vy, vz,
+                        max_horizontal_speed_, max_vertical_speed_);
+
+    // ===== 8. 机头指向 =====
+    cmd.desired_yaw = los_yaw;
+
+    // ===== 9. 输出 (NED) =====
+    cmd.velocity.x() = vx;   // NED North
+    cmd.velocity.y() = vy;   // NED East
+    cmd.velocity.z() = vz;   // NED Down
+    cmd.intercept_point_nwu = Eigen::Vector3d(
+        target_pose.pose.position.x,
+        target_pose.pose.position.y,
+        target_pose.pose.position.z);
+
+    ROS_DEBUG_THROTTLE(1.0,
+        "[Intercept PN] dist=%.1f, los=(%.1f, %.1f) deg, rate=(%.1f, %.1f) deg/s, "
+        "vel=(%.2f, %.2f, %.2f), lead=%.1f deg",
+        distance,
+        los_yaw   * 180.0 / M_PI, los_pitch * 180.0 / M_PI,
+        los_yaw_rate * 180.0 / M_PI, los_pitch_rate * 180.0 / M_PI,
+        vx, vy, vz,
+        lead_angle * 180.0 / M_PI);
 
     return cmd;
 }

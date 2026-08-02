@@ -18,6 +18,20 @@ pos_p_gain: 1.0
 vel_p_gain: 0.5
 thrust_weight: 0.5
 
+# === 2026-07-31: 比例导引 (PN) 专属参数 (InterceptGuidance) ===
+# 注意: guidance_speed 实际由 mission_manager 在 Attack(IN_TASK) 期间通过
+#   setUavSpeed() 动态下发 (skill.task_speed = attack_speed 字段;
+#   mission_manager.yaml 的 ~max_speed 是兜底默认). 以下 5 个 YAML 参数
+#   只在构造函数里读一次,作为"启动默认值 / 下发前的兜底上限".
+strike_max_speed: 40.0           # STRIKE 水平速度上限 (m/s), 兜底默认
+strike_max_vertical_speed: 3.0   # STRIKE 升降速度上限 (m/s)
+nav_ratio: 0.5                   # 导航比 N: 1.0=纯追踪, 3~5=经典 PN. 起步用 1.5 偏稳
+#                                  # (2026-08-01: 实测 1.5 在 1.0-1.7 Hz 形成闭环极限环,
+#                                  #  俯仰/滚转 std≈5.9°/5.1°. 静止目标下 N=0.5 = 纯追踪,
+#                                  #  环路增益 <1 不激发正反馈, 验证是否能压平振荡)
+max_lead_angle_deg: 30.0         # 前置角约束: 合速度与 LOS 夹角超过此值则钳到边界 (deg)
+los_filter_cutoff_hz: 2.0        # LOS 角低通滤波截止 (Hz). 越高越跟手越抖, 越低越平滑越滞后
+
 # LOS 制导参数（仅 los_kp_yaw / los_max_rate 是节点专属，los_kp_pitch 在 strategies 中）
 los_kp_yaw: 1.5
 los_max_rate: 1.2

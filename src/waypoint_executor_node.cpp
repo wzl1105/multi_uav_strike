@@ -185,6 +185,22 @@ private:
     double L1_min_;        // m,低速段最小 lookahead,默认 3.0(原硬编码 5.0 偏长→压线响应慢)
     double L1_period_;     // s,高速段 lookahead = cur_speed * L1_period_,默认 0.6(原硬编码 1.0)
 
+    // ===== L1 自适应增强(兼容低速 + 高速)=====
+    // l1_min_period_ > 0 时,L1_min 被 max(L1_min_, cur_speed * l1_min_period_)
+    // 替换成随速度增长的最小 lookahead。低空低速(4 m/s)L1 ≈ 4.8 m,高速(15 m/s)L1 ≈ 18 m,
+    // 消除低速 L1 卡死在 L1_min 引起的"画龙"。
+    double l1_min_period_; // s,默认 1.2(0 = 关闭,保留旧 L1_min 硬下限)
+    // XTE bearing 阻尼:在 L1 bearing 上叠加 atan2(-XTE, L1) * gain,等价于
+    // 在 L1 横向控制里加一份与 XTE 反向的角度反馈,反向补偿 yaw 跟踪滞后
+    // 引起的 L1 bearing 反向过冲。低 gain(0.7~1.0)主要消除低速画龙,
+    // 高 gain(>1.5)会让短连接段 yaw 误差反向放大,所以下面有 along_fraction gate。
+    double xte_damping_gain_; // 默认 1.0(0 = 关闭)
+    // 阻尼门控:飞机从 along < fraction·seg_len 段头进入新段时,XTE 可能还是
+    // 上一个段残留的偏差,如果立即叠加 bearing 阻尼会把 bearing 推离段方向;
+    // 限制 only when along > fraction·seg_len 才启用,短段(< 4·fraction·seg_len)
+    // 几乎全程不触发。
+    double xte_damping_min_along_fraction_; // 默认 0.25
+
     // ===== 航向 P-control(机头跟踪 L1 bearing)=====
     // yaw_rate = yaw_kp_ * yaw_error,饱和在 yaw_max_rate_
     // yaw_kp 越大 → 航向跟踪越紧,但过大会震荡
@@ -256,6 +272,9 @@ public:
         last_v_mag_(0.0),
         L1_min_(3.0),
         L1_period_(0.6),
+        l1_min_period_(1.2),
+        xte_damping_gain_(1.0),
+        xte_damping_min_along_fraction_(0.25),
         yaw_kp_(3.0),
         yaw_deadband_(0.05),
         current_work_mode_("SEARCH_ONLY"),
@@ -313,6 +332,17 @@ public:
         //     减小 → 高速时贴线更紧;增大 → 高速时更平滑但超调大。
         nh_private_.param<double>("L1_min", L1_min_, 3.0);
         nh_private_.param<double>("L1_period", L1_period_, 0.6);
+        // L1 自适应增强(2026-08-02):
+        //   l1_min_period: 替换固定 L1_min 下限,L1_min_eff = max(L1_min, v*l1_min_period)。
+        //     设 0 等价于旧的固定 L1_min 行为;默认 1.2 s 让 L1 跟随速度,
+        //     低速 4 m/s → L1≈4.8 m(原 3.0),高速 15 m/s → L1≈18 m(原 9.0)。
+        //   xte_damping_gain: XTE bearing 阻尼,bearing += atan2(-XTE, L1) * gain,
+        //     兼容低速和高速,自动按 L1 缩放;默认 1.0。0 关闭。
+        //   xte_damping_min_along_fraction: 阻尼门控,只在 along > fraction*seg_len
+        //     时启用,避免段头/段尾/短连接段误触发把 bearing 推离段方向。默认 0.25。
+        nh_private_.param<double>("l1_min_period", l1_min_period_, 1.2);
+        nh_private_.param<double>("xte_damping_gain", xte_damping_gain_, 1.0);
+        nh_private_.param<double>("xte_damping_min_along_fraction", xte_damping_min_along_fraction_, 0.25);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
         // 航向 P-control 增益 + 死区:
@@ -822,12 +852,21 @@ public:
                 double rx = current_ned_x_ - seg_x0;
                 double ry = current_ned_y_ - seg_y0;
                 double along = rx * ux + ry * uy;
+                // 段外偏差(cross-track,NED:u_n*r_e - u_e*r_n,正值=飞机在段方向左侧)
+                double xte = ux * ry - uy * rx;
 
                 // ===== Lookahead 距离(PX4 mc_pos_control 同款) =====
-// 来自字段 L1_min_/L1_period_,可在 yaml 调:减小→贴线更紧;过大→"画龙"超调。
+// 来自字段 L1_min_/L1_period_/l1_min_period_,可在 yaml 调:减小→贴线更紧;过大→"画龙"超调。
                 const double L1_min = L1_min_;     // m,低速段最小 lookahead,避免抖动
                 const double L1_period = L1_period_;  // s,高速段 lookahead 系数
-                double L1 = std::max(L1_min, cur_speed * L1_period);
+                // L1_min 自适应:l1_min_period_ > 0 时,低速段 L1 不再卡在 L1_min_,
+                //   而按当前速度给一份最小 lookahead(默认 4 m/s × 1.2 s = 4.8 m),
+                //   消除 L1=3 m + XTE=1 m 时 bearing 期望反相引起的低速画龙。
+                //   l1_min_period_ = 0 保留旧行为(只用固定 L1_min_)。
+                const double L1_min_eff = (l1_min_period_ > 0.0)
+                    ? std::max(L1_min, cur_speed * l1_min_period_)
+                    : L1_min;
+                double L1 = std::max(L1_min_eff, cur_speed * L1_period);
                 // lookahead 投影点夹在 [0, seg_len](不过段端、不倒退)
                 double target_along = along + L1;
                 if (target_along < 0.0) target_along = 0.0;
@@ -866,6 +905,27 @@ public:
                 }
                 // bearing 跟 lookahead: 段内朝段前方;偏离段时航向也跟着纠
                 bearing = atan2(dy_la, dx_la);
+
+                // ===== XTE bearing 阻尼(2026-08-02 兼容低速 + 高速)=====
+                // 经验问题:低速(4 m/s)L1 卡 L1_min=3 m 时,飞机 yaw 跟踪 L1 bearing
+                //   存在滞后,XTE 在 ±1 m 范围摆,bearing 跟着反向 → 5 s 周期画龙。
+                // 修正:把 XTE 反向的一份角度补偿叠加到 L1 bearing,等价于在 L1 横向
+                //   反馈里加一份直接压线项。atan2(-XTE, L1) 形式天然有界(±90°),
+                //   且同样的 gain 在低速(L1≈3-5 m)给强纠偏、高速(L1≈9-18 m)给
+                //   弱纠偏,一个 gain 同时兼容两种速度。
+                // 门控 xte_damping_min_along_fraction_:段头/段尾 along 接近 0 或
+                //   seg_len 时,XTE 可能还是上个段残留的方向偏差,直接叠加阻尼会
+                //   把 bearing 推离本段方向。限制 only when along > fraction*seg_len
+                //   才启用,短连接段(< 4·fraction·seg_len)几乎全程不触发,避免
+                //   短段 yaw error 反而被放大(对照实飞 replay 段[2]/[4]/[6])。
+                if (xte_damping_gain_ > 0.0 &&
+                    along > xte_damping_min_along_fraction_ * seg_len) {
+                    const double xte_correction = std::atan2(-xte, std::max(L1, 1.0))
+                                                   * xte_damping_gain_;
+                    // wrap to (-pi, pi] 避免 bearing 漂出 yaw P-controller 期望范围
+                    bearing = std::atan2(std::sin(bearing + xte_correction),
+                                         std::cos(bearing + xte_correction));
+                }
             }
         }
 

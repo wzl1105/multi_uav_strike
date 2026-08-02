@@ -15,6 +15,7 @@
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
+#include "multi_uav_strike/GuidancePnDebug.h"   // PN 坐标/LOS/速度链路 rosbag 诊断
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 #include "multi_uav_strike/InterUavStatus.h"  // /inter_uav/uav_status 心跳(替代 other_uav_poses)
@@ -48,6 +49,7 @@ private:
     ros::Publisher intercept_point_pub_; // 拦截点可视化
     ros::Publisher debug_pub_;           // 调试信息
     ros::Publisher target_filter_debug_pub_;  // 2026-07-16: 速度滤波前后对比 debug topic
+    ros::Publisher pn_debug_pub_;             // PN 输入/LOS/三阶段速度，供 rosbag 离线复盘
     std::string viz_frame_;              // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
 
     // Timer for guidance computation
@@ -132,13 +134,13 @@ private:
     multi_uav_strike::OneEuroFilter1D vel_filter_z_;
     multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
     ros::Time                    vel_filter_last_time_;
-    // 目标切换检测:目标位置突变(>5m)→ 视为不同物理目标 → reset filter,
-    //   否则旧目标的 x_prev 会污染新目标的初值,造成瞬时偏飞。
-    double last_target_pos_x_ = 0.0;
-    double last_target_pos_y_ = 0.0;
-    double last_target_pos_z_ = 0.0;
-    bool   last_target_pos_valid_ = false;
+    // 目标位置突变超过此值时，在 targetPoseCallback 内、下一次 PN 计算之前重置滤波器。
     static constexpr double kTargetSwitchJumpM = 5.0;
+    // 上一帧目标位置(NWU),用于 targetPoseCallback 内做"目标切换"突变检测
+    double last_target_pos_x_  = 0.0;
+    double last_target_pos_y_  = 0.0;
+    double last_target_pos_z_  = 0.0;
+    bool   last_target_pos_valid_ = false;
 
     // STRIKE模式参数
     double strike_min_altitude_;      // 开始下降的最小高度阈值
@@ -274,9 +276,16 @@ public:
         //   调参经验:还看着 UAV 抖 → 把 vel_min_cutoff_hz 降(0.5~1.0);
         //            UAV 反应迟钝跟不上目标 → 升 vel_beta(0.02~0.05)
         //   速度通道比位置通道可以略激进(响应要快),所以默认 beta 比位置稍大。
+        // === 2026-08-01: 收紧默认值, 消除 ~2 Hz 机体俯仰振荡 ===
+        //   现象: rosbag 分析发现 cmd_vel_unstamped 方向 ±2°@1 Hz 摆动,
+        //         触发 PX4 俯仰/滚转交替, 但 yaw 不抖.
+        //   旧默认值 1.5Hz + beta=0.015 对 1-2 Hz 摆动几乎是直通的
+        //   (beta 让截止频率随 dx/dt 升高,反而放行稳态摆动).
+        //   新默认值 0.5Hz + beta=0.001 把 1 Hz+ 成分削掉 ~12 dB,
+        //   PN 输出的 0.3 m/s std 摆动会被压到 ~0.05 m/s.
         double vel_min_cutoff, vel_beta, vel_d_cutoff;
-        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 1.5);
-        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.015);
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 0.5);
+        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.001);
         nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   1.0);
         vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
@@ -378,6 +387,9 @@ public:
 
         target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
             "guidance/target_filter_debug", 10);  // 2026-07-16: 速度滤波前后对比
+
+        pn_debug_pub_ = nh_.advertise<multi_uav_strike::GuidancePnDebug>(
+            "guidance/pn_debug", 10);
     }
 
     void initGuidanceStrategy() {
@@ -387,6 +399,46 @@ public:
 
     // Callback methods
     void targetPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        const double nx = msg->pose.position.x;
+        const double ny = msg->pose.position.y;
+        const double nz = msg->pose.position.z;
+
+        // === 2026-07-31: 目标位置突变(>5m)→ 同步 reset 滤波器 ===
+        //   在 targetPoseCallback 内做检测的好处: resetLosFilter() 与
+        //   上一次 PN computeCommand 之间没有其它 computeCommand → 首帧
+        //   computeCommand 拿到的就是 fresh 状态, 不会把旧目标的 LOS
+        //   角速度套到新目标上.
+        //   One Euro 通道也在这里 reset, 与 LOS 滤波器一起丢旧状态,
+        //   避免旧目标的速度平滑状态在新目标第一帧"残影"一拍再跟上.
+        if (last_target_pos_valid_) {
+            const double dx = nx - last_target_pos_x_;
+            const double dy = ny - last_target_pos_y_;
+            const double dz = nz - last_target_pos_z_;
+            const double jump = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (jump > kTargetSwitchJumpM) {
+                vel_filter_x_.reset();
+                vel_filter_y_.reset();
+                vel_filter_z_.reset();
+                vel_filter_yaw_.reset();
+                if (current_strategy_type_ ==
+                    multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
+                    guidance_strategy_) {
+                    auto* intercept_strategy =
+                        static_cast<multi_uav_strike::InterceptGuidance*>(
+                            guidance_strategy_.get());
+                    intercept_strategy->resetLosFilter();
+                }
+                ROS_WARN_THROTTLE(1.0,
+                    "[Guidance] Target switched (jump=%.1fm), "
+                    "reset velocity OneEuro + PN LOS filters",
+                    jump);
+            }
+        }
+        last_target_pos_x_ = nx;
+        last_target_pos_y_ = ny;
+        last_target_pos_z_ = nz;
+        last_target_pos_valid_ = true;
+
         current_target_pose_ = *msg;
         is_target_pose_received_ = true;
     }
@@ -674,11 +726,11 @@ public:
                     // TRACK模式：独立PI控制，不做STRIKE评估
                     // 固定高度 + PI控制水平位置
                     computeTrackVelocity(vel_cmd);
+                    // 所有策略统一先在 NED 滤波，再在发布前做 NED→ENU；debug 因此始终是 NED。
+                    filterVelocityCmd(vel_cmd);
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
-                    // === 2026-07-16: 速度指令过 One Euro,消除"速度量调"造成的 UAV 视觉晃 ===
-                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
@@ -687,53 +739,118 @@ public:
                         current_uav_pose_,
                         current_target_pose_,
                         current_target_twist_);
-                    // // 打印目标信息、无人机信息、速度指令信息用于调试
-                    // ROS_INFO("[Guidance] Target Pos (NWU): [%.2f, %.2f, %.2f]",
-                    //                    current_target_pose_.pose.position.x, current_target_pose_.pose.position.y, current_target_pose_.pose.position.z);
-                    // ROS_INFO("[Guidance] UAV Pos (NWU): [%.2f, %.2f, %.2f], UAV Alt: %.2f m",
-                    //                    current_uav_pose_.pose.position.x, current_uav_pose_.pose.position.y, current_uav_pose_.pose.position.z, -current_uav_pose_.pose.position.z);
-                    // ROS_INFO("[Guidance] Velocity Command (NWU): [%.2f, %.2f, %.2f], Intercept Point (NWU): [%.2f, %.2f, %.2f]",
-                    //                    cmd.velocity.x(), cmd.velocity.y(), cmd.velocity.z(),
-                    //                    cmd.intercept_point.x(), cmd.intercept_point.y(), cmd.intercept_point.z());
-                    // Publish velocity command - 转换为NED坐标发送
-                    // NWU (guidance内部) -> NED (飞控期望)
-                    // NED: x=North(不变), y=East(取反), z=Down(取反)
-                    vel_cmd.linear.x = cmd.velocity.x();   // NED N
-                    vel_cmd.linear.y = -cmd.velocity.y();  // NED E = -NWU W
+                    // InterceptGuidance 输出已经是 NED；这里不能再按 NWU 翻转 Y/Z。
+                    // 旧链路的二次翻转会让 East 反向，并把目标在下方时的 D+ 下降量钳成 0。
+                    vel_cmd.linear.x = cmd.velocity.x();
+                    vel_cmd.linear.y = cmd.velocity.y();
 
-                    // 基于视场角pitch的高度控制
-                    // pitch大（绝对值）= 俯冲阶段 = 允许下降
-                    // pitch小 = 接近阶段 = 限制下降
-                    //
-                    // 原来用硬 if/else 在 pitch_threshold=0.5rad 边界,|pitch| 跨阈值时
-                    //   vz 会从"完整 desired_z"瞬间跳到"被钳到 0",rqt_plot 上能看到
-                    //   单帧 vz 跳 0 → vel_cmd 视觉抖。
-                    // 改为:在阈值附近做平滑过渡(tanh),避免硬开关颠簸。
-                    double pitch = current_los_angle_.y;                         // NED 下俯仰角
-                    const double pitch_threshold = 0.5;                          // rad,跨此值允许全速下降
-                    const double transition_width = 0.1;                         // rad,过渡带宽
-                    const double max_descent_when_level = 0.0;                   // 接近阶段最大下沉速度 (m/s,NED D+)
-
-                    // smooth_weight ∈ [0, 1]:
-                    //   |pitch| >> pitch_threshold → ≈1 (放行 desired_z)
-                    //   |pitch| << pitch_threshold → ≈0 (夹到 max_descent_when_level)
-                    double smooth_weight = 0.5 * (std::tanh(
+                    // 基于当前 primary target 的几何 LOS pitch 做下降门控。
+                    // 使用 cmd.los_pitch 而不是 gimbal 的全局主目标 LOS，避免多目标时门控错对象。
+                    const double pitch = cmd.los_pitch;                              // 下负上正
+                    const double pitch_threshold = 0.20;                             // rad (2026-08-02: 0.5 → 0.20 ≈ 11.5°)
+                    //   远距俯冲段 los_pitch 永远 < 28.6°, 旧阈值会把 PN 的 vz 前馈
+                    //   压死, UAV 在目标上方水平飞过. 0.20 rad 让 11.5° 以上的俯冲段
+                    //   即开始产生下降分量, 短距浅俯冲不再被门控卡住.
+                    const double transition_width = 0.1;                             // rad
+                    const double max_descent_when_level = 0.0;                       // m/s, NED D+
+                    const double smooth_weight = 0.5 * (std::tanh(
                         (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
-                    double desired_z = -cmd.velocity.z();  // >0 = 下沉(NED)
+                    double desired_z = cmd.velocity.z();                             // NED: >0 下沉
                     if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
                     vel_cmd.linear.z = smooth_weight * desired_z;
-
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
-                    vel_cmd.angular.z = 0.0;
+                    // === 2026-08-02: STRIKE 偏航跟踪 ===
+                    //   现象: 之前 vel_cmd.angular.z 强制 0, 机头冻结在进入 STRIKE 时的航向;
+                    //         PN 在世界系推速度, 但机体朝别的方向, PX4 离轴速度激起 0.9-1.4 Hz 姿态抖.
+                    //   修复: 复用 TRACK 模式 [computeTrackVelocity] 同样的 yaw rate P 控制,
+                    //         desired = cmd.desired_yaw (= los_yaw, PN 已算好).
+                    //   关键 frame 修复 (uav0_strike_2026-08-02-10-53-30 bag 复盘):
+                    //     (1) current_uav_pose_ 在 use_sim_=false 分支下被 [uavPoseCallback]
+                    //         ENU→NWU 变换 (line ~480-491), 所以 atan2(...) 给的是 NWU 偏航.
+                    //     (2) cmd.desired_yaw 来自 PN 内部, 走的是 NED 系 (los_yaw 左负右正,
+                    //         0=北, +π/2=东).
+                    //     (3) NWU→NED: 同一物理指向 yaw_ned = -yaw_nwu (NWU 把西当 +π/2,
+                    //         NED 把东当 +π/2, 差一个负号).
+                    //     (4) err 公式: positive = "目标在 current 左侧" → 应让 PX4 CCW 转
+                    //         (NWU heading 减小, NED heading 减小), 所以 err = current - target.
+                    //     (5) PX4 NED: ang.z > 0 → heading 增大 (CW from above).
+                    //         经 convertVelNedToEnu (line 1224) 取反后 mavros 发 FLU
+                    //         (mavros 不再翻转), PX4 FRD 收到 -rate → heading 减小 (CCW).
+                    //         所以 err>0 时直接传 +rate 即可.
+                    //   旧版同时有 frame 错 (1) 和符号错 (4): 物理 20° 误差被放大成
+                    //     100+° 饱和到 +0.6, 09:43 bag 看到 yaw 90°→116° 反向旋转.
+                    const double uav_qx = current_uav_pose_.pose.orientation.x;
+                    const double uav_qy = current_uav_pose_.pose.orientation.y;
+                    const double uav_qz = current_uav_pose_.pose.orientation.z;
+                    const double uav_qw = current_uav_pose_.pose.orientation.w;
+                    const double current_yaw_nwu = std::atan2(
+                        2.0 * (uav_qw * uav_qz + uav_qx * uav_qy),
+                        1.0 - 2.0 * (uav_qy * uav_qy + uav_qz * uav_qz));
+                    const double current_yaw_ned = -current_yaw_nwu;                // NWU → NED
+                    const double target_bearing_ned = cmd.desired_yaw;             // = los_yaw (PN 内部 NED)
+                    // === 2026-08-02: STRIKE 偏航 err 公式修正 ===
+                    //   旧版: yaw_err_ctrl = wrap(current_ned - target_ned), vel_cmd.angular.z = +Kp*err
+                    //   旧版物理流向(实测 2026-08-02-15-00 bag, t_rel=-0.78):
+                    //     NED current=-67.9° (SE), target=+56.6° (NE, 目标在 RIGHT)
+                    //     err = -124.5°(负) → yaw_rate = +Kp*(-124.5°) = 负 (NED)
+                    //     经 convertVelNedToEnu 取反: published = 正 = CCW from above
+                    //     实际需要 CW (目标在右),但发了 CCW → 飞机背对目标兜了一圈
+                    //     (yaw_nwu 从 +67.9° 涨到 +195°, CCW 转了 128°,即用户描述"偏左90°再180°")
+                    //   根因:旧公式 +Kp*(current - target) 在 NED 下方向反.
+                    //   NED 下 +yaw_rate = CW from above (Z down 右手法则),目标在 RIGHT 时
+                    //     需要 yaw_rate 为正,所以 err 必须是 (target - current) 才给出正数.
+                    //   修法:err = target_bearing_ned - current_yaw_ned,与 TRACK 模式
+                    //     [computeTrackVelocity] 保持同一符号约定 (TRACK 用 target-current,
+                    //     输出再 -yaw_rate 取反,本质一致).
+                    const double yaw_err_ctrl = std::atan2(
+                        std::sin(target_bearing_ned - current_yaw_ned),
+                        std::cos(target_bearing_ned - current_yaw_ned));
+                    // 2026-08-02: STRIKE 用更保守的 kp / max_rate, 避免 87° 大误差下
+                    //   卡到 los_max_rate_ 限幅引发的 yaw spin (实测 09:18 bag: yaw std=54°,
+                    //   body_rate r 饱和 ±1.4 rad/s). 0.5 / 0.6 不影响 TRACK 模式.
+                    const double strike_los_kp_yaw    = 0.5;
+                    const double strike_los_max_rate  = 0.6;
+                    double yaw_rate = strike_los_kp_yaw * yaw_err_ctrl;
+                    yaw_rate = std::max(-strike_los_max_rate, std::min(strike_los_max_rate, yaw_rate));
+                    vel_cmd.angular.z = yaw_rate;
+
+                    // 保存 pitch 门控后的 NED 指令；One Euro 也统一在 NED 下运行。
+                    const geometry_msgs::Vector3 gated_velocity_ned = vel_cmd.linear;
                     evaluateStrike();
+                    filterVelocityCmd(vel_cmd);
+
+                    multi_uav_strike::GuidancePnDebug pn_dbg;
+                    pn_dbg.header.stamp = ros::Time::now();
+                    pn_dbg.header.frame_id = "nwu_position_ned_velocity";
+                    pn_dbg.uav_position_nwu = current_uav_pose_.pose.position;
+                    pn_dbg.target_position_nwu = current_target_pose_.pose.position;
+                    pn_dbg.strategy_velocity_ned.x = cmd.velocity.x();
+                    pn_dbg.strategy_velocity_ned.y = cmd.velocity.y();
+                    pn_dbg.strategy_velocity_ned.z = cmd.velocity.z();
+                    pn_dbg.gated_velocity_ned = gated_velocity_ned;
+                    pn_dbg.filtered_velocity_ned = vel_cmd.linear;
+                    const double rel_x = current_target_pose_.pose.position.x -
+                                         current_uav_pose_.pose.position.x;
+                    const double rel_y = current_target_pose_.pose.position.y -
+                                         current_uav_pose_.pose.position.y;
+                    const double rel_z = current_target_pose_.pose.position.z -
+                                         current_uav_pose_.pose.position.z;
+                    pn_dbg.horizontal_distance = std::hypot(rel_x, rel_y);
+                    pn_dbg.distance = std::sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z);
+                    pn_dbg.los_yaw = cmd.los_yaw;
+                    pn_dbg.los_pitch = cmd.los_pitch;
+                    pn_dbg.los_yaw_rate = cmd.los_yaw_rate;
+                    pn_dbg.los_pitch_rate = cmd.los_pitch_rate;
+                    pn_dbg.desired_yaw = cmd.desired_yaw;
+                    pn_dbg.pitch_gate_weight = smooth_weight;
+
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
-                    // STRIKE 模式也喂一次 One Euro,纯追踪对位置抖动更敏感
-                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
-                    publishInterceptPointMarker(cmd.intercept_point);
+                    pn_debug_pub_.publish(pn_dbg);
+                    publishInterceptPointMarker(cmd.intercept_point_nwu);
                 }
                 break;
             }
@@ -768,13 +885,15 @@ public:
     }
 
     // === 2026-07-16: 速度指令 One Euro Filter 统一入口 ===
-    //   TRACK/STRIKE 两个分支在 publish 前都过这里一次,共用 dt / target-switch 检测。
-    //   目标位置突变(>5m)→ reset 所有 filter,丢弃旧目标的 x_prev;
-    //   这样切换目标瞬间,速度不会先跳一段旧值的"残影"再跟上。
+    //   TRACK/STRIKE 两个分支在 publish 前都过这里一次,共用 dt。
+    //   目标位置突变(>5m)检测已搬到 targetPoseCallback 内:在那条路径上
+    //   resetLosFilter() 会在下一次 PN computeCommand 之前同步生效,
+    //   旧目标的 LOS 角速度不会套到新目标首帧。
+    //   这里只负责 dt 计算 + 四通道 One Euro 平滑 + 滤波前后 debug 上报。
     //   注意:这里读的是 publish 前的 vel_cmd(NED 系),但滤波状态本身与坐标无关,
     //   同 dt 同样的物理量,坐标转换不影响平滑效果。
     void filterVelocityCmd(geometry_msgs::Twist& vel_cmd) {
-        // ---- 1) dt + target-switch 检测 ----
+        // ---- 1) dt ----
         ros::Time now = ros::Time::now();
         double te = vel_filter_last_time_.isZero()
                         ? (1.0 / 50.0)
@@ -783,35 +902,11 @@ public:
         if (te <= 0.0) te = 1e-3;
         if (te > 1.0)  te = 1.0;  // 长时间没调用(断流/暂停)→ 限幅,避免 filter 一帧暴走
 
-        const double tx = current_target_pose_.pose.position.x;
-        const double ty = current_target_pose_.pose.position.y;
-        const double tz = current_target_pose_.pose.position.z;
-        if (last_target_pos_valid_) {
-            const double dx = tx - last_target_pos_x_;
-            const double dy = ty - last_target_pos_y_;
-            const double dz = tz - last_target_pos_z_;
-            if (std::sqrt(dx*dx + dy*dy + dz*dz) > kTargetSwitchJumpM) {
-                // 目标切换 → reset 所有 channel,丢掉旧目标的速度平滑状态
-                vel_filter_x_.reset();
-                vel_filter_y_.reset();
-                vel_filter_z_.reset();
-                vel_filter_yaw_.reset();
-                ROS_WARN_THROTTLE(1.0,
-                    "[Guidance] Target switched (jump=%.1fm), reset velocity OneEuro filters",
-                    std::sqrt(dx*dx + dy*dy + dz*dz));
-            }
-        }
-        last_target_pos_x_ = tx;
-        last_target_pos_y_ = ty;
-        last_target_pos_z_ = tz;
-        last_target_pos_valid_ = true;
-
         // ---- 2) 四通道 One Euro ----
         // 先 snapshot raw(NED),filter 之后再 publish 一起发到 debug topic
         const double raw_vx = vel_cmd.linear.x;
         const double raw_vy = vel_cmd.linear.y;
         const double raw_vz = vel_cmd.linear.z;
-        const double raw_wz = vel_cmd.angular.z;
         vel_cmd.linear.x  = vel_filter_x_.filter(vel_cmd.linear.x,  te);
         vel_cmd.linear.y  = vel_filter_y_.filter(vel_cmd.linear.y,  te);
         vel_cmd.linear.z  = vel_filter_z_.filter(vel_cmd.linear.z,  te);
@@ -823,7 +918,7 @@ public:
         //   若 residual 跟 UAV 抖同步 → One Euro 不够强,降 min_cutoff 或升 beta
         multi_uav_strike::TargetFilterDebug dbg;
         dbg.header.stamp    = now;
-        dbg.header.frame_id = "map";
+        dbg.header.frame_id = "ned";
         // 位置维度本节点不直接产生(由 mission_manager 计算),填 0
         dbg.pos_raw = dbg.pos_filtered = dbg.pos_delta = geometry_msgs::Point();
         // 注:raw 是 NED 系(进入 filterVelocityCmd 之前),filtered 同 NED;
@@ -835,11 +930,6 @@ public:
         dbg.vel_delta.x = raw_vx - vel_cmd.linear.x;
         dbg.vel_delta.y = raw_vy - vel_cmd.linear.y;
         dbg.vel_delta.z = raw_vz - vel_cmd.linear.z;
-        // yaw_rate 走的是 angular.z(TRACK 模式才非 0),塞到 vel_delta.z 不合适,
-        //   直接把 raw_wz / filtered wz 也保留在 vel_* 里(overwrite 上面):
-        dbg.vel_raw.z    = raw_wz;       // 把 angular.z 也展示一下,用户看 rqt_plot 自己辨认
-        dbg.vel_filtered.z = vel_cmd.angular.z;
-        dbg.vel_delta.z  = raw_wz - vel_cmd.angular.z;
         dbg.cluster_id = 0;  // 本节点不感知 cluster_id,留给 mission_manager 的 msg
         dbg.is_locked  = is_target_pose_received_;
         dbg.source     = "velocity";
