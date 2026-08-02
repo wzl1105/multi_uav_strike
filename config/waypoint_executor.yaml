@@ -23,6 +23,21 @@ reverse_speed: 1.0
 #     减小 → 高速时贴线更紧;增大 → 高速时更平滑但超调大(原 1.0 → 推荐 0.6)。
 L1_min: 3.0
 L1_period: 0.6
+# ===== L1 自适应增强(2026-08-02 兼容低速 + 高速)=====
+# 经验问题:低速 4 m/s 时 L1 卡 L1_min=3 m,XTE 1 m 量级摆动引起 yaw 跟踪滞后
+#   → L1 bearing 反向 → 5 s 周期画龙。
+#   l1_min_period: 把固定 L1_min 替换为 max(L1_min, v * l1_min_period),
+#     让 L1 跟随速度:4 m/s → ~4.8 m(原 3.0),15 m/s → ~18 m(原 9.0)。
+#     0 = 关闭,保留旧行为。
+#   xte_damping_gain: 在 L1 bearing 上叠加 atan2(-XTE, L1) * gain 的反向角度
+#     补偿,自动按 L1 缩放,一个 gain 同时兼容低速强纠偏和高速弱纠偏。
+#     0 = 关闭;推荐 1.0,>1.5 会让短段 yaw 误差反向放大。
+#   xte_damping_min_along_fraction: 阻尼门控,只在 along > fraction * seg_len
+#     时启用,避免段头/短连接段误触发。默认 0.25;调大(如 0.5)更保守,调小
+#     (如 0.1)更激进。
+l1_min_period: 1.2
+xte_damping_gain: 1.0
+xte_damping_min_along_fraction: 0.25
 
 # ===== 航向 P-controller(机头跟踪 L1 bearing)=====
 #   yaw_max_rate: 角速度饱和上限(rad/s),避免 P 输出过旋转。

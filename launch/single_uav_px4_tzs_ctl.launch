@@ -187,7 +187,7 @@
   <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.43.5" />
+      <param name="gcs_ip" value="192.168.3.90" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />
@@ -213,5 +213,26 @@
   <!-- ====================================================================== -->
   <node name="rviz" pkg="rviz" type="rviz" respawn="true"
         args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+
+  <!-- ====================================================================== -->
+  <!-- 11. ROSBag 自动记录：完整控制链，排除大图像话题                         -->
+  <!-- ====================================================================== -->
+  <arg name="record_bag" default="true" />
+  <arg name="bag_dir" default="$(env HOME)/LOG" />
+  <arg name="bag_prefix" default="$(arg uav_name)_strike" />
+
+  <group if="$(arg record_bag)">
+    <node pkg="rosbag"
+          type="record"
+          name="strike_rosbag_record"
+          output="screen"
+          required="false"
+          args="-a
+                --split
+                --size=2048
+                --buffsize=1024
+                -x '.*(/ros_short_image$|/ros_ir_image$|/ros_long_image$|/ros_vis_image_res$|/ros_ir_image_res$|/ros_zoom_image$|/image_raw$|/image_raw/compressed$).*'
+                -o $(arg bag_dir)/$(arg bag_prefix)" />
+  </group>
 
 </launch>

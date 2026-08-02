@@ -15,8 +15,9 @@ geometry_msgs/Point  pos_raw
 geometry_msgs/Point  pos_filtered
 geometry_msgs/Point  pos_delta
 
-# ---- 速度指令滤波对比 (NWU,m/s;STRIKE 模式 vz≈0,TRACK 模式 yaw_rate 在 vel_z 中) ----
-# 注:vel_filtered 是实际喂给 PX4 的速度;vel_raw 是 P 控制直出。
+# ---- 速度指令滤波前后对比 (NED,m/s) ----
+# 注:vel_raw / vel_filtered 都是坐标转换到 PX4 ENU 之前的 NED 速度；
+#    yaw_rate 不再复用 vel_*.z，保证垂直速度可用于打击复盘。
 geometry_msgs/Vector3 vel_raw
 geometry_msgs/Vector3 vel_filtered
 geometry_msgs/Vector3 vel_delta

@@ -47,6 +47,7 @@ add_message_files(
   ClusterTarget.msg
   ClusterState.msg
   TargetFilterDebug.msg     # 2026-07-16: 位置/速度滤波前后对比(debug)
+  GuidancePnDebug.msg       # 2026-07-31: PN 坐标/LOS/速度链路诊断
 )
 
 # 消息生成的依赖项
@@ -189,5 +190,7 @@ install(TARGETS
 # 安装 Python 脚本
 install(PROGRAMS
   scripts/gs_simulator_node.py
+  scripts/analyze_strike_bag.py
+  scripts/analyze_track_quality.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
