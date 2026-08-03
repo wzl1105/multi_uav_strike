@@ -46,7 +46,7 @@
     <include file="$(find mavros)/launch/px4.launch">
       <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
       <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
-      <arg name="gcs_url" value="udp://:14561@192.168.1.207:14560"/>
+      <arg name="gcs_url" value="udp://:14561@192.168.43.4:14560"/>
     </include>
   </group>
 
@@ -187,7 +187,7 @@
   <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.1.92" />
+      <param name="gcs_ip" value="192.168.43.5" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />

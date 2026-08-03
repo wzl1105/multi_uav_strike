@@ -682,6 +682,12 @@ private:
     //   立刻把刚起的 publisher 停了 → PX4 OFFBOARD 失流 → AUTO.LAND failsafe。
     //   用这个标志在 runPx4TakeoffSequence 守卫里做豁免。
     bool        attack_hover_setpoint_latched_   = false;
+    // === 2026-08-03: TARGET_LOST_HOVER 阶段 latch setpoint publisher ===
+    //   目标 lost 进入 hover 等待时,如果直接 disableGuidance + stop waypoint_executor
+    //   但不启 setpoint publisher,PX4 OFFBOARD 500ms~1s 内会 COM_OFFBOARD_LOSS_TIMEOUT
+    //   → AUTO.LAND failsafe。复用 attack_hover 同样的 latch 模式:startSetpointPublisher
+    //   锁当前位置 + 50Hz 喂 OFFBOARD 心跳,resume 时再停。
+    bool        target_lost_hover_setpoint_latched_ = false;
 
     // === Attack(105) 多机协同参数 ===
     double      attack_safety_margin_m_         = 3.0;   // 协同:每架距目标保留距离
@@ -2803,6 +2809,18 @@ public:
         const multi_uav_strike::ClusterTarget* attack_best = nullptr;
         double attack_best_d_wp2 = std::numeric_limits<double>::infinity();
 
+        // === 2026-08-03: 提前收 alive cluster_ids,case 体用它判断"旧目标是否还在 FOV" ===
+        //   背景:SEARCH_TRACK 阶段"已锁任何 label 拒绝"守卫需要区分:
+        //     a) 旧目标还在 FOV(同一 cluster_id 或同 label 多个 cluster_id 在 msg 里)
+        //        → case 体应 break,转移由 transfer 路径按距离阈值决定
+        //     b) 旧目标已经离开 FOV(locked_cluster_id_ 不在 msg 里)
+        //        → case 体应允许锁新目标,否则永远卡在旧锁 + TARGET_LOST_HOVER
+        //   实现:在 for loop 开始前一次性扫描,后续 O(1) 查表。
+        std::set<uint64_t> alive_cluster_ids;
+        for (const auto& cluster : msg->targets) {
+            alive_cluster_ids.insert(cluster.cluster_id);
+        }
+
         // === 遍历所有 alive cluster,对每个独立应用 gating + 派发 ===
         for (const auto& cluster : msg->targets) {
             // 黑名单(GS attack_cmd action=1/2 推入的 label + 位置名单)
@@ -2889,9 +2907,40 @@ public:
             //   会指向已"stale"的旧 cluster,UAV 飞向错位置,attack_cmd 拿到的是旧坐标。
             // 解法:同 label 已锁 → 把 lock 转移到当前 cluster,持续刷新位置。
             //   这等价于"没有聚类时每帧 YOLO 命中都重新锁"的旧行为,只是入口变成 cluster。
+            // === 2026-08-03 修:stale cluster 拒绝 transfer ===
+            //   旧 bug:transfer 路径无 stale 检查,把 locked_cluster_last_seen_us_ 写成
+            //   stale 时间戳 → 下个 tick 立即 TARGET_LOST_HOVER → waypoint_executor
+            //   收到 stop,guidance 关了没 resume → 飞机滞空 → failsafe。
+            //   (首次锁 stale 在下方 case 头部已拦,这里是同 label 转移路径的对应拦)
+            // === 2026-08-03 修:距离去抖 — transfer 距离阈值 ===
+            //   旧 bug:FOV 里同时有多个同 label 目标(A, B 距离 5m),YOLO 在两者间
+            //   反复切换 → cluster_id 也反复变化 → transfer 路径把 locked_cluster_*
+            //   来回覆盖到 A/B 位置 → 制导指令跳来跳去(虽然 One Euro Filter 在
+            //   targetEstPoseCallback 层有平滑,但跳变太密时残差仍大)。
+            //   修法:new cluster 与当前 locked_cluster_* 距离 < report_dedup_radius_m_ * 0.5
+            //   (约 12.5m) → 不 transfer,保持原锁,让 target_estimator primary_target
+            //   继续指旧 cluster 收位置,One Euro 平滑自然吸掉小幅抖动。
+            //   例外:locked_cluster_id_==0(从未锁)或新 cluster 距离远超阈值(旧目标
+            //   真走了)→ 仍允许 transfer,避免被卡死。
+            bool transfer_distance_ok = true;
+            if (locked_cluster_id_ != 0) {
+                const double dx = cluster.ned_x - locked_cluster_ned_x_;
+                const double dy = cluster.ned_y - locked_cluster_ned_y_;
+                const double transfer_dist = std::hypot(dx, dy);
+                const double transfer_threshold = report_dedup_radius_m_ * 0.5;
+                if (transfer_dist < transfer_threshold) {
+                    // 距离太近,认为"还是同一个目标,只是 cluster_id 在抖",不 transfer
+                    transfer_distance_ok = false;
+                }
+            }
             if (current_work_mode_ == WorkMode::SEARCH_TRACK &&
                 tracked_target_.is_valid &&
-                tracked_target_.yolo_label == cluster.label) {
+                tracked_target_.yolo_label == cluster.label &&
+                !is_strike_stale &&
+                !is_guidance_active_ &&  // 2026-08-03:guidance 已在飞时不允许 transfer,
+                                          //   否则 triggerStrike 后下一帧 transfer 改锁
+                                          //   → targetEstPoseCallback 收新位置 → 飞走
+                transfer_distance_ok) {
                 // 转移到新 cluster(可能 cluster_id 与上帧不同,只要 label 一致就 transfer)
                 multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
                 tracked_target_.latest     = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
@@ -3092,6 +3141,93 @@ public:
                 break;
             }
             case WorkMode::SEARCH_TRACK: {
+                // === 2026-08-03 修:stale 短路 — 不要锁 stale cluster,否则 80ms 内必然
+                //   TARGET_LOST_HOVER → waypoint_executor 收到 stop + guidance 关
+                //   但没人发 resume → UAV 滞空 → failsafe (典型复现:cluster 在 FOV 边缘
+                //   短暂命中后失锁,stale 6.92s 仍被首次上报豁免(>=5s 才 skip report),
+                //   SEARCH_TRACK case 旧版无 stale 守门 → 直接锁 + 启动 guidance)。
+                //   与下方 SEARCH_STRIKE 头部 is_strike_stale 拦截对齐。 ===
+                if (is_strike_stale) {
+                    // 复用上方 STALE-strike log 的 cluster_age 信息,这里仅点出"锁拒绝"语义
+                    ROS_WARN_THROTTLE(2.0,
+                        "[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK stale "
+                        "(last_seen_us set but >strike_max=%.2fs) → skip lock, keep scanning "
+                        "(will retry when YOLO produces a fresh hit)",
+                        cluster.cluster_id, cluster.label.c_str(),
+                        max_strike_cluster_age_sec_);
+                    break;
+                }
+                // === 2026-08-03 修:换 label 拒绝 — 锁定 A 后不能被 B 静默覆盖 ===
+                //   旧 bug:case 体内无"已锁 label"守卫,UAV 朝向位置有多个目标时,
+                //   任意一个 fresh 的、不同 label 的 cluster 进 dispatch 路径都会直接
+                //   setLockState + startGuidanceApproach,覆盖原 tracked_target_。
+                //   GS 看到的 tracking_state 还在报旧 label,用户点打时 triggerStrike
+                //   用最新 locked_cluster_*(已经被 B 覆盖),UAV 飞向 B,GS 端以为打的是 A。
+                //   修法:已锁 label_X,新 cluster label_Y != X → 跳过,等用户显式 ignore
+                //   (AttackCmd action=1) 或新 task_flow 触发取消跟踪后再锁下一个。
+                //   例外:tracked_target_.is_valid=false(打完/ignore/失锁恢复后)允许首次锁。
+                // === 2026-08-03 修:已锁任何 label 拒绝 — 让 transfer 路径处理同 label ===
+                //   进一步收紧:即使同 label,case 体也不该再锁一次(会被 FOV 里同 label
+                //   多目标 A/B 反复覆盖)。transfer 路径(L2892)在 case 之前已经按
+                //   "距离 > report_dedup_radius_m_*0.5"判断过:
+                //     - 距离够:旧目标真走了,transfer 路径已 continue,这里到不了
+                //     - 距离不够:目标没变,只是 cluster_id 在抖,保持原锁
+                //   所以 case 体只要检测 is_valid=true 就一律 break,任何覆盖都
+                //   由 transfer 路径决定,避免双锁路径打架。
+                if (tracked_target_.is_valid) {
+                    // === 2026-08-03: 区分"旧目标还在 FOV" vs "已离开" ===
+                    //   旧目标 cluster_id 仍在 alive_cluster_ids 中 → 同 label 的 transfer
+                    //     路径已经处理(距离阈值),case 体不重复锁
+                    //   旧目标 cluster_id 不在 alive_cluster_ids 中 → 目标已离开 estimator
+                    //     聚类,transfer 路径看不到旧 cluster,无法 transfer;此时如果还
+                    //     break,会永远卡在旧锁 + TARGET_LOST_HOVER
+                    //   → 允许 case 体锁新目标(类比"打完/ignore 后重新锁")
+                    // === 2026-08-03 修:guidance 阶段禁止 case 体重锁 ===
+                    //   旧 bug:triggerStrike 启动 guidance 后 phase=GUIDANCE_STRIKE,
+                    //   locked_cluster_* 仍指向 triggerStrike 当时的 cluster,但下一次
+                    //   clusterStatesCallback 看到旧 cluster 已离开 FOV,走"已离开"分支
+                    //   重新锁新 cluster → locked_cluster_* 被覆盖 → targetEstPoseCallback
+                    //   收到新位置 → guidance 飞向新目标(用户感觉"自己飞走了")。
+                    //   修法:guidance 已经在飞(is_guidance_active_=true)时一律拒绝 case
+                    //   体改锁,让 guidance 按 triggerStrike 锁定的目标飞完;旧目标真丢了
+                    //   走 target_lost_hold_sec_ 路径自然处理 TARGET_LOST_HOVER。
+                    if (is_guidance_active_) {
+                        if (tracked_target_.yolo_label != cluster.label) {
+                            ROS_WARN_THROTTLE(2.0,
+                                "[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK: guidance "
+                                "already active, ignoring different label='%s' (lock on '%s')",
+                                cluster.cluster_id, cluster.label.c_str(),
+                                cluster.label.c_str(),
+                                tracked_target_.yolo_label.c_str());
+                        }
+                        break;
+                    }
+                    const bool old_still_alive = (locked_cluster_id_ != 0) &&
+                        alive_cluster_ids.count(locked_cluster_id_) > 0;
+                    if (old_still_alive) {
+                        if (tracked_target_.yolo_label != cluster.label) {
+                            ROS_WARN_THROTTLE(2.0,
+                                "[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK: already locked "
+                                "on label='%s' (cluster_id=%lu still alive) → skip different label "
+                                "(use AttackCmd action=1 ignore or new task_flow to switch)",
+                                cluster.cluster_id, cluster.label.c_str(),
+                                tracked_target_.yolo_label.c_str(),
+                                static_cast<unsigned long>(locked_cluster_id_));
+                        }
+                        // 同 label:transfer 路径已按距离阈值处理,到这里说明被 transfer 拒绝
+                        // (距离太近,目标没变,只是 cluster_id 在抖)。一律 break — 不让
+                        // case 体再次锁,避免双锁路径打架。
+                        break;
+                    }
+                    // 旧目标已离开 + guidance 未在跑 → 落到下面正常锁新目标。
+                    // 发一次性 log 让 GS 能看到换锁时刻。
+                    ROS_WARN_THROTTLE(2.0,
+                        "[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK: previous lock "
+                        "on label='%s' (cluster_id=%lu) is no longer alive → re-lock to new target",
+                        cluster.cluster_id, cluster.label.c_str(),
+                        tracked_target_.yolo_label.c_str(),
+                        static_cast<unsigned long>(locked_cluster_id_));
+                }
                 // 搜索跟踪 — 锁目标 + 发 tracking_state,**不上报** DetectTarget
                 // 把 cluster 数据构造为 DetectTarget 缓存到 tracked_target_.latest,
                 // 供后续 attackCmdCallback (action=0/1/2) 构造上行 dt 使用
@@ -4388,6 +4524,14 @@ public:
 
     void stopSetpointPublisher() {
         setpoint_running_ = false;
+        // === 2026-08-03: 清掉所有 latch 标志,避免 setpoint 停了但标志还残留 ===
+        //   之前 stop 只清 setpoint_running_,attack_hover_setpoint_latched_ 和
+        //   target_lost_hover_setpoint_latched_ 留着 — 下次 taskFlowCallback 或
+        //   enterHoldState 等流程 stop+restart 时,startSetpointPublisher() 看到
+        //   setpoint_running_=false 会启新线程,但 latch 标志污染会让上游误判
+        //   "已经被我启过 / 我拥有这个 setpoint 流"。
+        attack_hover_setpoint_latched_        = false;
+        target_lost_hover_setpoint_latched_   = false;
         if (setpoint_thread_.joinable()) {
             setpoint_thread_.join();
         }
@@ -4782,8 +4926,9 @@ public:
             double age = (now.toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
             if (age > target_lost_hold_sec_) {
                 ROS_WARN("[MissionManager] Target lost in guidance (cluster=%lu age=%.1fs > hold=%.1fs) "
-                         "→ TARGET_LOST_HOVER",
-                         (unsigned long)locked_cluster_id_, age, target_lost_hold_sec_);
+                         "→ TARGET_LOST_HOVER (will re-try up to resume=%.1fs, then resume segment scan)",
+                         (unsigned long)locked_cluster_id_, age, target_lost_hold_sec_,
+                         target_lost_resume_sec_);
                 current_phase_                = MissionPhase::PHASE_TARGET_LOST_HOVER;
                 target_lost_hover_active_     = true;
                 target_lost_hover_enter_time_ = now;
@@ -4791,6 +4936,32 @@ public:
                 std_msgs::String stop_cmd;
                 stop_cmd.data = "stop";
                 waypoint_control_pub_.publish(stop_cmd);
+
+                // === 2026-08-03: 启 setpoint publisher 锁当前位置 ===
+                //   旧的"disableGuidance + stop"会让 PX4 OFFBOARD 500ms~1s 内失流
+                //   → AUTO.LAND failsafe,UAV 永远等不到 target_lost_resume_sec_ 的
+                //   resume 分支。复用 attack_hover 同样的 latch 模式:起 50Hz 位置
+                //   setpoint,锁当前 pose 维持 OFFBOARD 心跳。
+                //   若 setpoint_running_ 已经是 true(例如 attack_hover 启的),直接
+                //   复用,只置 latch 标志以便 resume 时知道是自己启的。
+                if (!setpoint_running_ && is_pose_received_) {
+                    startSetpointPublisher();
+                    takeoff_setpoint_.pose.position.x = current_pose_.pose.position.y;  // y_ned → x_enu (east)
+                    takeoff_setpoint_.pose.position.y = current_pose_.pose.position.x;  // x_ned → y_enu (north)
+                    takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z; // 当前高度 (NED z 取反)
+                    target_lost_hover_setpoint_latched_ = true;
+                    ROS_WARN("[MissionManager] TARGET_LOST_HOVER setpoint publisher latched at current pose "
+                             "(pos=%.2f,%.2f, alt=%.2f) — will hover %.1fs waiting for re-acquire",
+                             takeoff_setpoint_.pose.position.x,
+                             takeoff_setpoint_.pose.position.y,
+                             takeoff_setpoint_.pose.position.z,
+                             target_lost_resume_sec_);
+                } else if (setpoint_running_) {
+                    // 已被 attack_hover 等其他 latch 占用,只标自己的位
+                    target_lost_hover_setpoint_latched_ = true;
+                    ROS_WARN("[MissionManager] TARGET_LOST_HOVER: setpoint publisher already running (attack_hover?), "
+                             "reuse it for OFFBOARD heartbeat during hover");
+                }
                 publishMissionState();
             }
         } else if (current_phase_ == MissionPhase::PHASE_TARGET_LOST_HOVER &&
@@ -4812,9 +4983,21 @@ public:
                 tracked_target_.is_valid  = false;
                 publishPrimaryTarget(0);  // estimator 回退最高置信度
                 current_phase_            = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                // === 2026-08-03: 停 setpoint publisher,让 waypoint_executor 接管 ===
+                //   顺序:先发 resume 给 waypoint_executor(让它开始发速度 setpoint),
+                //   再停本节点自己的 setpoint publisher — 两路 setpoint 不能并存,
+                //   但 waypoint_executor resume 后会从 stop 状态切回正常发速度,
+                //   mission_manager 这边 setpoint publisher 立即停也不会有真空
+                //   (OFFBOARD 收到下一帧 waypoint_executor 速度 setpoint 接管)。
                 std_msgs::String resume_cmd;
                 resume_cmd.data = "resume";
                 waypoint_control_pub_.publish(resume_cmd);
+                if (target_lost_hover_setpoint_latched_) {
+                    target_lost_hover_setpoint_latched_ = false;
+                    if (setpoint_running_) {
+                        stopSetpointPublisher();
+                    }
+                }
                 publishMissionState();
             }
         }
