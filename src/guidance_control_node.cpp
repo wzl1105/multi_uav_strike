@@ -283,10 +283,17 @@ public:
         //   (beta 让截止频率随 dx/dt 升高,反而放行稳态摆动).
         //   新默认值 0.5Hz + beta=0.001 把 1 Hz+ 成分削掉 ~12 dB,
         //   PN 输出的 0.3 m/s std 摆动会被压到 ~0.05 m/s.
+        // === 2026-08-04: 再降 min_cutoff + 升 beta, 进一步压 vz/vx 中频抖动 ===
+        //   背景:target_estimated_pose 10Hz + 0.2m std → PN 输出 0.144/0.184 m/s 单帧跳变。
+        //   新默认值 0.25Hz + beta=0.02:
+        //     - 0.25Hz 截止频率把 0.5-1Hz 中频成分再削 6dB
+        //     - beta=0.02 让突然加速(d|v|/dt 大)时截止频率升到 ~1-2Hz,仍能跟上
+        //       目标切换 / STRIKE 启动初期的大速度变化
+        //   d_cutoff 1.0→0.5:导数估计更平滑,beta 放大截止频率时不会"毛刺"瞬时打开。
         double vel_min_cutoff, vel_beta, vel_d_cutoff;
-        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 0.5);
-        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.001);
-        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   1.0);
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 0.25);
+        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.02);
+        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   0.5);
         vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
