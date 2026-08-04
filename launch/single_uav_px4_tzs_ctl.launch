@@ -185,7 +185,6 @@
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
 
- 
   <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
@@ -210,6 +209,7 @@
       <param name="neighbor_timeout"      value="5.0" />
     </node>
   </group>
+
 
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->

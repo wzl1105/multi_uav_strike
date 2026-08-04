@@ -86,3 +86,16 @@ attack_wp2_look_delay_sec: 2.0
 # 105 阶段尚未到达 WP1 或延时内时的云台默认俯仰角(度,正值=下视,GS 语义)。
 # 默认 0=水平;非零可让云台保持搜索姿态等 WP1
 attack_gimbal_look_default_pitch_deg: 0.0
+
+# === CODEX DIRECT-LOOK START ===
+# Attack(105) 收到后先保持当前位置，机头偏航朝 WP2，云台只调整俯仰朝 WP2。
+# 连续 3 帧同一有效 cluster（已通过 WP2 距离、target_type 和新鲜度门控）后
+# 直接进入原有 strike guidance；超时没有确认则完整回退原 WP1→WP2 航点逻辑。
+attack_direct_look_enabled: true
+# 从开始转动机头/云台算起的总预检窗口（秒）。
+attack_direct_look_timeout_sec: 4.0
+# 前段只用于机头和云台稳定，不累计检测帧（秒）。
+attack_direct_look_settle_sec: 1.5
+# 用户确认要求：同一 cluster 必须连续检测 3 帧。
+attack_direct_look_confirm_hits: 3
+# === CODEX DIRECT-LOOK END ===
