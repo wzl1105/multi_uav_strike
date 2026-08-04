@@ -48,6 +48,7 @@ add_message_files(
   ClusterState.msg
   TargetFilterDebug.msg     # 2026-07-16: 位置/速度滤波前后对比(debug)
   GuidancePnDebug.msg       # 2026-07-31: PN 坐标/LOS/速度链路诊断
+  YxStatus.msg              # 2026-08-03: YX 设备 485 通信状态上报
 )
 
 # 消息生成的依赖项
@@ -165,13 +166,26 @@ target_link_libraries(uav_avoidance_node
 add_dependencies(uav_avoidance_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 # 10. 电源信息板通信节点
-add_executable(power_interact_node 
+add_executable(power_interact_node
   src/power_interact_node.cpp
 )
-target_link_libraries(power_interact_node 
+target_link_libraries(power_interact_node
   ${catkin_LIBRARIES}
 )
 add_dependencies(power_interact_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+
+# 11. YX 弹药载荷 485 通信节点(2026-08-03 新增)
+#     - /dev/ttyS3 115200 半双工 RS-485
+#     - GPIO1-C2 高发低收
+#     - payload_type=7 (NHY_PAYLOAD_TYPE_MUNITION)
+#     - 不进 systemd 自启动,launch 由用户在板子自启动脚本里调用
+add_executable(yx_comm_node
+  src/yx_comm_node.cpp
+)
+target_link_libraries(yx_comm_node
+  ${catkin_LIBRARIES}
+)
+add_dependencies(yx_comm_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 # ========== 安装可执行文件和脚本 ==========
 install(TARGETS
@@ -184,6 +198,8 @@ install(TARGETS
   mission_manager_node
   waypoint_distributor_node
   uav_avoidance_node
+  power_interact_node
+  yx_comm_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
