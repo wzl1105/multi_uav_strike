@@ -223,6 +223,20 @@ struct SkillRuntime {
     double                   attack_point_lat_ = 0.0;
     double                   attack_point_lon_ = 0.0;
     double                   attack_point_alt_ = 0.0;
+
+    // === CODEX DIRECT-LOOK START ===
+    // Attack(105) 收到后先原地朝 WP2 观察。预检期间尚未把 Skill 下发给
+    // waypoint_executor，避免飞机先向 WP1 窜动；超时后再原样下发旧路径。
+    bool                     direct_look_attempted_ = false;
+    bool                     direct_look_active_ = false;
+    // 三帧确认后为 true：Attack Skill 已装载进 executor，但 guidance 正在接管。
+    // 用它允许 WP1 前继续刷新锁定 cluster，并在真丢失回退时恢复当前 Attack 路径。
+    bool                     direct_strike_committed_ = false;
+    ros::Time                direct_look_start_time_;
+    uint64_t                 direct_look_cluster_id_ = 0;
+    uint64_t                 direct_look_last_seen_us_ = 0;
+    int                      direct_look_consecutive_hits_ = 0;
+    // === CODEX DIRECT-LOOK END ===
 };
 
 // === Phase 5: 目标锁定状态(供 attack_cmd 决��前置) ===
@@ -478,6 +492,14 @@ private:
     double attack_wp2_look_delay_sec_;
     //   105 阶段尚未到达 WP1 或延时内时的云台默认俯仰角(度,正值=下视,GS 语义)。
     double attack_gimbal_look_default_pitch_deg_;
+
+    // === CODEX DIRECT-LOOK START ===
+    // Attack(105) 直视预检参数。云台只控制俯仰，水平朝向由位置 setpoint 的 yaw 完成。
+    bool   attack_direct_look_enabled_;
+    double attack_direct_look_timeout_sec_;
+    double attack_direct_look_settle_sec_;
+    int    attack_direct_look_confirm_hits_;
+    // === CODEX DIRECT-LOOK END ===
 
     // 螺旋接近参数
     double spiral_approach_radius_;
@@ -966,6 +988,17 @@ public:
         nh_private_.param<double>("attack_wp2_look_delay_sec",      attack_wp2_look_delay_sec_,      2.0);
         nh_private_.param<double>("attack_gimbal_look_default_pitch_deg",
                                                                 attack_gimbal_look_default_pitch_deg_, 0.0);
+        // === CODEX DIRECT-LOOK START ===
+        nh_private_.param<bool>("attack_direct_look_enabled",
+                                attack_direct_look_enabled_, true);
+        nh_private_.param<double>("attack_direct_look_timeout_sec",
+                                  attack_direct_look_timeout_sec_, 4.0);
+        nh_private_.param<double>("attack_direct_look_settle_sec",
+                                  attack_direct_look_settle_sec_, 1.5);
+        nh_private_.param<int>("attack_direct_look_confirm_hits",
+                               attack_direct_look_confirm_hits_, 3);
+        attack_direct_look_confirm_hits_ = std::max(1, attack_direct_look_confirm_hits_);
+        // === CODEX DIRECT-LOOK END ===
     }
 
     void initSubscribers() {
@@ -2129,6 +2162,63 @@ public:
                 return;  // 等下次 tick
             }
         }
+
+        // === CODEX DIRECT-LOOK START ===
+        // Attack(105) 首次下发前先原地直视 WP2。这里故意不 publish waypoint_skill：
+        // 预检成功由 guidance 直接接管；预检超时后 direct_look_attempted_=true，
+        // 下一次进入本函数会继续执行下方原有 publish，完整保留 WP1→WP2 逻辑。
+        // 已有有效跟踪/制导时保留原 cooperative Attack 接管语义，不能起 position hold
+        // 与正在发布的 guidance 速度抢控制；直视预检只服务于“尚未锁定目标”的 Attack。
+        if (sr.msg.skill_type == 105 && attack_direct_look_enabled_ &&
+            !is_guidance_active_ && !tracked_target_.is_valid &&
+            !sr.direct_look_attempted_) {
+            sr.direct_look_attempted_ = true;
+            if (!is_pose_received_ || !is_gps_received_ ||
+                sr.msg.skill_area_path.poses.empty()) {
+                ROS_WARN("[MissionManager] Attack direct-look skipped: pose=%s gps=%s WP2=%s; "
+                         "falling back to original WP1->WP2 path",
+                         is_pose_received_ ? "ready" : "missing",
+                         is_gps_received_ ? "ready" : "missing",
+                         sr.msg.skill_area_path.poses.empty() ? "missing" : "ready");
+            } else {
+                startSetpointPublisher();
+                // startSetpointPublisher 默认 z=0.5；预检必须覆盖为当前高度，做到真正原地保持。
+                takeoff_setpoint_.pose.position.x = current_pose_.pose.position.y;  // NED y -> ENU east
+                takeoff_setpoint_.pose.position.y = current_pose_.pose.position.x;  // NED x -> ENU north
+                takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z; // NED down -> ENU up
+
+                // 云台没有 yaw 能力：用机头 yaw 指向 WP2。GPS 差得到 NED bearing，
+                // 再转换成 MAVROS position setpoint 使用的 ENU yaw。
+                const auto& wp2 = sr.msg.skill_area_path.poses.back();
+                const double north = gpsDeltaN(current_gps_.latitude, wp2.pose.position.x);
+                const double east  = gpsDeltaE(current_gps_.longitude, wp2.pose.position.y,
+                                               current_gps_.latitude);
+                const double yaw_ned = std::atan2(east, north);
+                const double yaw_enu = M_PI_2 - yaw_ned;
+                const double half = 0.5 * yaw_enu;
+                takeoff_setpoint_.pose.orientation.x = 0.0;
+                takeoff_setpoint_.pose.orientation.y = 0.0;
+                takeoff_setpoint_.pose.orientation.z = std::sin(half);
+                takeoff_setpoint_.pose.orientation.w = std::cos(half);
+
+                sr.direct_look_active_ = true;
+                sr.direct_look_start_time_ = ros::Time::now();
+                sr.direct_look_cluster_id_ = 0;
+                sr.direct_look_last_seen_us_ = 0;
+                sr.direct_look_consecutive_hits_ = 0;
+                sr.state = SkillState::TRANSIT;
+                sr.state_enter_time = sr.direct_look_start_time_;
+                sr.last_event = "TRANSIT: Attack direct-look precheck";
+                current_work_mode_ = WorkMode::SEARCH_STRIKE;
+                attack_hover_setpoint_latched_ = true;
+                ROS_WARN("[MissionManager] Attack(105) DIRECT_LOOK started: hold current position, "
+                         "nose+gimbal -> WP2, settle=%.1fs timeout=%.1fs confirm=%d frames",
+                         attack_direct_look_settle_sec_, attack_direct_look_timeout_sec_,
+                         attack_direct_look_confirm_hits_);
+                return;
+            }
+        }
+        // === CODEX DIRECT-LOOK END ===
         // 推到 executor。若上一条 gather 正在 HOLDING,先发布新 skill 让 executor
         // 建好速度 setpoint 源,再停 mission_manager 的 position-hold,避免 OFFBOARD 真空。
         const bool handoff_from_holding =
@@ -2763,8 +2853,13 @@ public:
         if (current_skill_index_ >= skill_queue_.size()) {
             return;
         }
-        const auto& sr = skill_queue_[current_skill_index_];
-        if (sr.state != SkillState::IN_TASK) {
+        auto& sr = skill_queue_[current_skill_index_];
+        const bool direct_look = (sr.msg.skill_type == 105 && sr.direct_look_active_);
+        const bool direct_strike_tracking =
+            (sr.msg.skill_type == 105 && sr.direct_strike_committed_ &&
+             (is_guidance_active_ || current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE));
+        const bool direct_pre_wp = direct_look || direct_strike_tracking;
+        if (sr.state != SkillState::IN_TASK && !direct_pre_wp) {
             return;
         }
         if (sr.msg.skill_type != 102 && sr.msg.skill_type != 105) {
@@ -2778,7 +2873,16 @@ public:
         //                              1=第一条到了开始飞第二条) — 见 executeSegmentFlight:730-732
         //   所以 skill_idx >= 1 = "至少到过第一条"
         //   skill_total=0(空 skill_area)跳过此门控,按 SEARCH 无搜索区场景处理
-        if (!latest_wp_status_ || latest_wp_status_->skill_id != sr.msg.skill_id) {
+        // === CODEX DIRECT-LOOK START ===
+        // 直视预检发生在 Skill 尚未下发、尚未到达 WP1 的窗口，因此只对这个明确子阶段
+        // 绕过 waypoint status / skill_idx 门控；正常 Search 和回退后的 Attack 完全沿用旧门控。
+        if (direct_look &&
+            (ros::Time::now() - sr.direct_look_start_time_).toSec() <
+                attack_direct_look_settle_sec_) {
+            return;  // 先给机头与云台留出稳定时间，不把转动途中的掠过检测计入三帧
+        }
+        if (!direct_pre_wp &&
+            (!latest_wp_status_ || latest_wp_status_->skill_id != sr.msg.skill_id)) {
             // 2026-07-29 B3:之前这里静默 return,排查时无法判断为什么 cluster_states
             //   全部被丢。加 WARN_THROTTLE 一眼看到 skill_id 不匹配窗口期。
             ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster callback gated: wp_status "
@@ -2788,7 +2892,7 @@ public:
                               sr.msg.skill_id.c_str());
             return;
         }
-        if (latest_wp_status_->skill_total > 0 &&
+        if (!direct_pre_wp && latest_wp_status_->skill_total > 0 &&
             latest_wp_status_->skill_idx < 1) {
             ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster callback gated: UAV not yet at "
                               "first skill_area (skill_idx=%u / skill_total=%u), "
@@ -2796,6 +2900,7 @@ public:
                               latest_wp_status_->skill_idx, latest_wp_status_->skill_total);
             return;
         }
+        // === CODEX DIRECT-LOOK END ===
 
         // === Gating 2: 1Hz 节流 dedup 清理(避免每帧遍历) ===
         cleanupReportedClusters();
@@ -3297,6 +3402,43 @@ public:
         if (sr.msg.skill_type == 105 &&
             current_work_mode_ == WorkMode::SEARCH_STRIKE &&
             attack_best != nullptr) {
+            // === CODEX DIRECT-LOOK START ===
+            // 直视阶段必须是同一 cluster 连续三帧都通过：新鲜度、WP2 距离门和
+            // target_type 路由均已在上方候选收集处验证。cluster_id 变化立即重新计数。
+            if (direct_look) {
+                if (sr.direct_look_cluster_id_ == attack_best->cluster_id &&
+                    attack_best->last_seen_us > sr.direct_look_last_seen_us_) {
+                    ++sr.direct_look_consecutive_hits_;
+                } else if (sr.direct_look_cluster_id_ != attack_best->cluster_id) {
+                    sr.direct_look_cluster_id_ = attack_best->cluster_id;
+                    sr.direct_look_consecutive_hits_ = 1;
+                } else {
+                    // cluster_states 重复快照不算新检测帧；等待 last_seen_us 真正刷新。
+                    return;
+                }
+                sr.direct_look_last_seen_us_ = attack_best->last_seen_us;
+                ROS_WARN("[MissionManager] Attack DIRECT_LOOK Cluster[%lu] confirmed %d/%d frames",
+                         static_cast<unsigned long>(attack_best->cluster_id),
+                         sr.direct_look_consecutive_hits_, attack_direct_look_confirm_hits_);
+                if (sr.direct_look_consecutive_hits_ < attack_direct_look_confirm_hits_) {
+                    return;
+                }
+                sr.direct_look_active_ = false;
+                sr.direct_strike_committed_ = true;
+                ROS_WARN("[MissionManager] Attack DIRECT_LOOK confirmed Cluster[%lu] for %d "
+                         "consecutive frames -> direct strike (skip WP1)",
+                         static_cast<unsigned long>(attack_best->cluster_id),
+                         attack_direct_look_confirm_hits_);
+
+                // 先把当前 Attack 的 WP1->WP2 队列装入 executor，再由下面
+                // triggerStrike()->startGuidanceApproach() 立即 stop。这样目标若之后
+                // 真实丢失，resume 的是当前 Attack，而不是上一条 Search(102) 队列。
+                sr.state = SkillState::PENDING;
+                sr.state_enter_time = ros::Time::now();
+                sr.last_event = "DIRECT_LOOK confirmed: preload Attack path before guidance";
+                pushCurrentSkillToExecutor();
+            }
+            // === CODEX DIRECT-LOOK END ===
             ROS_WARN("[MissionManager] Attack(105) target_type=0x%x picked best: "
                      "Cluster[%lu] label=%s d_wp2=%.1fm (candidates=%zu)",
                      sr.msg.target_type,
@@ -3305,6 +3447,11 @@ public:
             // 直接复用 case 体内的 processSearchStrikeStrike(锁+gate+publish+strike)
             //   锁前已过滤 stale(collect 段),所以这里 is_strike_stale=false
             processSearchStrikeStrike(*attack_best, sr);
+        } else if (direct_look) {
+            // 当前快照没有任何合格候选，不满足“连续帧”，下一次从 1 重新累计。
+            sr.direct_look_cluster_id_ = 0;
+            sr.direct_look_last_seen_us_ = 0;
+            sr.direct_look_consecutive_hits_ = 0;
         }
     }
 
@@ -4239,10 +4386,13 @@ public:
         // (新 flow 首发不是 takeoff 时),导致 phase=HOLDING 但 publisher 已停,此时必须重启+衔接。
         // 否则会出现两 setpoint 源同时停的真空间隙,PX4 COM_OFFBOARD_LOSS_TIMEOUT → AUTO.LAND failsafe。
         if (current_phase_ == MissionPhase::PHASE_HOLDING && setpoint_running_) {
-            // 已经在 HOLDING 且 publisher 活着,只刷一下 z 跟随当前高度即可
-            if (is_pose_received_) {
-                takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
-            }
+            // === CODEX HOLD-ALTITUDE-LATCH START ===
+            // 已经在 HOLDING 且 publisher 活着时必须保持首次进入 HOLDING 锁存的 z。
+            // 旧逻辑每个 10Hz tick 都用当前高度覆盖 setpoint：飞机瞬时下沉一点，
+            // 目标高度也跟着降低，形成持续向下的“棘轮”。这里直接返回，不再改 z。
+            // 新 TaskFlow 会先 stopSetpointPublisher()；下一次真正进入 HOLDING 时
+            // setpoint_running_=false，仍会走下方首次锁存分支记录新的当前高度。
+            // === CODEX HOLD-ALTITUDE-LATCH END ===
             return;
         }
         current_phase_ = MissionPhase::PHASE_HOLDING;
@@ -4900,10 +5050,114 @@ public:
                           skillStateStr(sr.state).c_str(),
                           missionPhaseToString().c_str());
         if (current_skill_index_ >= skill_queue_.size()) return;
+        // === CODEX DIRECT-LOOK START ===
+        // 先处理预检超时；超时函数会原样下发 Skill 并切回标准 TRANSIT。
+        advanceAttackDirectLook();
+        // === CODEX DIRECT-LOOK END ===
+
+        // === CODEX DIRECT-LOOK START ===
+        // 直接打击到达目标阈值后，接回原 Skill 的标准收尾：
+        // EXIT_PENDING -> COMPLETE -> HOLDING，不能继续压到地面后再恢复 WP1。
+        completeDirectStrikeIfReached();
+        // === CODEX DIRECT-LOOK END ===
+
+        // === CODEX DIRECT-LOOK START ===
+        // Skill 与 control 是两个 ROS topic，跨 topic 不保证首次 publish 的到达顺序。
+        // 直视打击期间每个 10Hz tick 重发 stop，确保刚装载的 Attack 队列不会与
+        // guidance 同时输出速度；队列仍完整保留，真丢失时才允许 resume。
+        if (current_skill_index_ < skill_queue_.size()) {
+            const SkillRuntime& active = skill_queue_[current_skill_index_];
+            if (active.direct_strike_committed_ && is_guidance_active_) {
+                std_msgs::String stop_cmd;
+                stop_cmd.data = "stop";
+                waypoint_control_pub_.publish(stop_cmd);
+            }
+        }
+        // === CODEX DIRECT-LOOK END ===
         advanceSkillStateMachine();
         // Attack(105) 专用 tick:门控重试 + 同步时间重算 + 挂起超时放弃
         advanceAttackPhaseMachine();
     }
+
+    // === CODEX DIRECT-LOOK START ===
+    /**
+     * 直视打击命中判定。
+     * current_pose_ 是 NED (North,East,Down)，locked_cluster_* 实际是 NWU
+     * (North,West,Up)，统一到 NWU 后计算三维距离。达到既有
+     * strike_distance_threshold_（common.yaml 默认 2m）即按正常 Skill 完成收尾。
+     */
+    void completeDirectStrikeIfReached() {
+        if (current_skill_index_ >= skill_queue_.size()) return;
+        SkillRuntime& sr = skill_queue_[current_skill_index_];
+        if (!sr.direct_strike_committed_ || !is_guidance_active_ ||
+            locked_cluster_id_ == 0 || !is_pose_received_) return;
+
+        const double uav_north = current_pose_.pose.position.x;
+        const double uav_west  = -current_pose_.pose.position.y;
+        const double uav_up    = -current_pose_.pose.position.z;
+        const double dx = uav_north - locked_cluster_ned_x_;
+        const double dy = uav_west  - locked_cluster_ned_y_;
+        const double dz = uav_up    - locked_cluster_ned_alt_;
+        const double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (distance > strike_distance_threshold_) return;
+
+        ROS_WARN("[MissionManager] Attack DIRECT_STRIKE reached target: distance=%.2fm <= %.2fm; "
+                 "finishing Attack via EXIT_PENDING -> COMPLETE -> HOLDING",
+                 distance, strike_distance_threshold_);
+
+        // 先关闭 velocity guidance，再由 enterHoldState 启当前位置 setpoint，保持
+        // OFFBOARD 连续且不再让已预装的 WP1->WP2 队列恢复执行。
+        disableGuidance();
+        std_msgs::String stop_cmd;
+        stop_cmd.data = "stop";
+        waypoint_control_pub_.publish(stop_cmd);
+
+        sr.direct_strike_committed_ = false;
+        sr.state = SkillState::EXIT_PENDING;
+        sr.state_enter_time = ros::Time::now();
+        sr.last_event = "DIRECT_STRIKE reached target -> EXIT_PENDING";
+        current_task_status_ = TaskStatus::STRIKE_EXECUTED;
+        attack_strike_phase_active_ = false;
+        target_lost_hover_active_ = false;
+        target_lost_hover_setpoint_latched_ = false;
+        current_target_.is_locked = false;
+        current_target_.is_detected = false;
+        tracked_target_.is_valid = false;
+        locked_cluster_id_ = 0;
+        locked_cluster_last_seen_us_ = 0;
+        setLockState(TrackLockState::NOT_LOCKED);
+        publishPrimaryTarget(0);
+        enterHoldState();
+        publishMissionState();
+    }
+    // === CODEX DIRECT-LOOK END ===
+
+    // === CODEX DIRECT-LOOK START ===
+    /** Attack(105) 原地直视预检超时：没有连续三帧有效目标就无损回退 WP1→WP2。 */
+    void advanceAttackDirectLook() {
+        if (current_skill_index_ >= skill_queue_.size()) return;
+        SkillRuntime& sr = skill_queue_[current_skill_index_];
+        if (!sr.direct_look_active_) return;
+        if ((ros::Time::now() - sr.direct_look_start_time_).toSec() <
+            attack_direct_look_timeout_sec_) return;
+
+        sr.direct_look_active_ = false;
+        sr.direct_look_cluster_id_ = 0;
+        sr.direct_look_last_seen_us_ = 0;
+        sr.direct_look_consecutive_hits_ = 0;
+        sr.state = SkillState::PENDING;
+        sr.state_enter_time = ros::Time::now();
+        sr.last_event = "Attack direct-look timeout: fallback to WP1->WP2";
+        ROS_WARN("[MissionManager] Attack DIRECT_LOOK timeout after %.1fs: no 3-frame target, "
+                 "falling back to original WP1->WP2 path",
+                 attack_direct_look_timeout_sec_);
+
+        // 先让 executor 建立速度 setpoint 源，再停止 position hold，避免 OFFBOARD 指令真空。
+        pushCurrentSkillToExecutor();
+        attack_hover_setpoint_latched_ = false;
+        if (setpoint_running_) stopSetpointPublisher();
+    }
+    // === CODEX DIRECT-LOOK END ===
 
     void advanceSkillStateMachine() {
         if (current_skill_index_ >= skill_queue_.size()) return;
@@ -4981,6 +5235,9 @@ public:
                 locked_cluster_ned_alt_   = 0.0;
                 locked_cluster_time_      = ros::Time();
                 tracked_target_.is_valid  = false;
+                // 直视打击真实丢失并完成等待后，切回标准 Attack 航点门控。
+                // executor 此时已缓存当前 WP1->WP2，resume 后从 WP1 正常开始。
+                sr.direct_strike_committed_ = false;
                 publishPrimaryTarget(0);  // estimator 回退最高置信度
                 current_phase_            = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 // === 2026-08-03: 停 setpoint publisher,让 waypoint_executor 接管 ===
@@ -5615,6 +5872,10 @@ public:
     }
 
     void handleSearchTrack() {
+        // TARGET_LOST_HOVER 必须由 advanceSkillStateMachine 的 10s 恢复计时管理。
+        // 禁止本 handler 在进入 hover 的同一 tick 因 is_guidance_active_=false
+        // 立即清锁并 resume，从而绕过悬停等待。
+        if (target_lost_hover_active_) return;
         // 搜索即跟踪模式
         // 如果已启动制导，不应再设置 waypoint 模式
         if (is_guidance_active_) {
@@ -5671,6 +5932,8 @@ public:
     }
 
     void handleSearchStrike() {
+        // 同 handleSearchTrack：目标丢失悬停期间不能立即恢复航点。
+        if (target_lost_hover_active_) return;
         // 搜索即打击模式
         // 如果已启动制导，不应再设置 waypoint 模式
         if (is_guidance_active_) {
@@ -6020,7 +6283,13 @@ public:
         //   advanceSkillStateMachine / 102 IN_TASK 入口已写入的值不变。
         if (current_skill_index_ < skill_queue_.size()) {
             const SkillRuntime& sr = skill_queue_[current_skill_index_];
-            if (sr.state == SkillState::IN_TASK && sr.msg.skill_type == 105) {
+            if (sr.msg.skill_type == 105 && sr.direct_look_active_) {
+                // === CODEX DIRECT-LOOK START ===
+                // 云台本身无偏航能力：水平角由上面的机头 yaw setpoint 承担，
+                // 此处只复用现有几何解算，让云台俯仰直接朝 WP2。
+                current_gimbal_pitch_ = computePitchDegToWp2(sr);
+                // === CODEX DIRECT-LOOK END ===
+            } else if (sr.state == SkillState::IN_TASK && sr.msg.skill_type == 105) {
                 const ros::Time now = ros::Time::now();
                 if (attack_strike_phase_active_) {
                     current_gimbal_pitch_ = computePitchDegToPrimaryCluster();
