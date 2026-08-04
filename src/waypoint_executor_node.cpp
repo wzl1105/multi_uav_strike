@@ -37,7 +37,9 @@
 #include <geometry_msgs/PointStamped.h>
 #include <nav_msgs/Path.h>
 #include <std_msgs/String.h>
+#include <std_msgs/Bool.h>     // 2026-08-05: /guidance/enable 订阅
 #include <std_msgs/Int16.h>
+#include <multi_uav_strike/WorkMode.h>  // 2026-08-05: typed work_mode 订阅
 #include <sensor_msgs/NavSatFix.h>
 #include <mavros_msgs/HomePosition.h>
 #include <mavros_msgs/State.h>
@@ -71,6 +73,8 @@ private:
     ros::Subscriber self_pose_sub_;          // 本机位置（NED）
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
+    ros::Subscriber mission_mode_typed_sub_; // === 2026-08-05: typed WorkMode(mission/mode 老 topic 已删) ===
+    ros::Subscriber guidance_enable_sub_;    // === 2026-08-05: /guidance/enable — 用于 OFFBOARD 心跳 ===
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
 
     // ============== 发布 ==============
@@ -107,6 +111,7 @@ private:
     size_t current_waypoint_index_;
     bool is_waypoints_received_;
     bool is_executing_;
+    bool is_guidance_active_ = false;       // === 2026-08-05: /guidance/enable 状态 ===
 
     // === Phase 4: 分段航点状态(必须放在 Waypoint 之后)===
     enum class SegmentPhase { IDLE, ARRIVE, SKILL_AREA, HOLD, COMPLETE };
@@ -454,6 +459,29 @@ public:
             "mission/mode", 10,
             &WaypointExecutor::missionModeCallback, this);
 
+        // === 2026-08-05: typed WorkMode(老的 std_msgs/String "mission/mode" 已删) ===
+        //   mission_manager 直接把内部 enum cast 成 uint8 发布到 /mission/current_work_mode:
+        //     SEARCH_ONLY=1, SEARCH_TRACK=2, SEARCH_STRIKE=3, DENIED_ENV_FLIGHT=4
+        //   没有这个订阅的话 current_work_mode_ 永远停在初始 "SEARCH_ONLY",
+        //   legacy 路径检查 `current_work_mode_ != "SEARCH_ONLY"` 永远 FALSE,
+        //   waypoint_executor 在 SEARCH_TRACK / SEARCH_STRIKE 阶段继续发 setpoint_velocity,
+        //   与 guidance_control_node 在 cmd_vel_unstamped 上叠加导致 PX4 OFFBOARD 震荡。
+        mission_mode_typed_sub_ = nh_.subscribe(
+            "mission/current_work_mode", 10,
+            &WaypointExecutor::missionModeTypedCallback, this);
+
+        // === 2026-08-05: 订阅 /guidance/enable 控制 OFFBOARD 心跳 ===
+        //   背景:8/5 02:55 bag 中,work_mode 从 SEARCH_TRACK 切到 SEARCH_ONLY 用 18 秒
+        //   (期间 takeoff 阶段 waypoint_executor 的 work_mode_typed_sub 路径返回,
+        //   没有任何 publisher 发 setpoint_velocity,>500ms 触发 PX4 OFFBOARD lost failsafe。
+        //   修法:订阅 /guidance/enable,当 guidance enable=true 时
+        //   (mission_manager 启动 strike/track 时)waypoint 完全停发,把通道让给 guidance。
+        //   当 guidance enable=false 时(takeoff / hover / search flight),waypoint 必须
+        //   持续发 (即使是 0) 维持 OFFBOARD 心跳,否则触发 failsafe。
+        guidance_enable_sub_ = nh_.subscribe(
+            "guidance/enable", 10,
+            &WaypointExecutor::guidanceEnableCallback, this);
+
         if (lidar_building_avoidance_enabled_) {
             lidar_measurement_sub_ = nh_.subscribe(
                 "lidar/measurement", 10, &WaypointExecutor::lidarMeasurementCallback, this);
@@ -698,16 +726,27 @@ public:
             return;
         }
 
+        // === 2026-08-05: guidance enable 时 waypoint 完全停发 ===
+        //   避免与 guidance_control_node 在 setpoint_velocity/cmd_vel_unstamped
+        //   上叠加(实测 7/16 bag 攻击切换窗口 1 秒内两个 publisher 交替穿插,
+        //   触发 PX4 OFFBOARD 速度震荡 → 飞手接管后 AUTO.LAND failsafe)
+        if (is_guidance_active_) {
+            // guidance 在飞,waypoint 静默(只保留 status/current_target 上报)
+            publishWaypointStatus();
+            publishCurrentTarget();
+            return;
+        }
+
         // === Phase 4: 分段航点执行(若 active skill)===
         if (segment_phase_ == SegmentPhase::ARRIVE ||
             segment_phase_ == SegmentPhase::SKILL_AREA) {
             // 衔接修复:attack/track handoff 时 mission_manager 发 "stop" → stop() 把
             //   is_executing_ 置 false(但保留 segment_phase_ 和航点队列以便 resume)。
-            //   必须在这里拦截,否则 50Hz 定时器仍会调 executeSegmentFlight() 发非零速度,
-            //   与 guidance_control 的 setpoint 冲突,导致 PX4 OFFBOARD 看到速度跳变。
-            //   老路径(下方 SEARCH_ONLY 分支)本来就检查 is_executing_,但 Phase 4 漏了。
+            //   旧版这里只 return 不发,实测 8/5 02:55 bag 触发 27 秒 cmd_vel gap → failsafe。
+            //   修法:!is_executing_ 时也 publishZeroVelocity() 维持 OFFBOARD 心跳
+            //   (0 速度不让 PX4 触发 lost-link),等 search/track 路径接管。
             if (!is_executing_) {
-                //publishZeroVelocity();
+                publishZeroVelocity();  // === 2026-08-05 修:解注释,OFFBOARD 心跳 ===
                 publishWaypointStatus();  // 仍上报(mission_manager 门控依赖)
                 publishCurrentTarget();   // 仍上报(uav_avoidance 用)
                 return;
@@ -723,10 +762,15 @@ public:
         // 兼容老路径:只有 SEARCH_ONLY 模式下才发航点控制指令
         // 其他模式(SEARCH_TRACK/SEARCH_STRIKE/IDLE)由 guidance_control_node 接管
         if (current_work_mode_ != "SEARCH_ONLY") {
+            // === 2026-08-05 修:work_mode != SEARCH_ONLY 但 guidance 也未启,
+            //   持续发 0 维持 OFFBOARD 心跳,避免 8/5 02:55 bag 那样的 failsafe
+            publishZeroVelocity();
             return;
         }
 
         if (!is_executing_ || !is_waypoints_received_) {
+            // === 2026-08-05 修:无航点但 guidance 未启,发 0 维持心跳 ===
+            publishZeroVelocity();
             return;
         }
 
@@ -1118,6 +1162,40 @@ public:
     }
 
     // ============== 模式回调 ==============
+
+    // === 2026-08-05: /guidance/enable 回调 ===
+    //   决定 waypoint_executor 是否继续发 setpoint_velocity:
+    //   - true:  guidance_control 接管了,waypoint 必须停,否则两个 publisher
+    //           在 setpoint_velocity 上叠加会导致 PX4 速度震荡
+    //   - false: 没有 guidance,waypoint 必须持续发(允许 0 速度)维持 OFFBOARD 心跳
+    void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
+        is_guidance_active_ = msg->data;
+    }
+
+    // === 2026-08-05: typed WorkMode 回调(替代已删的 String topic) ===
+    //   与 missionModeCallback 完全相同的逻辑,只把 uint8 转成对应字符串名
+    //   mission_manager 的 WorkMode.msg 用 enum 常量:
+    //     uint8 SEARCH_ONLY=3, SEARCH_TRACK=4, SEARCH_STRIKE=5 ... (跟 .msg 文件定义)
+    //   但 mission_manager publishCurrentWorkMode() 直接 cast 内部 enum:
+    //     internal SEARCH_ONLY=1 → uint8 1, SEARCH_TRACK=2 → 2, SEARCH_STRIKE=3 → 3
+    //   所以订阅端按 uint8 值映射即可,不依赖 .msg 常量文本。
+    void missionModeTypedCallback(const multi_uav_strike::WorkMode::ConstPtr& msg) {
+        // mission_manager 用 static_cast<uint8_t>(current_work_mode_) 直接发,
+        // 内部枚举顺序:IDLE=0, SEARCH_ONLY=1, SEARCH_TRACK=2, SEARCH_STRIKE=3, DENIED_ENV_FLIGHT=4
+        std::string new_mode;
+        switch (msg->mode) {
+            case 0: new_mode = "IDLE";              break;
+            case 1: new_mode = "SEARCH_ONLY";       break;
+            case 2: new_mode = "SEARCH_TRACK";      break;
+            case 3: new_mode = "SEARCH_STRIKE";     break;
+            case 4: new_mode = "DENIED_ENV_FLIGHT"; break;
+            default: new_mode = "UNKNOWN";          break;
+        }
+        // 直接复用 missionModeCallback 的逻辑(复用 stop / publishZeroVelocity 行为)
+        std_msgs::String legacy_msg;
+        legacy_msg.data = new_mode;
+        missionModeCallback(boost::make_shared<std_msgs::String const>(legacy_msg));
+    }
 
     void missionModeCallback(const std_msgs::String::ConstPtr& msg) {
         std::string new_mode = msg->data;

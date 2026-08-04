@@ -133,6 +133,13 @@ private:
     multi_uav_strike::OneEuroFilter1D vel_filter_y_;
     multi_uav_strike::OneEuroFilter1D vel_filter_z_;
     multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
+    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 5) — PN 输入 LPF ===
+    //   target_estimated_pose 在 10Hz 发布,带 0.2m std 噪声(target_estimator EMA α=0.1 后
+    //   还会有 ~0.05m 残余)。PN 50Hz 调用时在帧边界阶跃,los_yaw_rate 单帧最大 ~0.04 rad/s。
+    //   对 target 输入再加一层 1Hz OneEuro 滤波,代价 ~0.1s 滞后,STRIKE 时间窗够用。
+    multi_uav_strike::OneEuroFilter1D target_filter_x_;
+    multi_uav_strike::OneEuroFilter1D target_filter_y_;
+    multi_uav_strike::OneEuroFilter1D target_filter_z_;
     ros::Time                    vel_filter_last_time_;
     // 目标位置突变超过此值时，在 targetPoseCallback 内、下一次 PN 计算之前重置滤波器。
     static constexpr double kTargetSwitchJumpM = 5.0;
@@ -141,6 +148,24 @@ private:
     double last_target_pos_y_  = 0.0;
     double last_target_pos_z_  = 0.0;
     bool   last_target_pos_valid_ = false;
+    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 6) — cluster stale 软兜底 ===
+    //   target_estimated_pose 没新消息 → cluster 已 stale,UAV 不该再激进 chase
+    //   last_known 位置(否则单帧噪声会被 PN 当成新信号反馈到 body)
+    //   threshold 0.5s:target_estimator 10Hz,正常每 0.1s 一帧;0.5s 才有新意
+    ros::Time last_target_update_time_;
+    static constexpr double kClusterStaleThresholdSec = 0.5;
+    bool cluster_stale_latch_ = false;  // 进入过 stale(避免反复 warn)
+
+    // === 2026-08-05: STRIKE 反馈环解耦 (Handover 修复) ===
+    //   waypoint_executor 在 STRIKE 接管前最后发的速度(5.14, -0.81, -1.61) 与 PN 接管后
+    //   第一帧 (2.83, 0.19, 0) 差距很大。如果 OneEuro filter 从 x_prev=0 开始,
+    //   会先塌陷到 0.33 m/s 再爬回 5.27,过程中 yaw rate 也会饱和摆动。
+    //   修法:guidance enable 时用 UAV 当前实际速度初始化 filter,x_prev 跳过 0 状态。
+    geometry_msgs::Vector3 last_known_uav_velocity_ned_;  // pose-delta 计算
+    geometry_msgs::Point   prev_uav_pos_ned_;
+    ros::Time               prev_uav_pos_time_;
+    bool                    has_prev_uav_pos_   = false;
+    bool                    was_enabled_prev_   = false;
 
     // STRIKE模式参数
     double strike_min_altitude_;      // 开始下降的最小高度阈值
@@ -298,6 +323,13 @@ public:
         vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        // === 2026-08-04: target 输入 OneEuro (Layer 5) ===
+        //   比速度通道更激进(1Hz 截止,β=0.005) — target 是被动态调度的源,不是输出,
+        //   过度平滑会让"目标切换/位置突变"延迟;但 STRIKE 中目标相对静止,
+        //   把 0.05-0.1m 残余抖到稳态后,后续 0.5s 内基本无变化,极强 LPF 即可。
+        target_filter_x_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
+        target_filter_y_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
+        target_filter_z_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
         vel_filter_last_time_ = ros::Time();
         ROS_INFO("[Guidance] Vel cmd OneEuro: min_cutoff=%.2fHz beta=%.3f d_cutoff=%.2fHz",
                  vel_min_cutoff, vel_beta, vel_d_cutoff);
@@ -410,6 +442,16 @@ public:
         const double ny = msg->pose.position.y;
         const double nz = msg->pose.position.z;
 
+        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 5) — PN 输入 OneEuro LPF ===
+        //   target_estimator EMA α=0.1 后残余噪声 ~0.05m,10Hz 发布在 50Hz PN 调用
+        //   帧边界产生 0.04 rad/s los_rate 阶跃 → v_lateral 单帧 ~6m/s 跳变(被 nav_ratio 限幅)。
+        //   对 nx/ny/nz 加 1Hz OneEuro,稳态 std 砍 ~70%,首跳 ≤0.1s 滞后可接受。
+        const double fx = target_filter_x_.filter(nx, msg->header.stamp.toSec());
+        const double fy = target_filter_y_.filter(ny, msg->header.stamp.toSec());
+        const double fz = target_filter_z_.filter(nz, msg->header.stamp.toSec());
+
+        // Jump detection below uses raw values (nx/ny/nz) — keeps it independent of LPF lag.
+
         // === 2026-07-31: 目标位置突变(>5m)→ 同步 reset 滤波器 ===
         //   在 targetPoseCallback 内做检测的好处: resetLosFilter() 与
         //   上一次 PN computeCommand 之间没有其它 computeCommand → 首帧
@@ -427,6 +469,9 @@ public:
                 vel_filter_y_.reset();
                 vel_filter_z_.reset();
                 vel_filter_yaw_.reset();
+                target_filter_x_.reset();
+                target_filter_y_.reset();
+                target_filter_z_.reset();
                 if (current_strategy_type_ ==
                     multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
                     guidance_strategy_) {
@@ -447,7 +492,12 @@ public:
         last_target_pos_valid_ = true;
 
         current_target_pose_ = *msg;
+        current_target_pose_.pose.position.x = fx;
+        current_target_pose_.pose.position.y = fy;
+        current_target_pose_.pose.position.z = fz;
         is_target_pose_received_ = true;
+        // === 2026-08-04: Layer 6 — 记录最后更新时刻 ===
+        last_target_update_time_ = ros::Time::now();
     }
 
     void targetTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
@@ -499,6 +549,20 @@ public:
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;
         is_uav_pose_received_ = true;
+
+        // === 2026-08-05: 用 pose delta 估算 UAV 速度(NED),Handover 修复用 ===
+        //   mavros 没订阅 velocity_local,用相邻两帧 pose 差分计算,精度够 Handover 初始化用
+        if (has_prev_uav_pos_) {
+            const double dt = (msg->header.stamp - prev_uav_pos_time_).toSec();
+            if (dt > 0.001 && dt < 0.5) {
+                last_known_uav_velocity_ned_.x = (current_uav_pose_.pose.position.x - prev_uav_pos_ned_.x) / dt;
+                last_known_uav_velocity_ned_.y = (current_uav_pose_.pose.position.y - prev_uav_pos_ned_.y) / dt;
+                last_known_uav_velocity_ned_.z = (current_uav_pose_.pose.position.z - prev_uav_pos_ned_.z) / dt;
+            }
+        }
+        prev_uav_pos_ned_ = current_uav_pose_.pose.position;
+        prev_uav_pos_time_ = msg->header.stamp;
+        has_prev_uav_pos_ = true;
     }
 
     void losAngleCallback(const geometry_msgs::Point::ConstPtr& msg) {
@@ -515,9 +579,32 @@ public:
         is_enabled_ = msg->data;
         if (is_enabled_) {
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance ENABLED (mode: %s)", current_mode_.c_str());
+            // === 2026-08-05: Handover 修复 — 用 UAV 当前速度初始化 OneEuro filter ===
+            //   防止 waypoint→guidance 交接时 OneEuro 从 x_prev=0 起步,
+            //   输出塌陷再爬升(~0.94s 抖动窗口)
+            // 直接给 filter 内部状态赋值,跳过第一帧"从 0 收敛"的过渡
+            if (has_prev_uav_pos_) {
+                vel_filter_x_.x_prev      = last_known_uav_velocity_ned_.x;
+                vel_filter_y_.x_prev      = last_known_uav_velocity_ned_.y;
+                vel_filter_z_.x_prev      = last_known_uav_velocity_ned_.z;
+                // yaw rate filter:waypoint 阶段 wz=-0.6 是个控制量,但 P-controller
+                //   在 STRIKE 里只用 yaw_err 算新 wz,旧的 yaw rate 不重要,留 0 即可
+                vel_filter_yaw_.x_prev   = 0.0;
+                vel_filter_x_.initialized = true;
+                vel_filter_y_.initialized = true;
+                vel_filter_z_.initialized = true;
+                vel_filter_yaw_.initialized = true;
+                vel_filter_x_.dx_prev = vel_filter_y_.dx_prev = vel_filter_z_.dx_prev = vel_filter_yaw_.dx_prev = 0.0;
+                ROS_WARN_THROTTLE(2.0,
+                    "[Guidance] Handover seed: v_NED=(%.2f,%.2f,%.2f) m/s",
+                    last_known_uav_velocity_ned_.x,
+                    last_known_uav_velocity_ned_.y,
+                    last_known_uav_velocity_ned_.z);
+            }
         } else {
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
+        was_enabled_prev_ = is_enabled_;
     }
 
     void modeCallback(const std_msgs::String::ConstPtr& msg) {
@@ -741,11 +828,36 @@ public:
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
+                    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 6) — cluster stale 软兜底 ===
+                    //   target_estimated_pose 0.5s 没更新 → cluster 已 stale
+                    //   强行用 last_known 位置 chase,会让 PN 输出残影速度,反馈到 body 噪声。
+                    //   此处降速到 cruise 的 1/3,避免在 stale 期间把任何微小位置变化
+                    //   当成新信号放大成大速度指令(已经在 Layer 3-5 平滑,但 stale 阶段
+                    //   仍可能因为新一次 EMA α=0.1 后又来新位置触发完整 chase)。
+                    bool cluster_stale = (last_target_pos_valid_ &&
+                        (ros::Time::now() - last_target_update_time_).toSec() >
+                         kClusterStaleThresholdSec);
+                    if (cluster_stale && !cluster_stale_latch_) {
+                        ROS_WARN_THROTTLE(1.0, "[Guidance] STRIKE cluster stale for >%.1fs, "
+                                              "entering soft-fallback (reduced speed, dead-reckoning)",
+                                              kClusterStaleThresholdSec);
+                    }
+                    cluster_stale_latch_ = cluster_stale;
+
                     auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
                     auto cmd = strategy->computeCommand(
                         current_uav_pose_,
                         current_target_pose_,
                         current_target_twist_);
+                    // === Layer 6: stale 期间把 radial_speed/lateral 限速到 1/3 ===
+                    //   cmd.velocity 是 3D 矢量,直接按比例缩放最干净;导航方向不变,
+                    //   只是"信心"降低 → 慢点飞,让真实 cluster 有时间回来或 mission_manager
+                    //   走 TARGET_LOST_HOVER 接管。
+                    if (cluster_stale) {
+                        cmd.velocity.x() *= 0.33;
+                        cmd.velocity.y() *= 0.33;
+                        cmd.velocity.z() *= 0.33;
+                    }
                     // InterceptGuidance 输出已经是 NED；这里不能再按 NWU 翻转 Y/Z。
                     // 旧链路的二次翻转会让 East 反向，并把目标在下方时的 D+ 下降量钳成 0。
                     vel_cmd.linear.x = cmd.velocity.x();
