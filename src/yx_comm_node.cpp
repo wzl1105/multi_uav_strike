@@ -429,8 +429,8 @@ private:
         frame[6] = 0x00; frame[7] = 0x00;   // E 预留
         // CRC16/MODBUS over bytes[2..7] = 6 bytes
         uint16_t crc = crc16Modbus(frame + 2, 6);
-        frame[8] = (crc >> 8) & 0xFF;   // 高字节在前
-        frame[9] = (crc     ) & 0xFF;
+        frame[8] = (crc     ) & 0xFF;   // 低字节在前 (MODBUS 标准序,与 YX 端对齐)
+        frame[9] = (crc >> 8) & 0xFF;
 
         // 切发送 → 发送 → 切接收
         gpio_.writeValue(1);
