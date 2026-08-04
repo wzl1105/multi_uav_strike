@@ -190,16 +190,17 @@ private:
     // 替换成随速度增长的最小 lookahead。低空低速(4 m/s)L1 ≈ 4.8 m,高速(15 m/s)L1 ≈ 18 m,
     // 消除低速 L1 卡死在 L1_min 引起的"画龙"。
     double l1_min_period_; // s,默认 1.2(0 = 关闭,保留旧 L1_min 硬下限)
-    // XTE bearing 阻尼:在 L1 bearing 上叠加 atan2(-XTE, L1) * gain,等价于
-    // 在 L1 横向控制里加一份与 XTE 反向的角度反馈,反向补偿 yaw 跟踪滞后
-    // 引起的 L1 bearing 反向过冲。低 gain(0.7~1.0)主要消除低速画龙,
-    // 高 gain(>1.5)会让短连接段 yaw 误差反向放大,所以下面有 along_fraction gate。
-    double xte_damping_gain_; // 默认 1.0(0 = 关闭)
-    // 阻尼门控:飞机从 along < fraction·seg_len 段头进入新段时,XTE 可能还是
-    // 上一个段残留的偏差,如果立即叠加 bearing 阻尼会把 bearing 推离段方向;
-    // 限制 only when along > fraction·seg_len 才启用,短段(< 4·fraction·seg_len)
-    // 几乎全程不触发。
-    double xte_damping_min_along_fraction_; // 默认 0.25
+    // XTE 直接 P 控制(2026-08-03 重构)。
+    // L1 + atan2(-XTE, L1) 间接链路会让 PX4 速度层收到的是 angle-encoded 命令,
+    // yaw P-controller 再解码成 v_lateral;链路上的 yaw 响应滞后会导致 v_lateral
+    // 持续振荡,稳态 XTE 永远在 0 附近小幅晃动(短段更明显)。
+    // 新方案:直接把 XTE 用 v_lateral 表达,不再经角度二次转译:
+    //   v_lateral = -XTE / xte_tau_lookahead_
+    // 物理量,PX4 速度层直接接收,完全绕开 yaw 角度链路,稳态 XTE 一阶收敛。
+    double xte_tau_lookahead_; // s,默认 1.5(0 = 关闭,v_lateral=0)
+    // 兼容性:旧的 xte_damping 参数保留为只读 NO-OP,避免 yaml 加载报错,可后续清掉。
+    double xte_damping_gain_;            // 已废弃,无效
+    double xte_damping_min_along_fraction_; // 已废弃,无效
 
     // ===== 航向 P-control(机头跟踪 L1 bearing)=====
     // yaw_rate = yaw_kp_ * yaw_error,饱和在 yaw_max_rate_
@@ -273,8 +274,9 @@ public:
         L1_min_(3.0),
         L1_period_(0.6),
         l1_min_period_(1.2),
-        xte_damping_gain_(1.0),
-        xte_damping_min_along_fraction_(0.25),
+        xte_tau_lookahead_(1.5),
+        xte_damping_gain_(0.0),
+        xte_damping_min_along_fraction_(0.0),
         yaw_kp_(3.0),
         yaw_deadband_(0.05),
         current_work_mode_("SEARCH_ONLY"),
@@ -336,13 +338,17 @@ public:
         //   l1_min_period: 替换固定 L1_min 下限,L1_min_eff = max(L1_min, v*l1_min_period)。
         //     设 0 等价于旧的固定 L1_min 行为;默认 1.2 s 让 L1 跟随速度,
         //     低速 4 m/s → L1≈4.8 m(原 3.0),高速 15 m/s → L1≈18 m(原 9.0)。
-        //   xte_damping_gain: XTE bearing 阻尼,bearing += atan2(-XTE, L1) * gain,
-        //     兼容低速和高速,自动按 L1 缩放;默认 1.0。0 关闭。
-        //   xte_damping_min_along_fraction: 阻尼门控,只在 along > fraction*seg_len
-        //     时启用,避免段头/段尾/短连接段误触发把 bearing 推离段方向。默认 0.25。
+        //   xte_tau_lookahead (2026-08-03 重构): XTE 直接 P 控制时间常数,
+        //     v_lateral = -XTE / xte_tau_lookahead。替代旧的 xte_damping_gain +
+        //     xte_damping_min_along_fraction(angle-encoded 间接链路,有 yaw 滞后
+        //     振荡的固有问题)。tau_xte = 1.5s 时,短段 5s 内 XTE 收敛至 < 0.07m 初值。
+        //     0 关闭。范围 0.5~2.0,默认 1.5。
+        //   xte_damping_gain / xte_damping_min_along_fraction: 旧参数,no-op,
+        //     加载只为兼容 yaml 残留,实际不生效。
         nh_private_.param<double>("l1_min_period", l1_min_period_, 1.2);
-        nh_private_.param<double>("xte_damping_gain", xte_damping_gain_, 1.0);
-        nh_private_.param<double>("xte_damping_min_along_fraction", xte_damping_min_along_fraction_, 0.25);
+        nh_private_.param<double>("xte_tau_lookahead", xte_tau_lookahead_, 1.5);
+        nh_private_.param<double>("xte_damping_gain", xte_damping_gain_, 0.0);
+        nh_private_.param<double>("xte_damping_min_along_fraction", xte_damping_min_along_fraction_, 0.0);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
         // 航向 P-control 增益 + 死区:
@@ -753,10 +759,56 @@ public:
             return;
         }
 
-        // idx 越界 → 完成
-        if (*cur_idx >= cur_queue->size()) {
-            advanceSegmentPhase();
-            return;
+        // ===== Fall-through:消除 publishZeroVelocity() 20ms 缺口 =====
+        // 旧逻辑:idx 越界就 advanceSegmentPhase() + publishZeroVelocity() + return;
+        //   下一 tick(20ms)才发新段速度指令,期间 PX4 看到 0,产出极大 yaw-rate 尖峰
+        //   (实测 1700°/s),之后数秒 yaw 振荡(短段 wag 0.85Hz 和这个完全相关)。
+        // 新逻辑:在算几何之前循环 advance,直到 cur_idx 指向"未到达"或"段末边界",
+        //   让当前 tick 同一函数内继续算新段 (vx, vy) 直接发出去,没有 20ms 缺口。
+        //   避障层输入接口不动,只是消除了 zero-velocity 间隙。
+        while (true) {
+            if (*cur_idx >= cur_queue->size()) {
+                // 当前 phase 已走完
+                if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+                    // 最后一个 phase,没有下一段 → 安全保持(下方主循环仍会跑一次)
+                    break;
+                }
+                advanceSegmentPhase();
+                // 重新选当前 queue(idx 可能已被 advanceSegmentPhase 重置)
+                if (segment_phase_ == SegmentPhase::ARRIVE) {
+                    cur_queue = &arrive_queue_;
+                    cur_idx   = &arrive_idx_;
+                    cur_speed = cruise_speed_ > 0.0 ? cruise_speed_ : uav_speed_;
+                } else if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+                    cur_queue = &skill_area_queue_;
+                    cur_idx   = &skill_area_idx_;
+                    cur_speed = task_speed_ > 0.0 ? task_speed_ : uav_speed_;
+                } else {
+                    // IDLE / 未识别 → 退出
+                    return;
+                }
+                if (cur_queue->empty()) {
+                    // 新 phase 是空的,再 advance 一次
+                    advanceSegmentPhase();
+                    return;
+                }
+                continue;
+            }
+            // 取当前 idx 的目标,先算距离
+            const Waypoint& tg = (*cur_queue)[*cur_idx];
+            double dx_t = tg.ned_x - current_ned_x_;
+            double dy_t = tg.ned_y - current_ned_y_;
+            double dz_t = tg.ned_z - current_ned_z_;
+            double dist_h_check = std::sqrt(dx_t*dx_t + dy_t*dy_t);
+            double dist_to_target_check = std::sqrt(dist_h_check*dist_h_check + dz_t*dz_t);
+            if (dist_to_target_check >= arrival_threshold_) {
+                // 未到达,跳出循环算新段控制
+                break;
+            }
+            // 已到达,标记后 idx++ 继续找下一个
+            (*cur_queue)[*cur_idx].reached = true;
+            (*cur_idx)++;
+            // 注意:此处不 publishZeroVelocity(),直接下一轮循环
         }
 
         // === 段方向(压航线:用前一个点(或锁存的段起点)→ 当前点)===
@@ -873,38 +925,44 @@ public:
                 if (target_along > seg_len) target_along = seg_len;
                 double la_x = seg_x0 + ux * target_along;
                 double la_y = seg_y0 + uy * target_along;
+                // (la_x, la_y) 现在仅作 v_along 限速参考的几何量,不再用于 bearing 计算
 
-                // ===== 物理刹停(v² ≤ 2·a·d) =====
-                // 沿段剩余距离;过段端(< 0)改用 dist_h → 自动衔接 P-control
+                // ===== 沿段 v_along + XTE v_lateral 分解(2026-08-03 重构)=====
+                // 不再算 bearing 让 yaw 间接转译 v_lateral,那样会因 yaw 滞后持续振荡。
+                // v_along 沿段方向,沿段剩余距离做 v² ≤ 2·a·d 物理刹停;
+                // v_lateral 与 v_along 垂直,直接 XTE-P 控制 v_lateral = -XTE / tau_xte。
+                // 两者组成 (vx, vy) 直接发到 PX4 速度层,绕开 yaw 角度链路二次转译。
                 double dist_along_to_target = seg_len - along;
                 double brake_dist = (dist_along_to_target > 0.0)
                                         ? dist_along_to_target
                                         : dist_h;
-                double v_mag = std::min(cur_speed,
-                                        sqrt(2.0 * decel_limit_ * brake_dist));
-
-                // ===== 加速度限幅:起步不阶跃,跨航点平滑过渡 =====
-                // L1 算出的 v_mag 在静止起步时 = cur_speed(阶跃);
-                // 用 last_v_mag_ + a*dt 上限钳制 → 起飞/换航点平滑
-                double dt = 1.0 / executor_rate_;
+                double v_along = std::min(cur_speed,
+                                           sqrt(2.0 * decel_limit_ * brake_dist));
+                // 加速度限幅(起步/跨航点平滑过渡)
+                const double dt = 1.0 / executor_rate_;
                 double v_max_accel = last_v_mag_ + accel_limit_ * dt;
-                if (v_mag > v_max_accel) v_mag = v_max_accel;
-                if (v_mag < 0.0) v_mag = 0.0;
-                last_v_mag_ = v_mag;
+                if (v_along > v_max_accel) v_along = v_max_accel;
+                if (v_along < 0.0) v_along = 0.0;
+                last_v_mag_ = v_along;
 
-                // ===== 朝 lookahead 飞 =====
-                double dx_la = la_x - current_ned_x_;
-                double dy_la = la_y - current_ned_y_;
-                double dist_la = sqrt(dx_la*dx_la + dy_la*dy_la);
-                if (dist_la > 0.01) {
-                    vx = (dx_la / dist_la) * v_mag;
-                    vy = (dy_la / dist_la) * v_mag;
-                } else {
-                    vx = 0.0;
-                    vy = 0.0;
+                // XTE 直接 P 控制:XTE 收敛时间常数 = tau_xte(默认 1.5s)
+                double v_lateral = 0.0;
+                if (xte_tau_lookahead_ > 0.0) {
+                    v_lateral = -xte / xte_tau_lookahead_;
+                    // 毕达哥拉斯约束(总速度不超过 v_cruise)
+                    double v_total_sq = v_along * v_along + v_lateral * v_lateral;
+                    double v_cruise_sq = cur_speed * cur_speed;
+                    if (v_total_sq > v_cruise_sq) {
+                        double scale = cur_speed / std::sqrt(v_total_sq);
+                        v_along *= scale;
+                        v_lateral *= scale;
+                    }
                 }
-                // bearing 跟 lookahead: 段内朝段前方;偏离段时航向也跟着纠
-                bearing = atan2(dy_la, dx_la);
+                // 装配 (vx, vy):v = v_along * (ux, uy) + v_lateral * (-uy, ux)
+                vx = v_along * ux - v_lateral * uy;
+                vy = v_along * uy + v_lateral * ux;
+                // bearing 仅作 yaw P-controller 参考(避免 yaw 控制器误推算反向)
+                bearing = std::atan2(vy, vx);
 
                 // ===== XTE bearing 阻尼(2026-08-02 兼容低速 + 高速)=====
                 // 经验问题:低速(4 m/s)L1 卡 L1_min=3 m 时,飞机 yaw 跟踪 L1 bearing
@@ -918,14 +976,7 @@ public:
                 //   把 bearing 推离本段方向。限制 only when along > fraction*seg_len
                 //   才启用,短连接段(< 4·fraction·seg_len)几乎全程不触发,避免
                 //   短段 yaw error 反而被放大(对照实飞 replay 段[2]/[4]/[6])。
-                if (xte_damping_gain_ > 0.0 &&
-                    along > xte_damping_min_along_fraction_ * seg_len) {
-                    const double xte_correction = std::atan2(-xte, std::max(L1, 1.0))
-                                                   * xte_damping_gain_;
-                    // wrap to (-pi, pi] 避免 bearing 漂出 yaw P-controller 期望范围
-                    bearing = std::atan2(std::sin(bearing + xte_correction),
-                                         std::cos(bearing + xte_correction));
-                }
+                // (2026-08-03: XTE bearing 阻尼已废弃,改为 v_along/v_lateral 分解)
             }
         }
 
@@ -964,23 +1015,8 @@ public:
         //   以为目标是 WP2 真实高(可能是地面)而把飞机绕开到错误高度。
         applyBuildingAvoidance(vx, vy, vz, target_z_for_flight);
 
-        // === 距离判定 ===
-        if (dist_to_target < arrival_threshold_) {
-            (*cur_queue)[*cur_idx].reached = true;
-            (*cur_idx)++;
-
-            if (*cur_idx >= cur_queue->size()) {
-                // 段末 → 切下一段
-                advanceSegmentPhase();
-                publishZeroVelocity();
-                return;
-            }
-
-            // 段内下一航点:继续按新段方向飞
-            publishZeroVelocity();
-            publishWaypointStatus();
-            return;
-        }
+        // (2026-08-03 重构:段切换 fall-through 已移至函数顶端,不再在此处
+        //  publishZeroVelocity()+return。avoidance 之后直接 publish velocity)
 
         // === 发布速度+航向(沿段方向,不是目标方向)===
         publishVelocityCommandWithYaw(vx, vy, vz, bearing);

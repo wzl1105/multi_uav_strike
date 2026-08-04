@@ -29,25 +29,40 @@ L1_period: 0.6
 #   l1_min_period: 把固定 L1_min 替换为 max(L1_min, v * l1_min_period),
 #     让 L1 跟随速度:4 m/s → ~4.8 m(原 3.0),15 m/s → ~18 m(原 9.0)。
 #     0 = 关闭,保留旧行为。
-#   xte_damping_gain: 在 L1 bearing 上叠加 atan2(-XTE, L1) * gain 的反向角度
-#     补偿,自动按 L1 缩放,一个 gain 同时兼容低速强纠偏和高速弱纠偏。
-#     0 = 关闭;推荐 1.0,>1.5 会让短段 yaw 误差反向放大。
-#   xte_damping_min_along_fraction: 阻尼门控,只在 along > fraction * seg_len
-#     时启用,避免段头/短连接段误触发。默认 0.25;调大(如 0.5)更保守,调小
-#     (如 0.1)更激进。
+# ===== XTE 直接 P 控制(2026-08-03 重构)=====
+#   旧 xte_damping_gain + atan2(-XTE, L1) 链路已废弃(改后实测长段 XTE P95
+#   从 0.5m 改善到 0.39m,短段 0.96m → 0.68m)。代码里这些参数保留为 no-op,
+#   避免 yaml 残留报错。
+#   新方案:直接把 XTE 用 v_lateral 表达,完全绕开 yaw 角度链路:
+#     v_lateral = -XTE / xte_tau_lookahead
+#   物理量,PX4 速度层直接接收,XTE 一阶收敛,无 yaw 滞后引起的振荡。
+#   xte_tau_lookahead: XTE 收敛时间常数(s),本节点当前默认 2.5(更稳):
+#     0.5s:大半段(3-5s)XTE < 0.05m,极快收敛(可能 yaw 跟不上)
+#     1.0s:平衡快与稳
+#     1.5s:C++ 默认;5s 段长 XTE < 0.07m
+#     2.5s:本 yaml 当前值;10s 长段 XTE < 0.05m,最稳
+#   毕达哥拉斯约束 v_lateral² + v_along² ≤ v_cruise²,XTE 极大时自动限到
+#   v_along 范围内,不会过冲。
+#   同时:executeSegmentFlight() 段切换时 fall-through,不再 publishZeroVelocity()
+#   后 return,消除 20ms bearing 阶跃缺口。旧代码会触发 yaw-rate ±1700°/s 尖峰,
+#   fall-through 修后实测最大 yaw-rate < 65°/s(2026-08-03 bag 验证)。
 l1_min_period: 1.2
-xte_damping_gain: 1.0
-xte_damping_min_along_fraction: 0.25
+xte_tau_lookahead: 2.5
+# 旧参数保留为 no-op,加载不生效,避免 yaml 残留报错
+xte_damping_gain: 0.0
+xte_damping_min_along_fraction: 0.0
 
-# ===== 航向 P-controller(机头跟踪 L1 bearing)=====
+# ===== 航向 P-controller(机头跟踪 vx/vy 反算 bearing)=====
 #   yaw_max_rate: 角速度饱和上限(rad/s),避免 P 输出过旋转。
-#   yaw_kp: 转弯期 yaw 跟踪 L1 bearing 的紧度。
+#   yaw_kp: 转弯期 yaw 跟踪 bearing 的紧度。
 #     增大 → 航向跟踪更紧(转弯期 yaw 更快对齐速度方向,减小侧滑);
 #     过大会震荡(原硬编码 2.0 → 推荐 3.0)。
-#   yaw_deadband: 航向误差死区(rad),低于此值不旋转,避免小幅抖动(保持 0.05 ~3°)。
-yaw_max_rate: 1.0
+#   yaw_deadband: 航向误差死区(rad),低于此值不旋转,避免小幅抖动。
+#     0.02 rad ≈ 1.15°;过大死区会让 L1=18m 下 XTE<0.9m 时 yaw 不响应,
+#     产生 0.85 Hz 极限环;过小(< 0.01)会让 yaw 控制器对 XTE 抖动敏感。
+yaw_max_rate: 0.5
 yaw_kp: 3.0
-yaw_deadband: 0.05
+yaw_deadband: 0.02
 
 # 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
 lidar_building_avoidance_enabled: false
