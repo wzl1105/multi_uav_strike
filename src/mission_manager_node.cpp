@@ -5069,7 +5069,12 @@ public:
             const SkillRuntime& active = skill_queue_[current_skill_index_];
             if (active.direct_strike_committed_ && is_guidance_active_) {
                 std_msgs::String stop_cmd;
-                stop_cmd.data = "stop";
+                //===================制导修改====================
+                // 原命令保留：stop()会发布零速度，10Hz重发导致制导话题周期性插零。
+                // stop_cmd.data = "stop";
+                // 改为静默交权；仍保持10Hz重发以抵御Skill/control跨topic乱序。
+                stop_cmd.data = "yield_to_guidance";
+                //===================制导修改====================
                 waypoint_control_pub_.publish(stop_cmd);
             }
         }
@@ -6033,11 +6038,22 @@ public:
                  missionPhaseToString().c_str());
 
         // 停止航点执行，避免和 guidance 冲突
-        ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
+        //===================制导修改====================
+        // 原日志保留：
+        // ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
+        ROS_WARN("[MissionManager] >>>>> yield_to_guidance about to be published to waypoint_executor");
+        //===================制导修改====================
         std_msgs::String cmd;
-        cmd.data = "stop";
+        //===================制导修改====================
+        // 原命令会让WaypointExecutor发布一次零速度：
+        // cmd.data = "stop";
+        cmd.data = "yield_to_guidance";
+        //===================制导修改====================
         waypoint_control_pub_.publish(cmd);
-        ROS_WARN("[MissionManager] >>>>> stop command published");
+        //===================制导修改====================
+        // ROS_WARN("[MissionManager] >>>>> stop command published");
+        ROS_WARN("[MissionManager] >>>>> yield_to_guidance published");
+        //===================制导修改====================
 
         // === 2026-07-30: 关 attack_hover 留下的 setpoint publisher,避免和 guidance 冲突 ===
         //   根因:UAV 到 attack_point (20m AGL) 时 mission_manager 会启动位置 setpoint publisher

@@ -21,7 +21,15 @@ image_visible_timeout_sec: 0.4
 image_reacquire_blend_sec: 0.7
 # 首轮实飞采用保守限速；不会直接使用上游异常大的 task_speed。
 image_max_speed: 5.0
-image_max_vertical_speed: 1.0
+# //===================制导修改====================
+# image_max_vertical_speed: 1.0
+image_max_vertical_speed: 3.0
+# 斜线下降：水平/垂直到达时间同步，30度为相对水平面的最大下降角。
+strike_slant_descent_enabled: true
+strike_slant_descent_max_angle_deg: 30.0
+# 1m内若仍有较大高度误差，退出斜线计算并保留垂直下降安全兜底。
+strike_slant_min_horizontal_distance_m: 1.0
+# //===================制导修改====================
 # bbox 中心死区、世界视线 EMA 以及偏航速率限制。
 image_center_deadband: 0.03
 image_ray_alpha: 0.25
@@ -39,7 +47,10 @@ strike_yaw_freeze_radius_m: 3.0
 strike_target_pose_timeout_sec: 0.5
 # IMAGE/GEO 和末端方向变化统一经过速度指令斜率限制。
 strike_max_horizontal_accel: 2.0
-strike_max_vertical_accel: 1.0
+# //===================制导修改====================
+# 原值保留：strike_max_vertical_accel: 1.0
+strike_max_vertical_accel: 1.5
+# //===================制导修改====================
 strike_max_yaw_accel: 1.0
 # //===================制导修改====================
 

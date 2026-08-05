@@ -189,7 +189,13 @@ private:
     double image_visible_timeout_sec_ = 0.4;
     double image_reacquire_blend_sec_ = 0.7;
     double image_max_speed_ = 5.0;
-    double image_max_vertical_speed_ = 1.0;
+    //===================制导修改====================
+    // 原值保留：double image_max_vertical_speed_ = 1.0;
+    double image_max_vertical_speed_ = 2.5;
+    bool strike_slant_descent_enabled_ = true;
+    double strike_slant_descent_max_angle_deg_ = 25.0;
+    double strike_slant_min_horizontal_distance_m_ = 1.0;
+    //===================制导修改====================
     double image_center_deadband_ = 0.03;
     double image_ray_alpha_ = 0.25;
     double image_yaw_kp_ = 0.6;
@@ -202,7 +208,10 @@ private:
     double strike_yaw_freeze_radius_m_ = 3.0;
     double strike_target_pose_timeout_sec_ = 0.5;
     double strike_max_horizontal_accel_ = 2.0;
-    double strike_max_vertical_accel_ = 1.0;
+    //===================制导修改====================
+    // 原值保留：double strike_max_vertical_accel_ = 1.0;
+    double strike_max_vertical_accel_ = 1.5;
+    //===================制导修改====================
     double strike_max_yaw_accel_ = 1.0;
     ros::Time last_target_pose_receive_time_;
     ros::Time strike_guidance_enable_time_;
@@ -354,7 +363,17 @@ public:
         nh_private_.param<double>("image_visible_timeout_sec", image_visible_timeout_sec_, 0.4);
         nh_private_.param<double>("image_reacquire_blend_sec", image_reacquire_blend_sec_, 0.7);
         nh_private_.param<double>("image_max_speed", image_max_speed_, 5.0);
-        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
+        //===================制导修改====================
+        // 原参数默认值保留：
+        // nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
+        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 2.5);
+        nh_private_.param<bool>("strike_slant_descent_enabled",
+                                strike_slant_descent_enabled_, true);
+        nh_private_.param<double>("strike_slant_descent_max_angle_deg",
+                                  strike_slant_descent_max_angle_deg_, 25.0);
+        nh_private_.param<double>("strike_slant_min_horizontal_distance_m",
+                                  strike_slant_min_horizontal_distance_m_, 1.0);
+        //===================制导修改====================
         nh_private_.param<double>("image_center_deadband", image_center_deadband_, 0.03);
         nh_private_.param<double>("image_ray_alpha", image_ray_alpha_, 0.25);
         nh_private_.param<double>("image_yaw_kp", image_yaw_kp_, 0.6);
@@ -370,13 +389,26 @@ public:
                                   strike_target_pose_timeout_sec_, 0.5);
         nh_private_.param<double>("strike_max_horizontal_accel",
                                   strike_max_horizontal_accel_, 2.0);
+        //===================制导修改====================
+        // 原参数默认值保留：
+        // nh_private_.param<double>("strike_max_vertical_accel",
+        //                           strike_max_vertical_accel_, 1.0);
         nh_private_.param<double>("strike_max_vertical_accel",
-                                  strike_max_vertical_accel_, 1.0);
+                                  strike_max_vertical_accel_, 1.5);
+        //===================制导修改====================
         nh_private_.param<double>("strike_max_yaw_accel", strike_max_yaw_accel_, 1.0);
         strike_slowdown_radius_m_ = std::max(
             strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
         strike_terminal_world_direction_radius_m_ = std::max(
             strike_terminal_world_direction_radius_m_, strike_horizontal_stop_radius_m_);
+        //===================制导修改====================
+        image_max_vertical_speed_ = std::max(0.1, image_max_vertical_speed_);
+        strike_max_vertical_accel_ = std::max(0.1, strike_max_vertical_accel_);
+        strike_slant_min_horizontal_distance_m_ = std::max(
+            0.1, strike_slant_min_horizontal_distance_m_);
+        strike_slant_descent_max_angle_deg_ = clampValue(
+            strike_slant_descent_max_angle_deg_, 1.0, 60.0);
+        //===================制导修改====================
         //===================制导修改====================
         //===================制导修改====================
 
@@ -896,6 +928,35 @@ public:
         return yaw_rate;
     }
 
+    //===================制导修改====================
+    double computeSlantDescentSpeed(const StrikeTargetGeometry& g,
+                                    double horizontal_speed) const {
+        // 旧逻辑是只按高度差限幅，远距离时也固定下降1m/s，水平先到后只能垂直打击：
+        // return clampValue(g.down, -image_max_vertical_speed_,
+        //                            image_max_vertical_speed_);
+        if (!strike_slant_descent_enabled_) {
+            return clampValue(g.down, -image_max_vertical_speed_,
+                                      image_max_vertical_speed_);
+        }
+
+        // 水平与垂直预计到达时间同步：vz/vh = 高度差/水平距离。
+        // 再由最大下降角和垂直速度双重限幅，避免异常目标坐标导致陡俯冲。
+        if (g.horizontal > strike_slant_min_horizontal_distance_m_ &&
+            horizontal_speed > 1e-3) {
+            const double geometric_vz = horizontal_speed * g.down / g.horizontal;
+            const double max_angle_rad = strike_slant_descent_max_angle_deg_ * M_PI / 180.0;
+            const double angle_limited_vz = horizontal_speed * std::tan(max_angle_rad);
+            const double vertical_limit = std::min(
+                image_max_vertical_speed_, std::fabs(angle_limited_vz));
+            return clampValue(geometric_vz, -vertical_limit, vertical_limit);
+        }
+
+        // 扰动导致水平已进入停止圈但高度仍未满足命中距离时，保留原垂直下降兜底。
+        return clampValue(g.down, -image_max_vertical_speed_,
+                                  image_max_vertical_speed_);
+    }
+    //===================制导修改====================
+
     void computeGeoFallbackVelocity(geometry_msgs::Twist& cmd) {
         const StrikeTargetGeometry g = strikeTargetGeometry();
         const double requested_speed = std::min(track_max_speed_, image_max_speed_);
@@ -904,9 +965,12 @@ public:
             cmd.linear.x = speed * g.north / g.horizontal;
             cmd.linear.y = speed * g.east / g.horizontal;
         }
-        // 末端下降不再除以趋近于零的水平距离，避免垂直指令数值退化。
-        cmd.linear.z = clampValue(g.down, -image_max_vertical_speed_,
-                                          image_max_vertical_speed_);
+        //===================制导修改====================
+        // 原垂直控制保留：
+        // cmd.linear.z = clampValue(g.down, -image_max_vertical_speed_,
+        //                                    image_max_vertical_speed_);
+        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        //===================制导修改====================
         if (g.horizontal > 0.1) {
             cmd.angular.z = terminalYawRate(std::atan2(g.east, g.north), g.horizontal);
         }
@@ -933,7 +997,10 @@ public:
         // NWU ray → NED ray，一次转换；发布前仍统一走 convertVelNedToEnu。
         double north = ray.x();
         double east = -ray.y();
-        const double down = -ray.z();
+        //===================制导修改====================
+        // 原图像射线垂直分量保留；新斜线下降统一使用目标三维几何，避免两套高度源跳变。
+        // const double down = -ray.z();
+        //===================制导修改====================
         double horizontal = std::hypot(north, east);
 
         // bag中8m内图像射线趋近垂直并多次换边。末端仅保留图像可见性和速度调度，
@@ -947,11 +1014,14 @@ public:
             cmd.linear.x = speed * north / horizontal;
             cmd.linear.y = speed * east / horizontal;
         }
-        // 保持受限下降；不再让水平减速同时把下降速度降为零。
-        const double descent_sign_source =
-            g.distance > 1e-3 ? g.down : (down >= 0.0 ? 1.0 : -1.0);
-        cmd.linear.z = clampValue(descent_sign_source,
-                                  -image_max_vertical_speed_, image_max_vertical_speed_);
+        //===================制导修改====================
+        // 原垂直控制保留：
+        // const double descent_sign_source =
+        //     g.distance > 1e-3 ? g.down : (down >= 0.0 ? 1.0 : -1.0);
+        // cmd.linear.z = clampValue(descent_sign_source,
+        //                           -image_max_vertical_speed_, image_max_vertical_speed_);
+        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        //===================制导修改====================
 
         if (horizontal > 0.1) {
             cmd.angular.z = terminalYawRate(std::atan2(east, north), g.horizontal);
