@@ -10,7 +10,7 @@ guidance_strategy: "intercept"   # intercept / minsnap / los
 # //===================制导修改====================
 # STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
 # pn=融合main分支增强后的比例导引；legacy_pn作为pn的兼容别名。
-strike_guidance_logic: "image_geo_fallback"
+strike_guidance_logic: "pn"
 
 # 连续新图像帧达到此数量后才允许从坐标备份切入图像导引，避免单帧闪烁。
 image_confirm_frames: 3
@@ -19,8 +19,12 @@ image_confirm_frames: 3
 image_visible_timeout_sec: 0.4
 # IMAGE/GEO 两种速度源切换时的线性混合时间。
 image_reacquire_blend_sec: 0.7
-# 首轮实飞采用保守限速；不会直接使用上游异常大的 task_speed。
+#========速度修改========
+# 保留旧参数供回退；当前 IMAGE/GEO 不再用它截断速度，水平速度直接来自 Attack task_speed。
 image_max_speed: 5.0
+# false=不按距离减速且不在1m内置零；true=恢复原10m减速/1m水平停止逻辑。
+strike_terminal_speed_schedule_enabled: false
+#========速度修改========
 # //===================制导修改====================
 # image_max_vertical_speed: 1.0
 image_max_vertical_speed: 3.0
