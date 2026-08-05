@@ -59,6 +59,7 @@
 #include "multi_uav_strike/AvoidanceCmd.h"
 #include "multi_uav_strike/LidarMeasurement.h"
 #include "multi_uav_strike/WorkMode.h"
+#include "multi_uav_strike/MissionState.h"
 
 // 安阳基准点（用于 GPS → NED 转换）
 const double ANYANG_LAT = 36.096;      // 安阳纬度
@@ -77,6 +78,7 @@ private:
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
     ros::Subscriber mission_mode_typed_sub_; // === 2026-08-05: typed WorkMode(mission/mode 老 topic 已删) ===
+    ros::Subscriber mission_state_sub_;      // 起飞阶段门控：到达指定高度后才允许速度 setpoint
     ros::Subscriber guidance_enable_sub_;    // === 2026-08-05: /guidance/enable — 用于 OFFBOARD 心跳 ===
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
     // //===================制导修改====================
@@ -232,6 +234,8 @@ private:
     // setpoint_velocity 写入零速度/零角速度，避免与起飞位置 setpoint 预热流冲突。
     mavros_msgs::State current_mavros_state_;
     bool mavros_state_received_ = false;
+    uint8_t current_mission_phase_ = 0;  // MissionState: 0=GROUND_IDLE
+    bool mission_state_received_ = false;
 
     // 仿真/真机切换
     bool use_sim_;
@@ -502,14 +506,21 @@ public:
             "mission/current_work_mode", 10,
             &WaypointExecutor::missionModeTypedCallback, this);
 
+        // mission_manager 在实际高度达到 takeoff_altitude 容差并稳定后，才把 phase
+        // 从 TAKING_OFF(1) 推进为 HOVERING(2)。在此之前禁止发布任何 velocity
+        // setpoint（包括零速度），让起飞位置 setpoint 成为 MAVROS 的唯一控制源。
+        mission_state_sub_ = nh_.subscribe(
+            "mission/state", 10,
+            &WaypointExecutor::missionStateCallback, this);
+
         // === 2026-08-05: 订阅 /guidance/enable 控制 OFFBOARD 心跳 ===
         //   背景:8/5 02:55 bag 中,work_mode 从 SEARCH_TRACK 切到 SEARCH_ONLY 用 18 秒
         //   (期间 takeoff 阶段 waypoint_executor 的 work_mode_typed_sub 路径返回,
         //   没有任何 publisher 发 setpoint_velocity,>500ms 触发 PX4 OFFBOARD lost failsafe。
         //   修法:订阅 /guidance/enable,当 guidance enable=true 时
         //   (mission_manager 启动 strike/track 时)waypoint 完全停发,把通道让给 guidance。
-        //   当 guidance enable=false 时(takeoff / hover / search flight),waypoint 必须
-        //   持续发 (即使是 0) 维持 OFFBOARD 心跳,否则触发 failsafe。
+        //   当 guidance enable=false 且起飞高度已经达标时,waypoint 必须持续发
+        //   (即使是 0) 维持 OFFBOARD 心跳；爬升阶段仍由 position setpoint 独占。
         guidance_enable_sub_ = nh_.subscribe(
             "guidance/enable", 10,
             &WaypointExecutor::guidanceEnableCallback, this);
@@ -659,15 +670,23 @@ public:
                            msg->mode.c_str(), msg->armed ? 1 : 0);
     }
 
+    void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        current_mission_phase_ = msg->phase;
+        mission_state_received_ = true;
+    }
+
     bool canPublishVelocitySetpoint() const {
         // 仿真没有 mavros/state，保持原有发布行为。
         if (use_sim_) return true;
 
-        // 真机地面阶段由 mission_manager 的 position setpoint 完成 OFFBOARD 预热和起飞；
-        // waypoint_executor 此时不得另外写 velocity setpoint（即使值全为 0）。
+        // 真机地面及起飞爬升阶段由 mission_manager 的 position setpoint 独占控制。
+        // phase=HOVERING(2) 表示实际高度已达到本次任务指定的 takeoff_altitude；
+        // 未收到 MissionState 时 fail-closed，避免节点启动乱序导致提前发布。
         return mavros_state_received_ &&
                current_mavros_state_.connected &&
-               current_mavros_state_.armed;
+               current_mavros_state_.armed &&
+               mission_state_received_ &&
+               current_mission_phase_ >= 2;
     }
 
     // ============== 回调函数 ==============
@@ -1297,7 +1316,7 @@ public:
         }
         if (!canPublishVelocitySetpoint()) {
             ROS_DEBUG_THROTTLE(2.0,
-                "[WaypointExecutor] Velocity publish blocked: FCU state unavailable/disconnected/disarmed");
+                "[WaypointExecutor] Velocity publish blocked: waiting for armed FCU and takeoff altitude");
             return;
         }
         //===================制导修改====================
@@ -1393,7 +1412,7 @@ public:
         if (guidance_has_control_) return;
         if (!canPublishVelocitySetpoint()) {
             ROS_DEBUG_THROTTLE(2.0,
-                "[WaypointExecutor] Zero velocity publish blocked: FCU state unavailable/disconnected/disarmed");
+                "[WaypointExecutor] Zero velocity publish blocked: waiting for armed FCU and takeoff altitude");
             return;
         }
         //===================制导修改====================

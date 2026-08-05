@@ -10,7 +10,7 @@ guidance_strategy: "intercept"   # intercept / minsnap / los
 # //===================制导修改====================
 # STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
 # pn=融合main分支增强后的比例导引；legacy_pn作为pn的兼容别名。
-strike_guidance_logic: "pn"
+strike_guidance_logic: "image_geo_fallback"
 
 # 连续新图像帧达到此数量后才允许从坐标备份切入图像导引，避免单帧闪烁。
 image_confirm_frames: 3

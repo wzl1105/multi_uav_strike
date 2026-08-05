@@ -2046,6 +2046,7 @@ public:
                     takeoff_failed_time_   = ros::Time();
                 }
                 current_phase_ = MissionPhase::PHASE_TAKING_OFF;
+                publishMissionState();  // 立即关闭速度门控，不能等待下一次 1Hz 定时上报
                 ROS_WARN("[MissionManager] TaskFlow Takeoff skill to phase=TAKING_OFF "
                          "(cached prev_phase=%s, prev_work_mode=%s)",
                          missionPhaseToString(phase_before_takeoff_).c_str(),
@@ -4232,6 +4233,7 @@ public:
                         takeoff_state_ = TakeoffState::TAKEOFF_HOVERING;
                         takeoff_start_time_ = ros::Time::now();
                         current_phase_ = MissionPhase::PHASE_HOVERING;  // phase 推进:TAKING_OFF → HOVERING
+                        publishMissionState();  // 高度达标后立即开放速度门控
                         ROS_WARN("[MissionManager] Takeoff altitude reached, hovering (phase=HOVERING, ramped_z=%.2f)...",
                                  ramped_z);
                     }

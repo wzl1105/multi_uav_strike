@@ -9,6 +9,7 @@
 #include <std_msgs/String.h>
 #include <mavros_msgs/Thrust.h>
 #include <mavros_msgs/HomePosition.h>
+#include <mavros_msgs/State.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 #include "multi_uav_strike/InterUavStatus.h"  // /inter_uav/uav_status 心跳(替代 other_uav_poses)
+#include "multi_uav_strike/MissionState.h"
 //===================制导修改====================
 #include "multi_uav_strike/PrimaryImageTarget.h"
 //===================制导修改====================
@@ -43,6 +45,8 @@ private:
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber heartbeat_sub_;        // 邻居心跳 /inter_uav/uav_status(替代原 other_uav_poses)
     ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
+    ros::Subscriber mavros_state_sub_;     // 真机解锁门控
+    ros::Subscriber mission_state_sub_;    // 真机起飞高度完成门控
     //===================制导修改====================
     ros::Subscriber primary_image_target_sub_;
     //===================制导修改====================
@@ -76,6 +80,11 @@ private:
     bool is_target_twist_received_ = false;
     bool is_los_received_ = false;
     bool is_real_target_received_ = false;
+    bool mavros_state_received_ = false;
+    bool mission_state_received_ = false;
+    bool mavros_connected_ = false;
+    bool mavros_armed_ = false;
+    uint8_t current_mission_phase_ = 0;
 
     // 使能控制：SEARCH_ONLY 模式下 guidance 不工作
     bool is_enabled_;
@@ -553,6 +562,15 @@ public:
             "mavros/home_position/home", 10,
             &GuidanceControlNode::homePositionCallback, this);
 
+        if (!use_sim_) {
+            mavros_state_sub_ = nh_.subscribe(
+                "mavros/state", 10,
+                &GuidanceControlNode::mavrosStateCallback, this);
+            mission_state_sub_ = nh_.subscribe(
+                "mission/state", 10,
+                &GuidanceControlNode::missionStateCallback, this);
+        }
+
         //===================制导修改====================
         primary_image_target_sub_ = nh_.subscribe(
             "guidance/primary_image_target", 10,
@@ -980,6 +998,17 @@ public:
      * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
      * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
      */
+    void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        mavros_state_received_ = true;
+        mavros_connected_ = msg->connected;
+        mavros_armed_ = msg->armed;
+    }
+
+    void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        mission_state_received_ = true;
+        current_mission_phase_ = msg->phase;
+    }
+
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
         if (ref_initialized_) return;  // 锁一次
         if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
@@ -1377,6 +1406,17 @@ public:
     //===================制导修改====================
 
     void guidanceTimerCallback(const ros::TimerEvent&) {
+        // 真机只有在 FCU 已连接、已解锁且 mission_manager 确认实际高度达到
+        // 本次 takeoff_altitude（phase >= HOVERING）后，才允许任何 velocity setpoint。
+        // 未满足时连零速度也不发布，避免与起飞 position setpoint 混流。
+        if (!use_sim_ &&
+            (!mavros_state_received_ || !mavros_connected_ || !mavros_armed_ ||
+             !mission_state_received_ || current_mission_phase_ < 2)) {
+            ROS_DEBUG_THROTTLE(2.0,
+                "[Guidance] Velocity publish blocked: waiting for armed FCU and takeoff altitude");
+            return;
+        }
+
         // SEARCH_ONLY 模式下 guidance 不工作
         if (!is_enabled_) {
             return;
