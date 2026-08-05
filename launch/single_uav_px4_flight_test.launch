@@ -249,7 +249,7 @@
               --split
               --size=2048
               --buffsize=1024
-              -x '.*(/ros_short_image$|/ros_ir_image$|/ros_long_image$|/ros_vis_image_res$|/ros_ir_image_res$|/ros_zoom_image$).*'
+              -x '.*(/ros_short_image$|/ros_ir_image$|/ros_long_image$|/ros_vis_image_res$|/ros_ir_image_res$|/ros_zoom_image$|/starling_gimbal/training_sample$).*'
               -o $(arg bag_dir)/$(arg bag_prefix)"/>
   </group>
 
