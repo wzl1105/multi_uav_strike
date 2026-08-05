@@ -228,6 +228,10 @@ private:
     bool ref_initialized_ = false;
     ros::Subscriber home_position_sub_;  // 一次订阅,拿 PX4 home
     ros::Subscriber mavros_state_sub_;   // /mavros/state(仅真机):接管感知观测点
+    // 真机速度输出安全门控：未收到 FCU 状态或飞机未解锁时，禁止向 MAVROS
+    // setpoint_velocity 写入零速度/零角速度，避免与起飞位置 setpoint 预热流冲突。
+    mavros_msgs::State current_mavros_state_;
+    bool mavros_state_received_ = false;
 
     // 仿真/真机切换
     bool use_sim_;
@@ -647,12 +651,23 @@ public:
     }
 
     // === 2026-07-23: 飞手接管观测(仅真机)===
-    // 见 initSubscribers 处的决策说明:接管期间本节点**不改任何执行状态**,setpoint 继续流,
-    // 切回 OFFBOARD 后被飞控立即接走。此回调仅打 DEBUG,保留订阅点以备未来扩展(如接管期
-    // 主动降频 setpoint 或朝向丢失目标)。
+    // 同时缓存 connected/armed，作为所有 MAVROS 速度发布出口的安全门控。
     void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        current_mavros_state_ = *msg;
+        mavros_state_received_ = true;
         ROS_DEBUG_THROTTLE(2.0, "[WaypointExecutor] mavros_state mode=%s armed=%d",
                            msg->mode.c_str(), msg->armed ? 1 : 0);
+    }
+
+    bool canPublishVelocitySetpoint() const {
+        // 仿真没有 mavros/state，保持原有发布行为。
+        if (use_sim_) return true;
+
+        // 真机地面阶段由 mission_manager 的 position setpoint 完成 OFFBOARD 预热和起飞；
+        // waypoint_executor 此时不得另外写 velocity setpoint（即使值全为 0）。
+        return mavros_state_received_ &&
+               current_mavros_state_.connected &&
+               current_mavros_state_.armed;
     }
 
     // ============== 回调函数 ==============
@@ -1280,6 +1295,11 @@ public:
                 "[WaypointExecutor] Velocity publish blocked: guidance owns control");
             return;
         }
+        if (!canPublishVelocitySetpoint()) {
+            ROS_DEBUG_THROTTLE(2.0,
+                "[WaypointExecutor] Velocity publish blocked: FCU state unavailable/disconnected/disarmed");
+            return;
+        }
         //===================制导修改====================
         geometry_msgs::Twist vel_cmd;
         vel_cmd.linear.x = vx;
@@ -1371,6 +1391,11 @@ public:
         //===================制导修改====================
         // 制导接管时连零速度也不能发布，否则会在50Hz制导流中周期性插入0。
         if (guidance_has_control_) return;
+        if (!canPublishVelocitySetpoint()) {
+            ROS_DEBUG_THROTTLE(2.0,
+                "[WaypointExecutor] Zero velocity publish blocked: FCU state unavailable/disconnected/disarmed");
+            return;
+        }
         //===================制导修改====================
         geometry_msgs::Twist vel_cmd;
         vel_cmd.linear.x = 0.0;
