@@ -95,6 +95,7 @@ private:
     // === Phase 4: 类型化发布 ===
     ros::Publisher waypoint_status_pub_;    // typed WaypointStatus(给 mission_manager 用)
     ros::Publisher current_target_pub_;     // 当前航段终点 PoseStamped(给 uav_avoidance_node 用)
+    ros::Publisher velocity_active_skill_pub_; // 已实际发布速度的 skill_id，供无缝接管确认
 
     // === Phase 4: 类型化订阅 ===
     ros::Subscriber skill_sub_;             // /waypoint_executor/skill(mission_manager 下发)
@@ -510,7 +511,7 @@ public:
         // 从 TAKING_OFF(1) 推进为 HOVERING(2)。在此之前禁止发布任何 velocity
         // setpoint（包括零速度），让起飞位置 setpoint 成为 MAVROS 的唯一控制源。
         mission_state_sub_ = nh_.subscribe(
-            "mission/state", 10,
+            "mission/mission_state", 10,
             &WaypointExecutor::missionStateCallback, this);
 
         // === 2026-08-05: 订阅 /guidance/enable 控制 OFFBOARD 心跳 ===
@@ -586,6 +587,9 @@ public:
         // === Phase 6: 当前航段终点(uav_avoidance_node 用于"我方当前线段终点"参考)===
         current_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "waypoint_executor/current_target", 10);
+
+        velocity_active_skill_pub_ = nh_.advertise<std_msgs::String>(
+            "waypoint_executor/velocity_active_skill", 10);
 
         // 默认 avoidance:全不约束
         latest_avoidance_.lateral_blocked = true;
@@ -679,14 +683,18 @@ public:
         // 仿真没有 mavros/state，保持原有发布行为。
         if (use_sim_) return true;
 
-        // 真机地面及起飞爬升阶段由 mission_manager 的 position setpoint 独占控制。
-        // phase=HOVERING(2) 表示实际高度已达到本次任务指定的 takeoff_altitude；
-        // 未收到 MissionState 时 fail-closed，避免节点启动乱序导致提前发布。
-        return mavros_state_received_ &&
-               current_mavros_state_.connected &&
-               current_mavros_state_.armed &&
-               mission_state_received_ &&
-               current_mission_phase_ >= 2;
+        // MissionPhase 是速度通道的唯一权威门控。旧版还要求 waypoint_executor
+        // 自己异步缓存 mavros/state；日志已证明 phase=WAYPOINT_FOLLOW 且控制计算正常，
+        // 但 MAVROS 缓存条件未满足会静默挡住所有 publish，造成永远收不到 handoff ack。
+        if (!mission_state_received_) return false;
+
+        // 明确列出允许 waypoint 速度输出的阶段，不能简单用 phase>=2：
+        // COMPLETE/FAILED/OVERRIDDEN 的枚举值也大于 2，但这些阶段必须禁止输出。
+        return current_mission_phase_ == 2 ||  // HOVERING（已达到起飞高度）
+               current_mission_phase_ == 3 ||  // WAYPOINT_FOLLOW
+               current_mission_phase_ == 6 ||  // RETURNING（航点返航路径）
+               current_mission_phase_ == 9 ||  // HOLDING
+               current_mission_phase_ == 11;   // TARGET_LOST_HOVER
     }
 
     // ============== 回调函数 ==============
@@ -1315,8 +1323,14 @@ public:
             return;
         }
         if (!canPublishVelocitySetpoint()) {
-            ROS_DEBUG_THROTTLE(2.0,
-                "[WaypointExecutor] Velocity publish blocked: waiting for armed FCU and takeoff altitude");
+            ROS_WARN_THROTTLE(2.0,
+                "[WaypointExecutor] Velocity publish blocked: mission_state_received=%d phase=%u "
+                "mavros_state_received=%d connected=%d armed=%d",
+                mission_state_received_ ? 1 : 0,
+                static_cast<unsigned>(current_mission_phase_),
+                mavros_state_received_ ? 1 : 0,
+                current_mavros_state_.connected ? 1 : 0,
+                current_mavros_state_.armed ? 1 : 0);
             return;
         }
         //===================制导修改====================
@@ -1369,6 +1383,12 @@ public:
 
         setpoint_velocity_pub_.publish(vel_cmd);
 
+        // 只有真正写入 setpoint_velocity 后才确认接管；mission_manager 据此停止
+        // 起飞/悬停 position setpoint，避免新 TaskFlow 切换时产生 OFFBOARD 空窗。
+        std_msgs::String active_skill_msg;
+        active_skill_msg.data = active_skill_id_;
+        velocity_active_skill_pub_.publish(active_skill_msg);
+
         std_msgs::Int16 mode_msg;
         mode_msg.data = flight_mode_velocity_;
         flight_mode_pub_.publish(mode_msg);
@@ -1411,8 +1431,10 @@ public:
         // 制导接管时连零速度也不能发布，否则会在50Hz制导流中周期性插入0。
         if (guidance_has_control_) return;
         if (!canPublishVelocitySetpoint()) {
-            ROS_DEBUG_THROTTLE(2.0,
-                "[WaypointExecutor] Zero velocity publish blocked: waiting for armed FCU and takeoff altitude");
+            ROS_WARN_THROTTLE(2.0,
+                "[WaypointExecutor] Zero velocity publish blocked: mission_state_received=%d phase=%u",
+                mission_state_received_ ? 1 : 0,
+                static_cast<unsigned>(current_mission_phase_));
             return;
         }
         //===================制导修改====================
@@ -1425,6 +1447,10 @@ public:
         vel_cmd.angular.z = 0.0;  // 停止时偏航角速率也为0
 
         setpoint_velocity_pub_.publish(vel_cmd);
+
+        std_msgs::String active_skill_msg;
+        active_skill_msg.data = active_skill_id_;
+        velocity_active_skill_pub_.publish(active_skill_msg);
 
         // === 2026-08-05: 同步 ramp filter 状态 ===
         //   publishZeroVelocity() 发 0 之后,如果恢复 publish 非零速度,

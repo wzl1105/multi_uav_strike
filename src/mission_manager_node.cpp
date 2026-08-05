@@ -313,6 +313,7 @@ private:
     ros::Subscriber attack_cmd_sub_;       // MAV_CMD_ATTACK typed(multi_uav_strike/AttackCmd)
     // cluster_states_sub_ 在上方已声明
     ros::Subscriber waypoint_status_sub_;  // 航段状态(Phase 4 启用)
+    ros::Subscriber waypoint_velocity_active_sub_; // 当前 skill 已实际发出速度的接管确认
     ros::Subscriber inter_uav_status_sub_; // 多机心跳(/inter_uav/uav_status) — 多机 gather 同步用
 
     // ============== Service Client ==============
@@ -322,6 +323,7 @@ private:
 
     // ============== PX4 起飞 ==============
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
+    bool waiting_for_waypoint_velocity_handoff_ = false;
 
     // ==============
 
@@ -1096,6 +1098,9 @@ public:
         // waypoint_executor 段状态(Phase 4 启用)
         waypoint_status_sub_ = nh_.subscribe("waypoint_executor/status", 10,
                                               &MissionManager::waypointStatusCallback, this);
+        waypoint_velocity_active_sub_ = nh_.subscribe(
+            "waypoint_executor/velocity_active_skill", 10,
+            &MissionManager::waypointVelocityActiveCallback, this);
 
         // 多机心跳(由 comm_node 发布到 /inter_uav/uav_status) — 多机 gather 同步
         // 50Hz 上限避免高频回调拖累,实际 comm_node 自适应 1/5/20Hz
@@ -1839,12 +1844,9 @@ public:
             current_phase_               = MissionPhase::PHASE_GROUND_IDLE;
         }
 
-        // 防御：如果当前 setpoint publisher 在跑(说明前序 flow 结束后进入 PHASE_HOLDING 或正在 takeoff),
-        // 新 task_flow 到达时先停掉,避免与 waypoint_executor 双发 setpoint 冲突。
-        if (setpoint_running_) {
-            stopSetpointPublisher();
-            ROS_WARN("[MissionManager] Stopped setpoint publisher before processing new task_flow");
-        }
+        // 若当前位置 setpoint 正在维持 OFFBOARD，新 TaskFlow 到达时不能立即停止。
+        // 保持它继续发送，直到 waypoint_executor 用当前 skill_id 确认已实际发布第一帧
+        // velocity setpoint；否则 stop→skill→resume 的 ROS 异步窗口会触发 OFFBOARD loss。
 
         // 注:guidance 残留清理 / current_target_ 清锁 放到 preserve_track 判定之后,
         //     Attack(105) 协同场景需要保留并切 strike 模式,见下方分支。
@@ -1912,6 +1914,7 @@ public:
         }
 
         // 把 skill 流拷进运行时队列
+        waiting_for_waypoint_velocity_handoff_ = false;
         skill_queue_.clear();
         skill_queue_.reserve(msg->skills.size());
         // strip_leading_takeoff(已空中收到 [Takeoff, ...]):跳过 index 0 的 takeoff skill
@@ -1987,6 +1990,15 @@ public:
             skill_queue_.push_back(sr);
         }
         current_skill_index_ = 0;
+        if (!skill_queue_.empty() &&
+            skill_queue_[0].msg.skill_type != 100 &&
+            skill_queue_[0].msg.skill_type != 106 &&
+            (!skill_queue_[0].msg.arrive_path.poses.empty() ||
+             !skill_queue_[0].msg.skill_area_path.poses.empty())) {
+            waiting_for_waypoint_velocity_handoff_ = true;
+            ROS_WARN("[MissionManager] Keeping position setpoint until waypoint velocity ack "
+                     "for skill=%s", skill_queue_[0].msg.skill_id.c_str());
+        }
 
         // === Skill flow 适配:TaskFlow 含非空 arrive_path/skill_area_path 的 skill 时,
         //     视为"航点已下发",让 runPx4TakeoffSequence 在 HOVERING 时能触发 performTakeoffHandoff()
@@ -3818,6 +3830,29 @@ public:
         latest_wp_status_time_ = ros::Time::now();
     }
 
+    void waypointVelocityActiveCallback(const std_msgs::String::ConstPtr& msg) {
+        if (!waiting_for_waypoint_velocity_handoff_ ||
+            current_skill_index_ >= skill_queue_.size()) {
+            return;
+        }
+        const std::string& expected_skill_id =
+            skill_queue_[current_skill_index_].msg.skill_id;
+        if (msg->data != expected_skill_id) {
+            ROS_DEBUG_THROTTLE(1.0,
+                "[MissionManager] Ignoring stale velocity ack skill=%s expected=%s",
+                msg->data.c_str(), expected_skill_id.c_str());
+            return;
+        }
+
+        waiting_for_waypoint_velocity_handoff_ = false;
+        if (setpoint_running_) {
+            stopSetpointPublisher();
+        }
+        ROS_WARN("[MissionManager] Waypoint velocity ACTIVE for skill=%s; "
+                 "position setpoint publisher stopped after acknowledged handoff",
+                 expected_skill_id.c_str());
+    }
+
     /**
      * 多机心跳回调 — 多机 gather 同步用
      *   - 仅缓存本机(由 nh_.getNamespace() 决定)以外的 SN
@@ -3965,7 +4000,8 @@ public:
             //     在 attack_point,一旦停掉 PX4 OFFBOARD 失流 → COM_OFFBOARD_LOSS_TIMEOUT →
             //     AUTO.LAND failsafe(2026-07-26 修复:用 attack_hover_setpoint_latched_ 标记
             //     豁免,Attack EXIT_PENDING 路径会清标志并停 publisher)。
-            if (setpoint_running_ && !attack_hover_setpoint_latched_) {
+            if (setpoint_running_ && !attack_hover_setpoint_latched_ &&
+                !waiting_for_waypoint_velocity_handoff_) {
                 stopSetpointPublisher();
             }
             // 注意:不再重置 takeoff_state_。phase=WAYPOINT_FOLLOW/HOLDING 时 takeoff_state_=COMPLETE
@@ -4364,11 +4400,8 @@ public:
         //    把下一条 Skill 推到 /waypoint_executor/skill) 收到新路径,无需再发
         //    旧的 String mode 通知。
 
-        // 4. 立刻停 setpoint_thread (此时 waypoint_executor 即将接管)
-        if (setpoint_running_) {
-            stopSetpointPublisher();
-            ROS_WARN("[MissionManager]   - Takeoff setpoint publisher stopped");
-        }
+        // 4. 不在这里提前停止 position setpoint。收到 waypoint_executor 针对当前
+        // skill_id 的首帧 velocity 发布确认后，由 waypointVelocityActiveCallback 停止。
         
         // 5. 推进 takeoff_state_ 到 TAKEOFF_COMPLETE
         //    让 isTakeoffComplete()=true, missionTimerCallback 继续跑 mission 主循环
@@ -4398,6 +4431,7 @@ public:
 
         // 7. 推进 MissionPhase
         current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+        publishMissionState();  // 立即让 waypoint_executor 打开 phase 门控，不等 1Hz 定时器
 
         ROS_WARN("[MissionManager] ===== AUTO-HANDOFF COMPLETE, UAV now waypoint-following =====");
     }

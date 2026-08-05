@@ -567,7 +567,7 @@ public:
                 "mavros/state", 10,
                 &GuidanceControlNode::mavrosStateCallback, this);
             mission_state_sub_ = nh_.subscribe(
-                "mission/state", 10,
+                "mission/mission_state", 10,
                 &GuidanceControlNode::missionStateCallback, this);
         }
 
