@@ -238,6 +238,10 @@ private:
     // 2026-08-05 bag 修复：近距减速、垂直视线退化保护、启动新鲜度和指令斜率限制。
     double strike_slowdown_radius_m_ = 10.0;
     double strike_horizontal_stop_radius_m_ = 1.0;
+    //========速度修改========
+    // false: IMAGE/GEO 水平速度直接使用 Attack task_speed，不按目标距离减速或归零。
+    bool strike_terminal_speed_schedule_enabled_ = false;
+    //========速度修改========
     double strike_terminal_world_direction_radius_m_ = 8.0;
     double strike_yaw_freeze_radius_m_ = 3.0;
     double strike_target_pose_timeout_sec_ = 0.5;
@@ -464,6 +468,10 @@ public:
         nh_private_.param<double>("strike_slowdown_radius_m", strike_slowdown_radius_m_, 10.0);
         nh_private_.param<double>("strike_horizontal_stop_radius_m",
                                   strike_horizontal_stop_radius_m_, 1.0);
+        //========速度修改========
+        nh_private_.param<bool>("strike_terminal_speed_schedule_enabled",
+                                strike_terminal_speed_schedule_enabled_, false);
+        //========速度修改========
         nh_private_.param<double>("strike_terminal_world_direction_radius_m",
                                   strike_terminal_world_direction_radius_m_, 8.0);
         nh_private_.param<double>("strike_yaw_freeze_radius_m", strike_yaw_freeze_radius_m_, 3.0);
@@ -802,7 +810,24 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
-            last_strike_cmd_valid_ = false;
+            //========速度修改========
+            // 原逻辑从零速度开始做 slew limit，会造成打击接管后速度先掉到零再爬升。
+            // last_strike_cmd_valid_ = false;
+            last_strike_cmd_ned_ = geometry_msgs::Twist();
+            if (has_prev_uav_position_) {
+                last_strike_cmd_ned_.linear.x = last_known_uav_velocity_ned_.x;
+                last_strike_cmd_ned_.linear.y = last_known_uav_velocity_ned_.y;
+                last_strike_cmd_ned_.linear.z = last_known_uav_velocity_ned_.z;
+                last_strike_cmd_valid_ = true;
+                strike_blend_from_ned_ = last_strike_cmd_ned_;
+                ROS_WARN("[Guidance] IMAGE/GEO handover seed v_NED=(%.2f,%.2f,%.2f)",
+                         last_strike_cmd_ned_.linear.x,
+                         last_strike_cmd_ned_.linear.y,
+                         last_strike_cmd_ned_.linear.z);
+            } else {
+                last_strike_cmd_valid_ = false;
+            }
+            //========速度修改========
             last_strike_cmd_time_ = ros::Time();
             //===================制导修改====================
             pn_target_filter_x_.reset();
@@ -888,7 +913,18 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
-            last_strike_cmd_valid_ = false;
+            //========速度修改========
+            // mode 消息可能晚于 enable 到达，不能把 enableCallback 已建立的交接速度清零。
+            // last_strike_cmd_valid_ = false;
+            if (!last_strike_cmd_valid_ && has_prev_uav_position_) {
+                last_strike_cmd_ned_ = geometry_msgs::Twist();
+                last_strike_cmd_ned_.linear.x = last_known_uav_velocity_ned_.x;
+                last_strike_cmd_ned_.linear.y = last_known_uav_velocity_ned_.y;
+                last_strike_cmd_ned_.linear.z = last_known_uav_velocity_ned_.z;
+                last_strike_cmd_valid_ = true;
+                strike_blend_from_ned_ = last_strike_cmd_ned_;
+            }
+            //========速度修改========
             last_strike_cmd_time_ = ros::Time();
             strike_guidance_enable_time_ = ros::Time::now();
         }
@@ -1094,8 +1130,13 @@ public:
 
     bool targetPoseFreshForThisStrike() const {
         if (!is_target_pose_received_ || last_target_pose_receive_time_.isZero()) return false;
-        if (!strike_guidance_enable_time_.isZero() &&
-            last_target_pose_receive_time_ < strike_guidance_enable_time_) return false;
+        //========速度修改========
+        // 允许接管前已经收到、但仍在 freshness 窗口内的当前锁定目标立即用于导引。
+        // 原逻辑强制等待 enable 后的新一帧目标，低频目标话题会造成一段零速。
+        // stale 目标仍由 age 门槛拒绝，不能无限沿用上一任务缓存。
+        // if (!strike_guidance_enable_time_.isZero() &&
+        //     last_target_pose_receive_time_ < strike_guidance_enable_time_) return false;
+        //========速度修改========
         const double age = (ros::Time::now() - last_target_pose_receive_time_).toSec();
         return age >= 0.0 && age <= strike_target_pose_timeout_sec_;
     }
@@ -1151,8 +1192,14 @@ public:
 
     void computeGeoFallbackVelocity(geometry_msgs::Twist& cmd) {
         const StrikeTargetGeometry g = strikeTargetGeometry();
-        const double requested_speed = std::min(track_max_speed_, image_max_speed_);
-        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+        //========速度修改========
+        // track_max_speed_ 由 guidance/guidance_speed 更新，来源是 Attack task_speed。
+        // 默认不再受 image_max_speed、邻近目标减速和 1m 水平零速限制。
+        const double requested_speed = track_max_speed_;
+        const double speed = strike_terminal_speed_schedule_enabled_
+            ? terminalHorizontalSpeed(requested_speed, g.horizontal)
+            : requested_speed;
+        //========速度修改========
         if (g.horizontal > 0.1 && speed > 0.0) {
             cmd.linear.x = speed * g.north / g.horizontal;
             cmd.linear.y = speed * g.east / g.horizontal;
@@ -1177,14 +1224,23 @@ public:
         }
         ray.normalize();
 
-        // bbox 中心只用于速度调度和死区；飞行方向来自同一像素对应的世界视线。
-        double ex = current_image_target_.center_x - 0.5;
-        double ey = current_image_target_.center_y - 0.5;
-        if (std::fabs(ex) < image_center_deadband_) ex = 0.0;
-        if (std::fabs(ey) < image_center_deadband_) ey = 0.0;
-        const double alignment = clampValue(1.0 - std::hypot(ex, ey) / 0.5, 0.25, 1.0);
-        const double requested_speed = std::min(track_max_speed_, image_max_speed_) * alignment;
-        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+        //========速度修改========
+        // 原逻辑保留：bbox 中心只用于速度调度，偏离中心时 alignment 会把速度
+        // 降至 Attack speed 的 25%。图像射线方向计算仍在 primaryImageTargetCallback 中保留。
+        // double ex = current_image_target_.center_x - 0.5;
+        // double ey = current_image_target_.center_y - 0.5;
+        // if (std::fabs(ex) < image_center_deadband_) ex = 0.0;
+        // if (std::fabs(ey) < image_center_deadband_) ey = 0.0;
+        // const double alignment = clampValue(
+        //     1.0 - std::hypot(ex, ey) / 0.5, 0.25, 1.0);
+        // const double requested_speed =
+        //     std::min(track_max_speed_, image_max_speed_) * alignment;
+        // 图像偏差只决定方向，不再改变速度大小；水平速度直接接入 Attack task_speed。
+        const double requested_speed = track_max_speed_;
+        const double speed = strike_terminal_speed_schedule_enabled_
+            ? terminalHorizontalSpeed(requested_speed, g.horizontal)
+            : requested_speed;
+        //========速度修改========
 
         // NWU ray → NED ray，一次转换；发布前仍统一走 convertVelNedToEnu。
         double north = ray.x();

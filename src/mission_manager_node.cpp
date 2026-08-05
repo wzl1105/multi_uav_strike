@@ -6106,11 +6106,9 @@ public:
         // 确定模式：SEARCH_STRIKE -> "strike", SEARCH_TRACK -> "track"
         std::string guidance_mode = (current_work_mode_ == WorkMode::SEARCH_STRIKE) ? "strike" : "track";
 
-        // 使能制导
-        std_msgs::Bool enable;
-        enable.data = true;
-        guidance_enable_pub_.publish(enable);
-
+        //========速度修改========
+        // 原顺序先 enable，guidance timer 可能在 mode/target/speed 到达前先发布零速。
+        // 改为先完整下发本次模式、目标和 Attack speed，最后再原子式使能接管。
         // 发送模式
         std_msgs::String mode_msg;
         mode_msg.data = guidance_mode;
@@ -6123,6 +6121,12 @@ public:
         std_msgs::Float32 speed_msg;
         speed_msg.data = static_cast<float>(guidance_speed_);
         guidance_speed_pub_.publish(speed_msg);
+
+        // 使能制导
+        std_msgs::Bool enable;
+        enable.data = true;
+        guidance_enable_pub_.publish(enable);
+        //========速度修改========
 
         ROS_WARN_THROTTLE(5.0, "[MissionManager] Starting guidance approach to target (mode: %s, guidance_speed_=%.2f)",
                           guidance_mode.c_str(), guidance_speed_);
