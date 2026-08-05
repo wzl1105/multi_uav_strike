@@ -39,7 +39,9 @@
 #include <std_msgs/String.h>
 #include <std_msgs/Bool.h>     // 2026-08-05: /guidance/enable 订阅
 #include <std_msgs/Int16.h>
-#include <multi_uav_strike/WorkMode.h>  // 2026-08-05: typed work_mode 订阅
+//===================制导修改====================
+#include <std_msgs/Bool.h>
+//===================制导修改====================
 #include <sensor_msgs/NavSatFix.h>
 #include <mavros_msgs/HomePosition.h>
 #include <mavros_msgs/State.h>
@@ -76,6 +78,9 @@ private:
     ros::Subscriber mission_mode_typed_sub_; // === 2026-08-05: typed WorkMode(mission/mode 老 topic 已删) ===
     ros::Subscriber guidance_enable_sub_;    // === 2026-08-05: /guidance/enable — 用于 OFFBOARD 心跳 ===
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
+    //===================制导修改====================
+    ros::Subscriber guidance_enable_sub_;    // 制导控制权门控，防止与航点速度同时发布
+    //===================制导修改====================
 
     // ============== 发布 ==============
     ros::Publisher setpoint_velocity_pub_;    // NED 速度指令
@@ -111,7 +116,9 @@ private:
     size_t current_waypoint_index_;
     bool is_waypoints_received_;
     bool is_executing_;
-    bool is_guidance_active_ = false;       // === 2026-08-05: /guidance/enable 状态 ===
+    //===================制导修改====================
+    bool guidance_has_control_ = false;
+    //===================制导修改====================
 
     // === Phase 4: 分段航点状态(必须放在 Waypoint 之后)===
     enum class SegmentPhase { IDLE, ARRIVE, SKILL_AREA, HOLD, COMPLETE };
@@ -465,6 +472,14 @@ public:
             "waypoint_executor/control", 10,
             &WaypointExecutor::controlCallback, this);
 
+        //===================制导修改====================
+        // 这是速度发布的最终控制权门控。即使 Skill 与 control 跨 topic 乱序，
+        // guidance enable 后 waypoint_executor 也不能再写 MAVROS 速度话题。
+        guidance_enable_sub_ = nh_.subscribe(
+            "guidance/enable", 10,
+            &WaypointExecutor::guidanceEnableCallback, this);
+        //===================制导修改====================
+
         // 工作模式（来自 mission_manager 转发的地面站指令）
         // 只有 SEARCH_ONLY 模式下航点执行器才发控制指令
         mission_mode_sub_ = nh_.subscribe(
@@ -738,16 +753,14 @@ public:
             return;
         }
 
-        // === 2026-08-05: guidance enable 时 waypoint 完全停发 ===
-        //   避免与 guidance_control_node 在 setpoint_velocity/cmd_vel_unstamped
-        //   上叠加(实测 7/16 bag 攻击切换窗口 1 秒内两个 publisher 交替穿插,
-        //   触发 PX4 OFFBOARD 速度震荡 → 飞手接管后 AUTO.LAND failsafe)
-        if (is_guidance_active_) {
-            // guidance 在飞,waypoint 静默(只保留 status/current_target 上报)
+        //===================制导修改====================
+        if (guidance_has_control_) {
+            // 制导接管期间仍维持状态和航段目标上报，但不计算/发布任何航点速度。
             publishWaypointStatus();
             publishCurrentTarget();
             return;
         }
+        //===================制导修改====================
 
         // === Phase 4: 分段航点执行(若 active skill)===
         if (segment_phase_ == SegmentPhase::ARRIVE ||
@@ -1260,27 +1273,13 @@ public:
      * PX4 SITL: 需要将 NED 转换为 ENU
      */
     void publishVelocityCommandWithYaw(double vx, double vy, double vz, double desired_yaw_ned) {
-        // === 2026-08-05: 速度斜坡(平滑交接)===
-        //   11:01 bag 实测:attack-targets 到达后 0→5.4 m/s 硬切 → PX4 OFFBOARD 速度震荡
-        //   → 1s 内幅值跳动大。修法:一阶 IIR ramp 限制 vx/vy/vz 跳变幅度
-        //   alpha = 1 - exp(-dt/tau),tau=0.10s → 30ms 内爬到 26%,300ms 爬到 95%
-        //   解决硬切,但保留正常 L1 控制的快速响应
-        const ros::Time now = ros::Time::now();
-        if (!last_vel_pub_time_.isZero()) {
-            const double dt = (now - last_vel_pub_time_).toSec();
-            if (dt > 0.0 && dt < 1.0) {
-                const double alpha = 1.0 - std::exp(-dt / kVelRampTauSec);
-                vx = filt_vx_ + alpha * (vx - filt_vx_);
-                vy = filt_vy_ + alpha * (vy - filt_vy_);
-                vz = filt_vz_ + alpha * (vz - filt_vz_);
-                // Yaw 不 ramp(由 PX4 内环 P 控制,小幅跳变不伤),保持瞬时响应
-            }
+        //===================制导修改====================
+        if (guidance_has_control_) {
+            ROS_WARN_THROTTLE(1.0,
+                "[WaypointExecutor] Velocity publish blocked: guidance owns control");
+            return;
         }
-        last_vel_pub_time_ = now;
-        filt_vx_ = vx;
-        filt_vy_ = vy;
-        filt_vz_ = vz;
-
+        //===================制导修改====================
         geometry_msgs::Twist vel_cmd;
         vel_cmd.linear.x = vx;
         vel_cmd.linear.y = vy;
@@ -1368,6 +1367,10 @@ public:
     }
 
     void publishZeroVelocity() {
+        //===================制导修改====================
+        // 制导接管时连零速度也不能发布，否则会在50Hz制导流中周期性插入0。
+        if (guidance_has_control_) return;
+        //===================制导修改====================
         geometry_msgs::Twist vel_cmd;
         vel_cmd.linear.x = 0.0;
         vel_cmd.linear.y = 0.0;
@@ -1494,6 +1497,13 @@ public:
 
         if (cmd == "stop") {
             stop();
+        //===================制导修改====================
+        } else if (cmd == "yield_to_guidance") {
+            // 静默交出控制权：保留队列，不向MAVROS插入零速度。
+            is_executing_ = false;
+            ROS_INFO_THROTTLE(1.0,
+                "[WaypointExecutor] Yielded velocity control to guidance");
+        //===================制导修改====================
         } else if (cmd == "pause") {
             pause();
         } else if (cmd == "resume") {
@@ -1508,10 +1518,33 @@ public:
         // 与 missionModeCallback 切出 SEARCH_ONLY 一致：暂停执行但**保留航点队列**，
         // 这样 mission_manager 在检测到目标发"stop"时不会破坏后续 resume 的能力。
         // 如果真的需要清空航点，发个新的 waypoint_cmd 即可（会 reset 队列）。
+        //===================制导修改====================
+        // 原逻辑每收到一次stop都发布零速度；DIRECT_LOOK以10Hz重发stop时，
+        // 会在50Hz guidance速度流中每5帧插入一个0。
+        // is_executing_ = false;
+        // publishZeroVelocity();
+        if (!is_executing_) {
+            ROS_DEBUG_THROTTLE(1.0, "[WaypointExecutor] Repeated stop ignored");
+            return;
+        }
         is_executing_ = false;
         publishZeroVelocity();
+        //===================制导修改====================
         ROS_INFO("[WaypointExecutor] Stopped");
     }
+
+    //===================制导修改====================
+    void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
+        guidance_has_control_ = msg->data;
+        if (guidance_has_control_) {
+            // 只暂停执行，不发布零速度；disable也不自动resume，由mission_manager决定后续。
+            is_executing_ = false;
+            ROS_WARN("[WaypointExecutor] Guidance control ownership ENABLED");
+        } else {
+            ROS_INFO("[WaypointExecutor] Guidance control ownership RELEASED");
+        }
+    }
+    //===================制导修改====================
 
     void pause() {
         is_executing_ = false;

@@ -36,7 +36,12 @@ InterceptGuidance::InterceptGuidance(ros::NodeHandle& nh)
     nh.param<double>("strike_max_vertical_speed", max_vertical_speed_, 3.0);
     nh.param<double>("max_lead_angle_deg", max_lead_angle_rad_, 30.0);
     max_lead_angle_rad_ = max_lead_angle_rad_ * M_PI / 180.0;  // deg → rad
+    //===================制导修改====================
+    // 原默认值保留：
+    // nh.param<double>("los_filter_cutoff_hz", los_filter_cutoff_hz_, 2.0);
+    // 融合main分支：降低到1Hz，抑制10Hz目标更新在50Hz PN中的LOS-rate尖峰。
     nh.param<double>("los_filter_cutoff_hz", los_filter_cutoff_hz_, 1.0);
+    //===================制导修改====================
 
     // 初始化 LOS 角低通滤波器
     // === 2026-08-04: los_filter_cutoff_hz 默认 2.0 → 1.0 ===

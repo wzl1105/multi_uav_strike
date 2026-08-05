@@ -48,6 +48,9 @@ add_message_files(
   ClusterState.msg
   TargetFilterDebug.msg     # 2026-07-16: 位置/速度滤波前后对比(debug)
   GuidancePnDebug.msg       # 2026-07-31: PN 坐标/LOS/速度链路诊断
+  # //===================制导修改====================
+  PrimaryImageTarget.msg    # 锁定目标的 bbox + 相机视线，供图像导引使用
+  # //===================制导修改====================
   YxStatus.msg              # 2026-08-03: YX 设备 485 通信状态上报
 )
 

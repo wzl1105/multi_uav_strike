@@ -12,6 +12,9 @@
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <cmath>
+//===================制导修改====================
+#include <algorithm>
+//===================制导修改====================
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
@@ -19,6 +22,9 @@
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 #include "multi_uav_strike/InterUavStatus.h"  // /inter_uav/uav_status 心跳(替代 other_uav_poses)
+//===================制导修改====================
+#include "multi_uav_strike/PrimaryImageTarget.h"
+//===================制导修改====================
 
 class GuidanceControlNode {
 private:
@@ -37,6 +43,9 @@ private:
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber heartbeat_sub_;        // 邻居心跳 /inter_uav/uav_status(替代原 other_uav_poses)
     ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
+    //===================制导修改====================
+    ros::Subscriber primary_image_target_sub_;
+    //===================制导修改====================
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -133,13 +142,22 @@ private:
     multi_uav_strike::OneEuroFilter1D vel_filter_y_;
     multi_uav_strike::OneEuroFilter1D vel_filter_z_;
     multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
-    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 5) — PN 输入 LPF ===
-    //   target_estimated_pose 在 10Hz 发布,带 0.2m std 噪声(target_estimator EMA α=0.1 后
-    //   还会有 ~0.05m 残余)。PN 50Hz 调用时在帧边界阶跃,los_yaw_rate 单帧最大 ~0.04 rad/s。
-    //   对 target 输入再加一层 1Hz OneEuro 滤波,代价 ~0.1s 滞后,STRIKE 时间窗够用。
-    multi_uav_strike::OneEuroFilter1D target_filter_x_;
-    multi_uav_strike::OneEuroFilter1D target_filter_y_;
-    multi_uav_strike::OneEuroFilter1D target_filter_z_;
+    //===================制导修改====================
+    // main PN增强使用独立目标滤波状态；不得覆盖IMAGE/GEO使用的原始目标坐标。
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_x_;
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_y_;
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_z_;
+    geometry_msgs::PoseStamped pn_filtered_target_pose_;
+    bool pn_filtered_target_valid_ = false;
+    ros::Time pn_last_target_update_time_;
+    double pn_cluster_stale_timeout_sec_ = 0.5;
+    double pn_cluster_stale_speed_scale_ = 0.33;
+    bool pn_cluster_stale_latch_ = false;
+    geometry_msgs::Vector3 last_known_uav_velocity_ned_;
+    geometry_msgs::Point prev_uav_position_nwu_;
+    ros::Time prev_uav_position_time_;
+    bool has_prev_uav_position_ = false;
+    //===================制导修改====================
     ros::Time                    vel_filter_last_time_;
     // 目标位置突变超过此值时，在 targetPoseCallback 内、下一次 PN 计算之前重置滤波器。
     static constexpr double kTargetSwitchJumpM = 5.0;
@@ -192,6 +210,55 @@ private:
     std::vector<multi_uav_strike::InterUavStatus::ConstPtr> heartbeats_;
     ros::Time last_heartbeat_purge_;
     double avoidance_safe_distance_;
+
+    //===================制导修改====================
+    enum class StrikeVisionState { GEO_FALLBACK, IMAGE_GUIDANCE };
+    std::string strike_guidance_logic_ = "image_geo_fallback";
+    multi_uav_strike::PrimaryImageTarget current_image_target_;
+    bool image_target_received_ = false;
+    uint32_t last_image_frame_seq_ = 0;
+    uint64_t last_image_stamp_us_ = 0;
+    int image_confirm_count_ = 0;
+    int image_confirm_frames_ = 3;
+    double image_visible_timeout_sec_ = 0.4;
+    double image_reacquire_blend_sec_ = 0.7;
+    double image_max_speed_ = 5.0;
+    //===================制导修改====================
+    // 原值保留：double image_max_vertical_speed_ = 1.0;
+    double image_max_vertical_speed_ = 2.5;
+    bool strike_slant_descent_enabled_ = true;
+    double strike_slant_descent_max_angle_deg_ = 25.0;
+    double strike_slant_min_horizontal_distance_m_ = 1.0;
+    //===================制导修改====================
+    double image_center_deadband_ = 0.03;
+    double image_ray_alpha_ = 0.25;
+    double image_yaw_kp_ = 0.6;
+    double image_yaw_rate_max_ = 0.5;
+    //===================制导修改====================
+    // 2026-08-05 bag 修复：近距减速、垂直视线退化保护、启动新鲜度和指令斜率限制。
+    double strike_slowdown_radius_m_ = 10.0;
+    double strike_horizontal_stop_radius_m_ = 1.0;
+    double strike_terminal_world_direction_radius_m_ = 8.0;
+    double strike_yaw_freeze_radius_m_ = 3.0;
+    double strike_target_pose_timeout_sec_ = 0.5;
+    double strike_max_horizontal_accel_ = 2.0;
+    //===================制导修改====================
+    // 原值保留：double strike_max_vertical_accel_ = 1.0;
+    double strike_max_vertical_accel_ = 1.5;
+    //===================制导修改====================
+    double strike_max_yaw_accel_ = 1.0;
+    ros::Time last_target_pose_receive_time_;
+    ros::Time strike_guidance_enable_time_;
+    ros::Time last_strike_cmd_time_;
+    //===================制导修改====================
+    Eigen::Vector3d filtered_image_ray_nwu_{0.0, 0.0, -1.0};
+    bool image_ray_filter_valid_ = false;
+    StrikeVisionState strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+    ros::Time strike_vision_switch_time_;
+    geometry_msgs::Twist strike_blend_from_ned_;
+    geometry_msgs::Twist last_strike_cmd_ned_;
+    bool last_strike_cmd_valid_ = false;
+    //===================制导修改====================
 
 public:
     GuidanceControlNode() : nh_private_("~"),
@@ -308,34 +375,124 @@ public:
         //   (beta 让截止频率随 dx/dt 升高,反而放行稳态摆动).
         //   新默认值 0.5Hz + beta=0.001 把 1 Hz+ 成分削掉 ~12 dB,
         //   PN 输出的 0.3 m/s std 摆动会被压到 ~0.05 m/s.
-        // === 2026-08-04: 再降 min_cutoff + 升 beta, 进一步压 vz/vx 中频抖动 ===
-        //   背景:target_estimated_pose 10Hz + 0.2m std → PN 输出 0.144/0.184 m/s 单帧跳变。
-        //   新默认值 0.25Hz + beta=0.02:
-        //     - 0.25Hz 截止频率把 0.5-1Hz 中频成分再削 6dB
-        //     - beta=0.02 让突然加速(d|v|/dt 大)时截止频率升到 ~1-2Hz,仍能跟上
-        //       目标切换 / STRIKE 启动初期的大速度变化
-        //   d_cutoff 1.0→0.5:导数估计更平滑,beta 放大截止频率时不会"毛刺"瞬时打开。
+        //===================制导修改====================
+        // 按STRIKE选择隔离输出滤波默认值：PN吸收main增强值，IMAGE保持local_save实测值。
+        std::string strike_logic_for_filter_defaults;
+        nh_private_.param<std::string>("strike_guidance_logic",
+                                       strike_logic_for_filter_defaults,
+                                       "image_geo_fallback");
+        const bool use_main_pn_filter_defaults =
+            strike_logic_for_filter_defaults == "pn" ||
+            strike_logic_for_filter_defaults == "legacy_pn";
+        const double default_vel_min_cutoff = use_main_pn_filter_defaults ? 0.25 : 0.5;
+        const double default_vel_beta = use_main_pn_filter_defaults ? 0.02 : 0.001;
+        const double default_vel_d_cutoff = use_main_pn_filter_defaults ? 0.5 : 1.0;
+        //===================制导修改====================
         double vel_min_cutoff, vel_beta, vel_d_cutoff;
-        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 0.25);
-        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.02);
-        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   0.5);
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff,
+                                  default_vel_min_cutoff);
+        nh_private_.param<double>("vel_smooth_beta", vel_beta, default_vel_beta);
+        nh_private_.param<double>("vel_smooth_d_cutoff_hz", vel_d_cutoff,
+                                  default_vel_d_cutoff);
         vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
-        // === 2026-08-04: target 输入 OneEuro (Layer 5) ===
-        //   比速度通道更激进(1Hz 截止,β=0.005) — target 是被动态调度的源,不是输出,
-        //   过度平滑会让"目标切换/位置突变"延迟;但 STRIKE 中目标相对静止,
-        //   把 0.05-0.1m 残余抖到稳态后,后续 0.5s 内基本无变化,极强 LPF 即可。
-        target_filter_x_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
-        target_filter_y_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
-        target_filter_z_ = multi_uav_strike::OneEuroFilter1D(1.0, 0.005, 1.0);
+        //===================制导修改====================
+        double pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff;
+        nh_private_.param<double>("pn_target_filter_min_cutoff_hz",
+                                  pn_target_min_cutoff, 1.0);
+        nh_private_.param<double>("pn_target_filter_beta", pn_target_beta, 0.005);
+        nh_private_.param<double>("pn_target_filter_d_cutoff_hz",
+                                  pn_target_d_cutoff, 1.0);
+        pn_target_filter_x_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        pn_target_filter_y_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        pn_target_filter_z_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        nh_private_.param<double>("pn_cluster_stale_timeout_sec",
+                                  pn_cluster_stale_timeout_sec_, 0.5);
+        nh_private_.param<double>("pn_cluster_stale_speed_scale",
+                                  pn_cluster_stale_speed_scale_, 0.33);
+        pn_cluster_stale_timeout_sec_ = std::max(0.1, pn_cluster_stale_timeout_sec_);
+        pn_cluster_stale_speed_scale_ = clampValue(
+            pn_cluster_stale_speed_scale_, 0.0, 1.0);
+        //===================制导修改====================
         vel_filter_last_time_ = ros::Time();
         ROS_INFO("[Guidance] Vel cmd OneEuro: min_cutoff=%.2fHz beta=%.3f d_cutoff=%.2fHz",
                  vel_min_cutoff, vel_beta, vel_d_cutoff);
 
         // STRIKE模式专用参数
         nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
+
+        //===================制导修改====================
+        nh_private_.param<std::string>("strike_guidance_logic", strike_guidance_logic_,
+                                       "image_geo_fallback");
+        //===================制导修改====================
+        if (strike_guidance_logic_ == "legacy_pn") {
+            ROS_WARN("[Guidance] strike_guidance_logic=legacy_pn is deprecated; using pn");
+            strike_guidance_logic_ = "pn";
+        } else if (strike_guidance_logic_ != "image_geo_fallback" &&
+                   strike_guidance_logic_ != "pn") {
+            ROS_ERROR("[Guidance] Invalid strike_guidance_logic='%s'; fallback to image_geo_fallback",
+                      strike_guidance_logic_.c_str());
+            strike_guidance_logic_ = "image_geo_fallback";
+        }
+        ROS_WARN("[Guidance] STRIKE guidance selected: %s", strike_guidance_logic_.c_str());
+        //===================制导修改====================
+        nh_private_.param<int>("image_confirm_frames", image_confirm_frames_, 3);
+        nh_private_.param<double>("image_visible_timeout_sec", image_visible_timeout_sec_, 0.4);
+        nh_private_.param<double>("image_reacquire_blend_sec", image_reacquire_blend_sec_, 0.7);
+        nh_private_.param<double>("image_max_speed", image_max_speed_, 5.0);
+        //===================制导修改====================
+        // 原参数默认值保留：
+        // nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
+        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 2.5);
+        nh_private_.param<bool>("strike_slant_descent_enabled",
+                                strike_slant_descent_enabled_, true);
+        nh_private_.param<double>("strike_slant_descent_max_angle_deg",
+                                  strike_slant_descent_max_angle_deg_, 25.0);
+        nh_private_.param<double>("strike_slant_min_horizontal_distance_m",
+                                  strike_slant_min_horizontal_distance_m_, 1.0);
+        //===================制导修改====================
+        nh_private_.param<double>("image_center_deadband", image_center_deadband_, 0.03);
+        nh_private_.param<double>("image_ray_alpha", image_ray_alpha_, 0.25);
+        nh_private_.param<double>("image_yaw_kp", image_yaw_kp_, 0.6);
+        nh_private_.param<double>("image_yaw_rate_max", image_yaw_rate_max_, 0.5);
+        //===================制导修改====================
+        nh_private_.param<double>("strike_slowdown_radius_m", strike_slowdown_radius_m_, 10.0);
+        nh_private_.param<double>("strike_horizontal_stop_radius_m",
+                                  strike_horizontal_stop_radius_m_, 1.0);
+        nh_private_.param<double>("strike_terminal_world_direction_radius_m",
+                                  strike_terminal_world_direction_radius_m_, 8.0);
+        nh_private_.param<double>("strike_yaw_freeze_radius_m", strike_yaw_freeze_radius_m_, 3.0);
+        nh_private_.param<double>("strike_target_pose_timeout_sec",
+                                  strike_target_pose_timeout_sec_, 0.5);
+        nh_private_.param<double>("strike_max_horizontal_accel",
+                                  strike_max_horizontal_accel_, 2.0);
+        //===================制导修改====================
+        // 原参数默认值保留：
+        // nh_private_.param<double>("strike_max_vertical_accel",
+        //                           strike_max_vertical_accel_, 1.0);
+        nh_private_.param<double>("strike_max_vertical_accel",
+                                  strike_max_vertical_accel_, 1.5);
+        //===================制导修改====================
+        nh_private_.param<double>("strike_max_yaw_accel", strike_max_yaw_accel_, 1.0);
+        strike_slowdown_radius_m_ = std::max(
+            strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
+        strike_terminal_world_direction_radius_m_ = std::max(
+            strike_terminal_world_direction_radius_m_, strike_horizontal_stop_radius_m_);
+        //===================制导修改====================
+        image_max_vertical_speed_ = std::max(0.1, image_max_vertical_speed_);
+        strike_max_vertical_accel_ = std::max(0.1, strike_max_vertical_accel_);
+        strike_slant_min_horizontal_distance_m_ = std::max(
+            0.1, strike_slant_min_horizontal_distance_m_);
+        strike_slant_descent_max_angle_deg_ = clampValue(
+            strike_slant_descent_max_angle_deg_, 1.0, 60.0);
+        //===================制导修改====================
+        //===================制导修改====================
+        //===================制导修改====================
 
         ROS_INFO("[Guidance] Mode: %s, pose_topic: %s", use_sim_ ? "SIMULATION" : "PX4 SITL", pose_topic_.c_str());
     }
@@ -387,6 +544,12 @@ public:
         home_position_sub_ = nh_.subscribe(
             "mavros/home_position/home", 10,
             &GuidanceControlNode::homePositionCallback, this);
+
+        //===================制导修改====================
+        primary_image_target_sub_ = nh_.subscribe(
+            "guidance/primary_image_target", 10,
+            &GuidanceControlNode::primaryImageTargetCallback, this);
+        //===================制导修改====================
     }
 
     void initPublishers() {
@@ -469,9 +632,13 @@ public:
                 vel_filter_y_.reset();
                 vel_filter_z_.reset();
                 vel_filter_yaw_.reset();
-                target_filter_x_.reset();
-                target_filter_y_.reset();
-                target_filter_z_.reset();
+                //===================制导修改====================
+                pn_target_filter_x_.reset();
+                pn_target_filter_y_.reset();
+                pn_target_filter_z_.reset();
+                pn_filtered_target_valid_ = false;
+                pn_cluster_stale_latch_ = false;
+                //===================制导修改====================
                 if (current_strategy_type_ ==
                     multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
                     guidance_strategy_) {
@@ -496,14 +663,61 @@ public:
         current_target_pose_.pose.position.y = fy;
         current_target_pose_.pose.position.z = fz;
         is_target_pose_received_ = true;
-        // === 2026-08-04: Layer 6 — 记录最后更新时刻 ===
-        last_target_update_time_ = ros::Time::now();
+        //===================制导修改====================
+        last_target_pose_receive_time_ = ros::Time::now();
+
+        // main分支PN Layer 5：10Hz目标阶跃先经独立1Hz OneEuro，再交给50Hz PN。
+        // IMAGE/GEO继续使用上面的current_target_pose_原值，二者互不污染。
+        pn_filtered_target_pose_ = *msg;
+        const double filter_time = msg->header.stamp.isZero()
+            ? ros::Time::now().toSec() : msg->header.stamp.toSec();
+        pn_filtered_target_pose_.pose.position.x = pn_target_filter_x_.filter(nx, filter_time);
+        pn_filtered_target_pose_.pose.position.y = pn_target_filter_y_.filter(ny, filter_time);
+        pn_filtered_target_pose_.pose.position.z = pn_target_filter_z_.filter(nz, filter_time);
+        pn_filtered_target_valid_ = true;
+        pn_last_target_update_time_ = ros::Time::now();
+        //===================制导修改====================
     }
 
     void targetTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
         current_target_twist_ = *msg;
         is_target_twist_received_ = true;
     }
+
+    //===================制导修改====================
+    void primaryImageTargetCallback(
+        const multi_uav_strike::PrimaryImageTarget::ConstPtr& msg) {
+        current_image_target_ = *msg;
+        image_target_received_ = true;
+
+        // statesTimerCb 会重复发布同一帧，只有 frame_seq/stamp 真正变化才累计确认帧。
+        const bool is_new_frame = msg->frame_seq != last_image_frame_seq_ ||
+                                  msg->stamp_us != last_image_stamp_us_;
+        if (is_new_frame) {
+            last_image_frame_seq_ = msg->frame_seq;
+            last_image_stamp_us_ = msg->stamp_us;
+            if (msg->visible) {
+                image_confirm_count_ = std::min(image_confirm_count_ + 1,
+                                                image_confirm_frames_);
+                Eigen::Vector3d ray(msg->world_ray_nwu.x,
+                                    msg->world_ray_nwu.y,
+                                    msg->world_ray_nwu.z);
+                if (ray.norm() > 1e-6) {
+                    ray.normalize();
+                    if (!image_ray_filter_valid_) {
+                        filtered_image_ray_nwu_ = ray;
+                        image_ray_filter_valid_ = true;
+                    } else {
+                        filtered_image_ray_nwu_ =
+                            image_ray_alpha_ * ray +
+                            (1.0 - image_ray_alpha_) * filtered_image_ray_nwu_;
+                        filtered_image_ray_nwu_.normalize();
+                    }
+                }
+            }
+        }
+    }
+    //===================制导修改====================
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         if (use_sim_) {
@@ -550,19 +764,23 @@ public:
         current_uav_pose_.header.frame_id = msg->header.frame_id;
         is_uav_pose_received_ = true;
 
-        // === 2026-08-05: 用 pose delta 估算 UAV 速度(NED),Handover 修复用 ===
-        //   mavros 没订阅 velocity_local,用相邻两帧 pose 差分计算,精度够 Handover 初始化用
-        if (has_prev_uav_pos_) {
-            const double dt = (msg->header.stamp - prev_uav_pos_time_).toSec();
+        //===================制导修改====================
+        // main分支handover思想：由内部NWU位置差分估计实际NED速度，PN接管时作为滤波初值。
+        if (has_prev_uav_position_) {
+            const double dt = (msg->header.stamp - prev_uav_position_time_).toSec();
             if (dt > 0.001 && dt < 0.5) {
-                last_known_uav_velocity_ned_.x = (current_uav_pose_.pose.position.x - prev_uav_pos_ned_.x) / dt;
-                last_known_uav_velocity_ned_.y = (current_uav_pose_.pose.position.y - prev_uav_pos_ned_.y) / dt;
-                last_known_uav_velocity_ned_.z = (current_uav_pose_.pose.position.z - prev_uav_pos_ned_.z) / dt;
+                const double dn = current_uav_pose_.pose.position.x - prev_uav_position_nwu_.x;
+                const double dw = current_uav_pose_.pose.position.y - prev_uav_position_nwu_.y;
+                const double du = current_uav_pose_.pose.position.z - prev_uav_position_nwu_.z;
+                last_known_uav_velocity_ned_.x = dn / dt;
+                last_known_uav_velocity_ned_.y = -dw / dt;
+                last_known_uav_velocity_ned_.z = -du / dt;
             }
         }
-        prev_uav_pos_ned_ = current_uav_pose_.pose.position;
-        prev_uav_pos_time_ = msg->header.stamp;
-        has_prev_uav_pos_ = true;
+        prev_uav_position_nwu_ = current_uav_pose_.pose.position;
+        prev_uav_position_time_ = msg->header.stamp;
+        has_prev_uav_position_ = true;
+        //===================制导修改====================
     }
 
     void losAngleCallback(const geometry_msgs::Point::ConstPtr& msg) {
@@ -576,6 +794,51 @@ public:
     }
 
     void enableCallback(const std_msgs::Bool::ConstPtr& msg) {
+        //===================制导修改====================
+        const bool rising_edge = (!is_enabled_ && msg->data);
+        if (rising_edge) {
+            strike_guidance_enable_time_ = ros::Time::now();
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+            //===================制导修改====================
+            pn_target_filter_x_.reset();
+            pn_target_filter_y_.reset();
+            pn_target_filter_z_.reset();
+            pn_filtered_target_valid_ = false;
+            pn_last_target_update_time_ = ros::Time();
+            pn_cluster_stale_latch_ = false;
+            if (strike_guidance_logic_ == "pn") {
+                if (current_strategy_type_ ==
+                        multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
+                    guidance_strategy_) {
+                    auto* pn = static_cast<multi_uav_strike::InterceptGuidance*>(
+                        guidance_strategy_.get());
+                    pn->resetLosFilter();
+                }
+                if (has_prev_uav_position_) {
+                    vel_filter_x_.x_prev = last_known_uav_velocity_ned_.x;
+                    vel_filter_y_.x_prev = last_known_uav_velocity_ned_.y;
+                    vel_filter_z_.x_prev = last_known_uav_velocity_ned_.z;
+                    vel_filter_yaw_.x_prev = 0.0;
+                    vel_filter_x_.initialized = true;
+                    vel_filter_y_.initialized = true;
+                    vel_filter_z_.initialized = true;
+                    vel_filter_yaw_.initialized = true;
+                    vel_filter_x_.dx_prev = vel_filter_y_.dx_prev =
+                        vel_filter_z_.dx_prev = vel_filter_yaw_.dx_prev = 0.0;
+                    ROS_WARN("[Guidance] PN handover seed v_NED=(%.2f,%.2f,%.2f)",
+                             last_known_uav_velocity_ned_.x,
+                             last_known_uav_velocity_ned_.y,
+                             last_known_uav_velocity_ned_.z);
+                }
+            }
+            //===================制导修改====================
+        }
+        //===================制导修改====================
         is_enabled_ = msg->data;
         if (is_enabled_) {
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance ENABLED (mode: %s)", current_mode_.c_str());
@@ -602,12 +865,34 @@ public:
                     last_known_uav_velocity_ned_.z);
             }
         } else {
+            //===================制导修改====================
+            // 每次退出制导都清掉图像确认、滤波和切换历史，防止下一次 Attack
+            // 继承上一目标的视线或速度混合状态。
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+            //===================制导修改====================
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
         was_enabled_prev_ = is_enabled_;
     }
 
     void modeCallback(const std_msgs::String::ConstPtr& msg) {
+        //===================制导修改====================
+        const bool entering_strike = (current_mode_ != "strike" && msg->data == "strike");
+        if (entering_strike) {
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+            strike_guidance_enable_time_ = ros::Time::now();
+        }
+        //===================制导修改====================
         current_mode_ = msg->data;
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
@@ -770,6 +1055,271 @@ public:
         }
     }
 
+    //===================制导修改====================
+    static double clampValue(double value, double low, double high) {
+        return std::max(low, std::min(high, value));
+    }
+
+    double currentYawNed() const {
+        const auto& q = current_uav_pose_.pose.orientation;
+        const double yaw_nwu = std::atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        return -yaw_nwu;
+    }
+
+    struct StrikeTargetGeometry {
+        double north = 0.0;
+        double east = 0.0;
+        double down = 0.0;
+        double horizontal = 0.0;
+        double distance = 0.0;
+    };
+
+    StrikeTargetGeometry strikeTargetGeometry(
+        const geometry_msgs::PoseStamped& target_pose) const {
+        StrikeTargetGeometry g;
+        // current pose/target pose 均为节点内部 NWU；这里统一转换到 NED。
+        g.north = target_pose.pose.position.x - current_uav_pose_.pose.position.x;
+        g.east = -(target_pose.pose.position.y - current_uav_pose_.pose.position.y);
+        g.down = -(target_pose.pose.position.z - current_uav_pose_.pose.position.z);
+        g.horizontal = std::hypot(g.north, g.east);
+        g.distance = std::sqrt(g.horizontal * g.horizontal + g.down * g.down);
+        return g;
+    }
+
+    StrikeTargetGeometry strikeTargetGeometry() const {
+        return strikeTargetGeometry(current_target_pose_);
+    }
+
+    bool targetPoseFreshForThisStrike() const {
+        if (!is_target_pose_received_ || last_target_pose_receive_time_.isZero()) return false;
+        if (!strike_guidance_enable_time_.isZero() &&
+            last_target_pose_receive_time_ < strike_guidance_enable_time_) return false;
+        const double age = (ros::Time::now() - last_target_pose_receive_time_).toSec();
+        return age >= 0.0 && age <= strike_target_pose_timeout_sec_;
+    }
+
+    double terminalHorizontalSpeed(double requested_speed, double horizontal_distance) const {
+        if (horizontal_distance <= strike_horizontal_stop_radius_m_) return 0.0;
+        if (horizontal_distance >= strike_slowdown_radius_m_) return requested_speed;
+        const double scale =
+            (horizontal_distance - strike_horizontal_stop_radius_m_) /
+            (strike_slowdown_radius_m_ - strike_horizontal_stop_radius_m_);
+        return requested_speed * clampValue(scale, 0.0, 1.0);
+    }
+
+    double terminalYawRate(double desired_yaw, double horizontal_distance) const {
+        const double yaw_error = std::atan2(std::sin(desired_yaw - currentYawNed()),
+                                            std::cos(desired_yaw - currentYawNed()));
+        double yaw_rate = clampValue(image_yaw_kp_ * yaw_error,
+                                     -image_yaw_rate_max_, image_yaw_rate_max_);
+        if (strike_yaw_freeze_radius_m_ > 1e-3) {
+            yaw_rate *= clampValue(horizontal_distance / strike_yaw_freeze_radius_m_, 0.0, 1.0);
+        }
+        return yaw_rate;
+    }
+
+    //===================制导修改====================
+    double computeSlantDescentSpeed(const StrikeTargetGeometry& g,
+                                    double horizontal_speed) const {
+        // 旧逻辑是只按高度差限幅，远距离时也固定下降1m/s，水平先到后只能垂直打击：
+        // return clampValue(g.down, -image_max_vertical_speed_,
+        //                            image_max_vertical_speed_);
+        if (!strike_slant_descent_enabled_) {
+            return clampValue(g.down, -image_max_vertical_speed_,
+                                      image_max_vertical_speed_);
+        }
+
+        // 水平与垂直预计到达时间同步：vz/vh = 高度差/水平距离。
+        // 再由最大下降角和垂直速度双重限幅，避免异常目标坐标导致陡俯冲。
+        if (g.horizontal > strike_slant_min_horizontal_distance_m_ &&
+            horizontal_speed > 1e-3) {
+            const double geometric_vz = horizontal_speed * g.down / g.horizontal;
+            const double max_angle_rad = strike_slant_descent_max_angle_deg_ * M_PI / 180.0;
+            const double angle_limited_vz = horizontal_speed * std::tan(max_angle_rad);
+            const double vertical_limit = std::min(
+                image_max_vertical_speed_, std::fabs(angle_limited_vz));
+            return clampValue(geometric_vz, -vertical_limit, vertical_limit);
+        }
+
+        // 扰动导致水平已进入停止圈但高度仍未满足命中距离时，保留原垂直下降兜底。
+        return clampValue(g.down, -image_max_vertical_speed_,
+                                  image_max_vertical_speed_);
+    }
+    //===================制导修改====================
+
+    void computeGeoFallbackVelocity(geometry_msgs::Twist& cmd) {
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        const double requested_speed = std::min(track_max_speed_, image_max_speed_);
+        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+        if (g.horizontal > 0.1 && speed > 0.0) {
+            cmd.linear.x = speed * g.north / g.horizontal;
+            cmd.linear.y = speed * g.east / g.horizontal;
+        }
+        //===================制导修改====================
+        // 原垂直控制保留：
+        // cmd.linear.z = clampValue(g.down, -image_max_vertical_speed_,
+        //                                    image_max_vertical_speed_);
+        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        //===================制导修改====================
+        if (g.horizontal > 0.1) {
+            cmd.angular.z = terminalYawRate(std::atan2(g.east, g.north), g.horizontal);
+        }
+    }
+
+    void computeImageVelocity(geometry_msgs::Twist& cmd) {
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        Eigen::Vector3d ray = filtered_image_ray_nwu_;
+        if (ray.norm() < 1e-6) {
+            computeGeoFallbackVelocity(cmd);
+            return;
+        }
+        ray.normalize();
+
+        // bbox 中心只用于速度调度和死区；飞行方向来自同一像素对应的世界视线。
+        double ex = current_image_target_.center_x - 0.5;
+        double ey = current_image_target_.center_y - 0.5;
+        if (std::fabs(ex) < image_center_deadband_) ex = 0.0;
+        if (std::fabs(ey) < image_center_deadband_) ey = 0.0;
+        const double alignment = clampValue(1.0 - std::hypot(ex, ey) / 0.5, 0.25, 1.0);
+        const double requested_speed = std::min(track_max_speed_, image_max_speed_) * alignment;
+        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+
+        // NWU ray → NED ray，一次转换；发布前仍统一走 convertVelNedToEnu。
+        double north = ray.x();
+        double east = -ray.y();
+        //===================制导修改====================
+        // 原图像射线垂直分量保留；新斜线下降统一使用目标三维几何，避免两套高度源跳变。
+        // const double down = -ray.z();
+        //===================制导修改====================
+        double horizontal = std::hypot(north, east);
+
+        // bag中8m内图像射线趋近垂直并多次换边。末端仅保留图像可见性和速度调度，
+        // 水平方向改用稳定的cluster世界坐标，避免越顶后瞬间反向满速修正。
+        if (g.horizontal <= strike_terminal_world_direction_radius_m_ && g.horizontal > 0.1) {
+            north = g.north;
+            east = g.east;
+            horizontal = g.horizontal;
+        }
+        if (horizontal > 0.1 && speed > 0.0) {
+            cmd.linear.x = speed * north / horizontal;
+            cmd.linear.y = speed * east / horizontal;
+        }
+        //===================制导修改====================
+        // 原垂直控制保留：
+        // const double descent_sign_source =
+        //     g.distance > 1e-3 ? g.down : (down >= 0.0 ? 1.0 : -1.0);
+        // cmd.linear.z = clampValue(descent_sign_source,
+        //                           -image_max_vertical_speed_, image_max_vertical_speed_);
+        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        //===================制导修改====================
+
+        if (horizontal > 0.1) {
+            cmd.angular.z = terminalYawRate(std::atan2(east, north), g.horizontal);
+        }
+    }
+
+    void applyStrikeCommandSlewLimit(geometry_msgs::Twist& cmd) {
+        const ros::Time now = ros::Time::now();
+        double dt = last_strike_cmd_time_.isZero()
+            ? (1.0 / 50.0) : (now - last_strike_cmd_time_).toSec();
+        dt = clampValue(dt, 1e-3, 0.1);
+        last_strike_cmd_time_ = now;
+
+        const geometry_msgs::Twist previous = last_strike_cmd_valid_
+            ? last_strike_cmd_ned_ : geometry_msgs::Twist();
+        double dx = cmd.linear.x - previous.linear.x;
+        double dy = cmd.linear.y - previous.linear.y;
+        const double delta_horizontal = std::hypot(dx, dy);
+        const double max_horizontal_delta = strike_max_horizontal_accel_ * dt;
+        if (delta_horizontal > max_horizontal_delta && delta_horizontal > 1e-9) {
+            const double scale = max_horizontal_delta / delta_horizontal;
+            dx *= scale;
+            dy *= scale;
+        }
+        cmd.linear.x = previous.linear.x + dx;
+        cmd.linear.y = previous.linear.y + dy;
+        cmd.linear.z = previous.linear.z + clampValue(
+            cmd.linear.z - previous.linear.z,
+            -strike_max_vertical_accel_ * dt,
+             strike_max_vertical_accel_ * dt);
+        cmd.angular.z = previous.angular.z + clampValue(
+            cmd.angular.z - previous.angular.z,
+            -strike_max_yaw_accel_ * dt,
+             strike_max_yaw_accel_ * dt);
+    }
+
+    void computeImageGeoStrikeVelocity(geometry_msgs::Twist& cmd) {
+        const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
+        const bool stamp_valid = image_target_received_ &&
+                                 current_image_target_.stamp_us > 0 &&
+                                 now_us >= current_image_target_.stamp_us;
+        const double image_age = stamp_valid
+            ? (now_us - current_image_target_.stamp_us) * 1e-6
+            : std::numeric_limits<double>::infinity();
+
+        // 新一轮guidance启用后，必须等本轮新发布的target_estimated_pose。
+        // 等待期间输出零速，由50Hz发布维持OFFBOARD，不再沿用上一任务缓存目标。
+        if (!targetPoseFreshForThisStrike()) {
+            ROS_WARN_THROTTLE(1.0,
+                "[Guidance] Waiting fresh target pose for this strike; publishing zero setpoint");
+            return;
+        }
+        const bool image_ready = stamp_valid && current_image_target_.visible &&
+                                 image_age <= image_visible_timeout_sec_ &&
+                                 image_confirm_count_ >= image_confirm_frames_ &&
+                                 image_ray_filter_valid_;
+        const StrikeVisionState desired_state = image_ready
+            ? StrikeVisionState::IMAGE_GUIDANCE
+            : StrikeVisionState::GEO_FALLBACK;
+
+        if (desired_state != strike_vision_state_) {
+            strike_blend_from_ned_ = last_strike_cmd_valid_
+                ? last_strike_cmd_ned_ : geometry_msgs::Twist();
+            strike_vision_state_ = desired_state;
+            strike_vision_switch_time_ = ros::Time::now();
+            if (desired_state == StrikeVisionState::GEO_FALLBACK) {
+                image_confirm_count_ = 0;
+                image_ray_filter_valid_ = false;
+            }
+            ROS_WARN("[Guidance] strike source -> %s (image_age=%.3fs confirm=%d/%d)",
+                     desired_state == StrikeVisionState::IMAGE_GUIDANCE
+                         ? "IMAGE_GUIDANCE" : "GEO_FALLBACK",
+                     image_age, image_confirm_count_, image_confirm_frames_);
+        }
+
+        geometry_msgs::Twist desired;
+        if (strike_vision_state_ == StrikeVisionState::IMAGE_GUIDANCE) {
+            computeImageVelocity(desired);
+        } else {
+            computeGeoFallbackVelocity(desired);
+        }
+
+        const double elapsed = strike_vision_switch_time_.isZero()
+            ? image_reacquire_blend_sec_
+            : (ros::Time::now() - strike_vision_switch_time_).toSec();
+        const double alpha = image_reacquire_blend_sec_ <= 1e-3
+            ? 1.0 : clampValue(elapsed / image_reacquire_blend_sec_, 0.0, 1.0);
+        cmd.linear.x = (1.0 - alpha) * strike_blend_from_ned_.linear.x + alpha * desired.linear.x;
+        cmd.linear.y = (1.0 - alpha) * strike_blend_from_ned_.linear.y + alpha * desired.linear.y;
+        cmd.linear.z = (1.0 - alpha) * strike_blend_from_ned_.linear.z + alpha * desired.linear.z;
+        cmd.angular.z = (1.0 - alpha) * strike_blend_from_ned_.angular.z + alpha * desired.angular.z;
+        applyStrikeCommandSlewLimit(cmd);
+        last_strike_cmd_ned_ = cmd;
+        last_strike_cmd_valid_ = true;
+
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        ROS_INFO_THROTTLE(1.0,
+            "[Guidance] %s age=%.2fs horiz=%.2fm dist=%.2fm bbox=(%.3f,%.3f) "
+            "cmd_ned=(%.2f,%.2f,%.2f yaw_rate=%.2f)",
+            strike_vision_state_ == StrikeVisionState::IMAGE_GUIDANCE ? "IMAGE" : "GEO",
+            image_age, g.horizontal, g.distance,
+            current_image_target_.center_x, current_image_target_.center_y,
+            cmd.linear.x, cmd.linear.y, cmd.linear.z, cmd.angular.z);
+    }
+    //===================制导修改====================
+
     void guidanceTimerCallback(const ros::TimerEvent&) {
         // SEARCH_ONLY 模式下 guidance 不工作
         if (!is_enabled_) {
@@ -828,35 +1378,49 @@ public:
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
-                    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 6) — cluster stale 软兜底 ===
-                    //   target_estimated_pose 0.5s 没更新 → cluster 已 stale
-                    //   强行用 last_known 位置 chase,会让 PN 输出残影速度,反馈到 body 噪声。
-                    //   此处降速到 cruise 的 1/3,避免在 stale 期间把任何微小位置变化
-                    //   当成新信号放大成大速度指令(已经在 Layer 3-5 平滑,但 stale 阶段
-                    //   仍可能因为新一次 EMA α=0.1 后又来新位置触发完整 chase)。
-                    bool cluster_stale = (last_target_pos_valid_ &&
-                        (ros::Time::now() - last_target_update_time_).toSec() >
-                         kClusterStaleThresholdSec);
-                    if (cluster_stale && !cluster_stale_latch_) {
-                        ROS_WARN_THROTTLE(1.0, "[Guidance] STRIKE cluster stale for >%.1fs, "
-                                              "entering soft-fallback (reduced speed, dead-reckoning)",
-                                              kClusterStaleThresholdSec);
+                    //===================制导修改====================
+                    if (strike_guidance_logic_ == "image_geo_fallback") {
+                        geometry_msgs::Twist vel_cmd;
+                        computeImageGeoStrikeVelocity(vel_cmd);
+                        evaluateStrike();
+                        filterVelocityCmd(vel_cmd);
+                        if (!use_sim_) {
+                            convertVelNedToEnu(vel_cmd);
+                        }
+                        vel_cmd_pub_.publish(vel_cmd);
+                    } else if (strike_guidance_logic_ == "pn") {
+                    // 原 PN STRIKE 分支完整保留，并融合main的目标LPF、stale软降速和handover。
+                    //===================制导修改====================
+                    const bool pn_target_from_this_strike = pn_filtered_target_valid_ &&
+                        !pn_last_target_update_time_.isZero() &&
+                        (strike_guidance_enable_time_.isZero() ||
+                         pn_last_target_update_time_ >= strike_guidance_enable_time_);
+                    if (!pn_target_from_this_strike) {
+                        ROS_WARN_THROTTLE(1.0,
+                            "[Guidance] PN waiting fresh filtered target; publishing zero setpoint");
+                        geometry_msgs::Twist hover_cmd;
+                        if (!use_sim_) convertVelNedToEnu(hover_cmd);
+                        vel_cmd_pub_.publish(hover_cmd);
+                        break;
                     }
-                    cluster_stale_latch_ = cluster_stale;
+
+                    const bool pn_cluster_stale = !pn_last_target_update_time_.isZero() &&
+                        (ros::Time::now() - pn_last_target_update_time_).toSec() >
+                            pn_cluster_stale_timeout_sec_;
+                    if (pn_cluster_stale && !pn_cluster_stale_latch_) {
+                        ROS_WARN("[Guidance] PN target stale > %.2fs; speed scale=%.2f",
+                                 pn_cluster_stale_timeout_sec_,
+                                 pn_cluster_stale_speed_scale_);
+                    }
+                    pn_cluster_stale_latch_ = pn_cluster_stale;
 
                     auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
                     auto cmd = strategy->computeCommand(
                         current_uav_pose_,
-                        current_target_pose_,
+                        pn_filtered_target_pose_,
                         current_target_twist_);
-                    // === Layer 6: stale 期间把 radial_speed/lateral 限速到 1/3 ===
-                    //   cmd.velocity 是 3D 矢量,直接按比例缩放最干净;导航方向不变,
-                    //   只是"信心"降低 → 慢点飞,让真实 cluster 有时间回来或 mission_manager
-                    //   走 TARGET_LOST_HOVER 接管。
-                    if (cluster_stale) {
-                        cmd.velocity.x() *= 0.33;
-                        cmd.velocity.y() *= 0.33;
-                        cmd.velocity.z() *= 0.33;
+                    if (pn_cluster_stale) {
+                        cmd.velocity *= pn_cluster_stale_speed_scale_;
                     }
                     // InterceptGuidance 输出已经是 NED；这里不能再按 NWU 翻转 Y/Z。
                     // 旧链路的二次翻转会让 East 反向，并把目标在下方时的 D+ 下降量钳成 0。
@@ -865,18 +1429,29 @@ public:
 
                     // 基于当前 primary target 的几何 LOS pitch 做下降门控。
                     // 使用 cmd.los_pitch 而不是 gimbal 的全局主目标 LOS，避免多目标时门控错对象。
-                    const double pitch = cmd.los_pitch;                              // 下负上正
-                    const double pitch_threshold = 0.20;                             // rad (2026-08-02: 0.5 → 0.20 ≈ 11.5°)
+                    // const double pitch = cmd.los_pitch;                           // 下负上正
+                    // const double pitch_threshold = 0.20;                          // rad (2026-08-02: 0.5 → 0.20 ≈ 11.5°)
                     //   远距俯冲段 los_pitch 永远 < 28.6°, 旧阈值会把 PN 的 vz 前馈
                     //   压死, UAV 在目标上方水平飞过. 0.20 rad 让 11.5° 以上的俯冲段
                     //   即开始产生下降分量, 短距浅俯冲不再被门控卡住.
-                    const double transition_width = 0.1;                             // rad
-                    const double max_descent_when_level = 0.0;                       // m/s, NED D+
-                    const double smooth_weight = 0.5 * (std::tanh(
-                        (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
-                    double desired_z = cmd.velocity.z();                             // NED: >0 下沉
-                    if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
-                    vel_cmd.linear.z = smooth_weight * desired_z;
+                    // const double transition_width = 0.1;                          // rad
+                    // 原PN垂直门控参数保留：
+                    // const double max_descent_when_level = 0.0;                    // m/s, NED D+
+                    // const double smooth_weight = 0.5 * (std::tanh(
+                    //     (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
+                    // double desired_z = cmd.velocity.z();                          // NED: >0 下沉
+                    // if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
+                    //===================制导修改====================
+                    // 原main PN垂直门控保留：
+                    // vel_cmd.linear.z = smooth_weight * desired_z;
+                    // 融合后两种导引共用斜线下降；PN仅保留自己的水平比例导引和偏航。
+                    const StrikeTargetGeometry pn_geometry =
+                        strikeTargetGeometry(pn_filtered_target_pose_);
+                    const double pn_horizontal_speed = std::hypot(
+                        vel_cmd.linear.x, vel_cmd.linear.y);
+                    vel_cmd.linear.z = computeSlantDescentSpeed(
+                        pn_geometry, pn_horizontal_speed);
+                    //===================制导修改====================
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
                     // === 2026-08-02: STRIKE 偏航跟踪 ===
@@ -943,17 +1518,17 @@ public:
                     pn_dbg.header.stamp = ros::Time::now();
                     pn_dbg.header.frame_id = "nwu_position_ned_velocity";
                     pn_dbg.uav_position_nwu = current_uav_pose_.pose.position;
-                    pn_dbg.target_position_nwu = current_target_pose_.pose.position;
+                    pn_dbg.target_position_nwu = pn_filtered_target_pose_.pose.position;
                     pn_dbg.strategy_velocity_ned.x = cmd.velocity.x();
                     pn_dbg.strategy_velocity_ned.y = cmd.velocity.y();
                     pn_dbg.strategy_velocity_ned.z = cmd.velocity.z();
                     pn_dbg.gated_velocity_ned = gated_velocity_ned;
                     pn_dbg.filtered_velocity_ned = vel_cmd.linear;
-                    const double rel_x = current_target_pose_.pose.position.x -
+                    const double rel_x = pn_filtered_target_pose_.pose.position.x -
                                          current_uav_pose_.pose.position.x;
-                    const double rel_y = current_target_pose_.pose.position.y -
+                    const double rel_y = pn_filtered_target_pose_.pose.position.y -
                                          current_uav_pose_.pose.position.y;
-                    const double rel_z = current_target_pose_.pose.position.z -
+                    const double rel_z = pn_filtered_target_pose_.pose.position.z -
                                          current_uav_pose_.pose.position.z;
                     pn_dbg.horizontal_distance = std::hypot(rel_x, rel_y);
                     pn_dbg.distance = std::sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z);
@@ -962,7 +1537,12 @@ public:
                     pn_dbg.los_yaw_rate = cmd.los_yaw_rate;
                     pn_dbg.los_pitch_rate = cmd.los_pitch_rate;
                     pn_dbg.desired_yaw = cmd.desired_yaw;
-                    pn_dbg.pitch_gate_weight = smooth_weight;
+                    //===================制导修改====================
+                    // 原俯仰门控调试量保留：
+                    // pn_dbg.pitch_gate_weight = smooth_weight;
+                    // 当前PN垂直速度不再经过俯仰门控，固定报告完全放行。
+                    pn_dbg.pitch_gate_weight = 1.0;
+                    //===================制导修改====================
 
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
@@ -970,6 +1550,9 @@ public:
                     vel_cmd_pub_.publish(vel_cmd);
                     pn_debug_pub_.publish(pn_dbg);
                     publishInterceptPointMarker(cmd.intercept_point_nwu);
+                    //===================制导修改====================
+                    }
+                    //===================制导修改====================
                 }
                 break;
             }

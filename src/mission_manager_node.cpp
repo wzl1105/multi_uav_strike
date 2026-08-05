@@ -5095,16 +5095,22 @@ public:
         // === CODEX DIRECT-LOOK END ===
 
         // === CODEX DIRECT-LOOK START ===
-        // 历史背景:这段每 10Hz 重发 stop 是为了"跨 topic 不保证首次 publish 到达顺序"
-        // 兜底。后果:waypoint_executor.controlCallback 收到 stop → stop() → publishZeroVelocity()
-        //   → 往 /mavros/setpoint_velocity/cmd_vel_unstamped 发一帧全 0。
-        //   guidance_control_node 也在 50Hz 发速度,被这一帧 0 插进去 → PX4 OFFBOARD 看到
-        //   速度跳变,横滚/偏航都被推一下(实测 2026-08-04-16-11 bag:STRIKE 期间每 100ms
-        //   一帧全 0,正好每 5 帧 guidance 数据中插一帧 0)。
-        // 修法:删掉这段重发 stop。"stop" 已在 triggerStrike → startGuidanceApproach 时
-        //   通过 mission_manager → waypoint_executor 发过一次(line 4423 附近),单次足够。
-        //   后续阶段要恢复 waypoint(EXIT_PENDING → COMPLETE → HOLDING)走 resume 路径,
-        //   不需要每 tick 再发 stop。
+        // Skill 与 control 是两个 ROS topic，跨 topic 不保证首次 publish 的到达顺序。
+        // 直视打击期间每个 10Hz tick 重发 stop，确保刚装载的 Attack 队列不会与
+        // guidance 同时输出速度；队列仍完整保留，真丢失时才允许 resume。
+        if (current_skill_index_ < skill_queue_.size()) {
+            const SkillRuntime& active = skill_queue_[current_skill_index_];
+            if (active.direct_strike_committed_ && is_guidance_active_) {
+                std_msgs::String stop_cmd;
+                //===================制导修改====================
+                // 原命令保留：stop()会发布零速度，10Hz重发导致制导话题周期性插零。
+                // stop_cmd.data = "stop";
+                // 改为静默交权；仍保持10Hz重发以抵御Skill/control跨topic乱序。
+                stop_cmd.data = "yield_to_guidance";
+                //===================制导修改====================
+                waypoint_control_pub_.publish(stop_cmd);
+            }
+        }
         // === CODEX DIRECT-LOOK END ===
         advanceSkillStateMachine();
         // Attack(105) 专用 tick:门控重试 + 同步时间重算 + 挂起超时放弃
@@ -6065,11 +6071,22 @@ public:
                  missionPhaseToString().c_str());
 
         // 停止航点执行，避免和 guidance 冲突
-        ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
+        //===================制导修改====================
+        // 原日志保留：
+        // ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
+        ROS_WARN("[MissionManager] >>>>> yield_to_guidance about to be published to waypoint_executor");
+        //===================制导修改====================
         std_msgs::String cmd;
-        cmd.data = "stop";
+        //===================制导修改====================
+        // 原命令会让WaypointExecutor发布一次零速度：
+        // cmd.data = "stop";
+        cmd.data = "yield_to_guidance";
+        //===================制导修改====================
         waypoint_control_pub_.publish(cmd);
-        ROS_WARN("[MissionManager] >>>>> stop command published");
+        //===================制导修改====================
+        // ROS_WARN("[MissionManager] >>>>> stop command published");
+        ROS_WARN("[MissionManager] >>>>> yield_to_guidance published");
+        //===================制导修改====================
 
         // === 2026-07-30: 关 attack_hover 留下的 setpoint publisher,避免和 guidance 冲突 ===
         //   根因:UAV 到 attack_point (20m AGL) 时 mission_manager 会启动位置 setpoint publisher
