@@ -58,6 +58,7 @@
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/AvoidanceCmd.h"
 #include "multi_uav_strike/LidarMeasurement.h"
+#include "multi_uav_strike/WorkMode.h"
 
 // 安阳基准点（用于 GPS → NED 转换）
 const double ANYANG_LAT = 36.096;      // 安阳纬度
@@ -78,8 +79,8 @@ private:
     ros::Subscriber mission_mode_typed_sub_; // === 2026-08-05: typed WorkMode(mission/mode 老 topic 已删) ===
     ros::Subscriber guidance_enable_sub_;    // === 2026-08-05: /guidance/enable — 用于 OFFBOARD 心跳 ===
     ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
-    //===================制导修改====================
-    ros::Subscriber guidance_enable_sub_;    // 制导控制权门控，防止与航点速度同时发布
+    // //===================制导修改====================
+    // ros::Subscriber guidance_enable_sub_;    // 制导控制权门控，防止与航点速度同时发布
     //===================制导修改====================
 
     // ============== 发布 ==============
@@ -472,12 +473,12 @@ public:
             "waypoint_executor/control", 10,
             &WaypointExecutor::controlCallback, this);
 
-        //===================制导修改====================
-        // 这是速度发布的最终控制权门控。即使 Skill 与 control 跨 topic 乱序，
-        // guidance enable 后 waypoint_executor 也不能再写 MAVROS 速度话题。
-        guidance_enable_sub_ = nh_.subscribe(
-            "guidance/enable", 10,
-            &WaypointExecutor::guidanceEnableCallback, this);
+        // //===================制导修改====================
+        // // 这是速度发布的最终控制权门控。即使 Skill 与 control 跨 topic 乱序，
+        // // guidance enable 后 waypoint_executor 也不能再写 MAVROS 速度话题。
+        // guidance_enable_sub_ = nh_.subscribe(
+        //     "guidance/enable", 10,
+        //     &WaypointExecutor::guidanceEnableCallback, this);
         //===================制导修改====================
 
         // 工作模式（来自 mission_manager 转发的地面站指令）
@@ -1193,9 +1194,9 @@ public:
     //   - true:  guidance_control 接管了,waypoint 必须停,否则两个 publisher
     //           在 setpoint_velocity 上叠加会导致 PX4 速度震荡
     //   - false: 没有 guidance,waypoint 必须持续发(允许 0 速度)维持 OFFBOARD 心跳
-    void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
-        is_guidance_active_ = msg->data;
-    }
+    // void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
+    //     is_guidance_active_ = msg->data;
+    // }
 
     // === 2026-08-05: typed WorkMode 回调(替代已删的 String topic) ===
     //   与 missionModeCallback 完全相同的逻辑,只把 uint8 转成对应字符串名

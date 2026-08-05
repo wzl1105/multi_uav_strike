@@ -179,9 +179,9 @@ private:
     //   第一帧 (2.83, 0.19, 0) 差距很大。如果 OneEuro filter 从 x_prev=0 开始,
     //   会先塌陷到 0.33 m/s 再爬回 5.27,过程中 yaw rate 也会饱和摆动。
     //   修法:guidance enable 时用 UAV 当前实际速度初始化 filter,x_prev 跳过 0 状态。
-    geometry_msgs::Vector3 last_known_uav_velocity_ned_;  // pose-delta 计算
-    geometry_msgs::Point   prev_uav_pos_ned_;
-    ros::Time               prev_uav_pos_time_;
+    // geometry_msgs::Vector3 last_known_uav_velocity_ned_;  // pose-delta 计算
+    // geometry_msgs::Point   prev_uav_pos_ned_;
+    // ros::Time               prev_uav_pos_time_;
     bool                    has_prev_uav_pos_   = false;
     bool                    was_enabled_prev_   = false;
 
@@ -609,9 +609,9 @@ public:
         //   target_estimator EMA α=0.1 后残余噪声 ~0.05m,10Hz 发布在 50Hz PN 调用
         //   帧边界产生 0.04 rad/s los_rate 阶跃 → v_lateral 单帧 ~6m/s 跳变(被 nav_ratio 限幅)。
         //   对 nx/ny/nz 加 1Hz OneEuro,稳态 std 砍 ~70%,首跳 ≤0.1s 滞后可接受。
-        const double fx = target_filter_x_.filter(nx, msg->header.stamp.toSec());
-        const double fy = target_filter_y_.filter(ny, msg->header.stamp.toSec());
-        const double fz = target_filter_z_.filter(nz, msg->header.stamp.toSec());
+        const double fx = pn_target_filter_x_.filter(nx, msg->header.stamp.toSec());
+        const double fy = pn_target_filter_y_.filter(ny, msg->header.stamp.toSec());
+        const double fz = pn_target_filter_z_.filter(nz, msg->header.stamp.toSec());
 
         // Jump detection below uses raw values (nx/ny/nz) — keeps it independent of LPF lag.
 
