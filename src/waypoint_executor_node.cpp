@@ -237,6 +237,18 @@ private:
 
     // 最后一个航点到位后是否已打印过日志（避免每周期刷屏）
     bool last_waypoint_reached_logged_;
+    // === 2026-08-05: 速度斜坡 (smooth handover) ===
+    //   背景:11:01 bag 实测 attack-targets 到达后 5 秒 hold 0,然后从 0 突变 5.4 m/s
+    //   (硬切),waypoint 飞 14.9 m/s,接近目标 brake 到 4-5 m/s。
+    //   修法:publishVelocityCommandWithYaw 加 LERP 斜坡,目标速度跳变时
+    //   用 ~300ms 平滑过去。避免硬切冲击 PX4 OFFBOARD,降低能量消耗。
+    double filt_vx_ = 0.0;   // 已发布的水平速度
+    double filt_vy_ = 0.0;
+    double filt_vz_ = 0.0;
+    double filt_yaw_ = 0.0;
+    ros::Time last_vel_pub_time_;
+    // 斜坡时间常数:300ms 内从 0 爬到目标速度的 90% (~3 tau)
+    static constexpr double kVelRampTauSec = 0.10;
 
     // 最后一个航点 P-controller 增益（用于位置保持，避免震荡）
     double hold_kp_;
@@ -1248,6 +1260,27 @@ public:
      * PX4 SITL: 需要将 NED 转换为 ENU
      */
     void publishVelocityCommandWithYaw(double vx, double vy, double vz, double desired_yaw_ned) {
+        // === 2026-08-05: 速度斜坡(平滑交接)===
+        //   11:01 bag 实测:attack-targets 到达后 0→5.4 m/s 硬切 → PX4 OFFBOARD 速度震荡
+        //   → 1s 内幅值跳动大。修法:一阶 IIR ramp 限制 vx/vy/vz 跳变幅度
+        //   alpha = 1 - exp(-dt/tau),tau=0.10s → 30ms 内爬到 26%,300ms 爬到 95%
+        //   解决硬切,但保留正常 L1 控制的快速响应
+        const ros::Time now = ros::Time::now();
+        if (!last_vel_pub_time_.isZero()) {
+            const double dt = (now - last_vel_pub_time_).toSec();
+            if (dt > 0.0 && dt < 1.0) {
+                const double alpha = 1.0 - std::exp(-dt / kVelRampTauSec);
+                vx = filt_vx_ + alpha * (vx - filt_vx_);
+                vy = filt_vy_ + alpha * (vy - filt_vy_);
+                vz = filt_vz_ + alpha * (vz - filt_vz_);
+                // Yaw 不 ramp(由 PX4 内环 P 控制,小幅跳变不伤),保持瞬时响应
+            }
+        }
+        last_vel_pub_time_ = now;
+        filt_vx_ = vx;
+        filt_vy_ = vy;
+        filt_vz_ = vz;
+
         geometry_msgs::Twist vel_cmd;
         vel_cmd.linear.x = vx;
         vel_cmd.linear.y = vy;
@@ -1344,6 +1377,15 @@ public:
         vel_cmd.angular.z = 0.0;  // 停止时偏航角速率也为0
 
         setpoint_velocity_pub_.publish(vel_cmd);
+
+        // === 2026-08-05: 同步 ramp filter 状态 ===
+        //   publishZeroVelocity() 发 0 之后,如果恢复 publish 非零速度,
+        //   ramp 会从 0 慢慢爬,避免从历史速度突然跳到目标速度造成硬切。
+        //   (上层的 ramp filter 已经在 publishVelocityCommandWithYaw 里实现)
+        filt_vx_ = 0.0;
+        filt_vy_ = 0.0;
+        filt_vz_ = 0.0;
+        last_vel_pub_time_ = ros::Time::now();
 
         ROS_DEBUG_THROTTLE(1.0, "[WaypointExecutor] Zero velocity published");
     }
