@@ -9,7 +9,7 @@ guidance_strategy: "intercept"   # intercept / minsnap / los
 
 # //===================制导修改====================
 # STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
-# legacy_pn=保留并启用原来的 InterceptGuidance(PN) 分支。
+# pn=融合main分支增强后的比例导引；legacy_pn作为pn的兼容别名。
 strike_guidance_logic: "image_geo_fallback"
 
 # 连续新图像帧达到此数量后才允许从坐标备份切入图像导引，避免单帧闪烁。
@@ -24,7 +24,7 @@ image_max_speed: 5.0
 # //===================制导修改====================
 # image_max_vertical_speed: 1.0
 image_max_vertical_speed: 3.0
-# 斜线下降：水平/垂直到达时间同步，30度为相对水平面的最大下降角。
+# IMAGE/GEO与PN共用斜线下降：水平/垂直到达时间同步，30度为最大下降角。
 strike_slant_descent_enabled: true
 strike_slant_descent_max_angle_deg: 30.0
 # 1m内若仍有较大高度误差，退出斜线计算并保留垂直下降安全兜底。
@@ -35,6 +35,13 @@ image_center_deadband: 0.03
 image_ray_alpha: 0.25
 image_yaw_kp: 0.6
 image_yaw_rate_max: 0.5
+
+# PN专用目标输入滤波和陈旧目标软降速；IMAGE/GEO不使用这些滤波结果。
+pn_target_filter_min_cutoff_hz: 1.0
+pn_target_filter_beta: 0.005
+pn_target_filter_d_cutoff_hz: 1.0
+pn_cluster_stale_timeout_sec: 0.5
+pn_cluster_stale_speed_scale: 0.33
 
 # 本次 bag 中 8m 内图像射线接近垂直，水平分量反复换向；末端改用已锁定目标的
 # 世界坐标方向，并随水平距离连续减速，1m 内停止水平追逐。
@@ -77,7 +84,9 @@ nav_ratio: 0.5                   # 导航比 N: 1.0=纯追踪, 3~5=经典 PN. �
 #                                  #  俯仰/滚转 std≈5.9°/5.1°. 静止目标下 N=0.5 = 纯追踪,
 #                                  #  环路增益 <1 不激发正反馈, 验证是否能压平振荡)
 max_lead_angle_deg: 30.0         # 前置角约束: 合速度与 LOS 夹角超过此值则钳到边界 (deg)
-los_filter_cutoff_hz: 2.0        # LOS 角低通滤波截止 (Hz). 越高越跟手越抖, 越低越平滑越滞后
+# main分支增强值：1Hz抑制10Hz目标输入在PN 50Hz帧边界造成的LOS-rate尖峰。
+# 原值保留：los_filter_cutoff_hz: 2.0
+los_filter_cutoff_hz: 1.0        # 越高越跟手越抖,越低越平滑越滞后
 
 # LOS 制导参数（仅 los_kp_yaw / los_max_rate 是节点专属，los_kp_pitch 在 strategies 中）
 los_kp_yaw: 1.5

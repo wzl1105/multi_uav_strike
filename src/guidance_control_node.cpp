@@ -142,6 +142,22 @@ private:
     multi_uav_strike::OneEuroFilter1D vel_filter_y_;
     multi_uav_strike::OneEuroFilter1D vel_filter_z_;
     multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
+    //===================制导修改====================
+    // main PN增强使用独立目标滤波状态；不得覆盖IMAGE/GEO使用的原始目标坐标。
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_x_;
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_y_;
+    multi_uav_strike::OneEuroFilter1D pn_target_filter_z_;
+    geometry_msgs::PoseStamped pn_filtered_target_pose_;
+    bool pn_filtered_target_valid_ = false;
+    ros::Time pn_last_target_update_time_;
+    double pn_cluster_stale_timeout_sec_ = 0.5;
+    double pn_cluster_stale_speed_scale_ = 0.33;
+    bool pn_cluster_stale_latch_ = false;
+    geometry_msgs::Vector3 last_known_uav_velocity_ned_;
+    geometry_msgs::Point prev_uav_position_nwu_;
+    ros::Time prev_uav_position_time_;
+    bool has_prev_uav_position_ = false;
+    //===================制导修改====================
     ros::Time                    vel_filter_last_time_;
     // 目标位置突变超过此值时，在 targetPoseCallback 内、下一次 PN 计算之前重置滤波器。
     static constexpr double kTargetSwitchJumpM = 5.0;
@@ -341,14 +357,50 @@ public:
         //   (beta 让截止频率随 dx/dt 升高,反而放行稳态摆动).
         //   新默认值 0.5Hz + beta=0.001 把 1 Hz+ 成分削掉 ~12 dB,
         //   PN 输出的 0.3 m/s std 摆动会被压到 ~0.05 m/s.
+        //===================制导修改====================
+        // 按STRIKE选择隔离输出滤波默认值：PN吸收main增强值，IMAGE保持local_save实测值。
+        std::string strike_logic_for_filter_defaults;
+        nh_private_.param<std::string>("strike_guidance_logic",
+                                       strike_logic_for_filter_defaults,
+                                       "image_geo_fallback");
+        const bool use_main_pn_filter_defaults =
+            strike_logic_for_filter_defaults == "pn" ||
+            strike_logic_for_filter_defaults == "legacy_pn";
+        const double default_vel_min_cutoff = use_main_pn_filter_defaults ? 0.25 : 0.5;
+        const double default_vel_beta = use_main_pn_filter_defaults ? 0.02 : 0.001;
+        const double default_vel_d_cutoff = use_main_pn_filter_defaults ? 0.5 : 1.0;
+        //===================制导修改====================
         double vel_min_cutoff, vel_beta, vel_d_cutoff;
-        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 0.5);
-        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.001);
-        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   1.0);
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff,
+                                  default_vel_min_cutoff);
+        nh_private_.param<double>("vel_smooth_beta", vel_beta, default_vel_beta);
+        nh_private_.param<double>("vel_smooth_d_cutoff_hz", vel_d_cutoff,
+                                  default_vel_d_cutoff);
         vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
         vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        //===================制导修改====================
+        double pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff;
+        nh_private_.param<double>("pn_target_filter_min_cutoff_hz",
+                                  pn_target_min_cutoff, 1.0);
+        nh_private_.param<double>("pn_target_filter_beta", pn_target_beta, 0.005);
+        nh_private_.param<double>("pn_target_filter_d_cutoff_hz",
+                                  pn_target_d_cutoff, 1.0);
+        pn_target_filter_x_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        pn_target_filter_y_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        pn_target_filter_z_ = multi_uav_strike::OneEuroFilter1D(
+            pn_target_min_cutoff, pn_target_beta, pn_target_d_cutoff);
+        nh_private_.param<double>("pn_cluster_stale_timeout_sec",
+                                  pn_cluster_stale_timeout_sec_, 0.5);
+        nh_private_.param<double>("pn_cluster_stale_speed_scale",
+                                  pn_cluster_stale_speed_scale_, 0.33);
+        pn_cluster_stale_timeout_sec_ = std::max(0.1, pn_cluster_stale_timeout_sec_);
+        pn_cluster_stale_speed_scale_ = clampValue(
+            pn_cluster_stale_speed_scale_, 0.0, 1.0);
+        //===================制导修改====================
         vel_filter_last_time_ = ros::Time();
         ROS_INFO("[Guidance] Vel cmd OneEuro: min_cutoff=%.2fHz beta=%.3f d_cutoff=%.2fHz",
                  vel_min_cutoff, vel_beta, vel_d_cutoff);
@@ -359,6 +411,18 @@ public:
         //===================制导修改====================
         nh_private_.param<std::string>("strike_guidance_logic", strike_guidance_logic_,
                                        "image_geo_fallback");
+        //===================制导修改====================
+        if (strike_guidance_logic_ == "legacy_pn") {
+            ROS_WARN("[Guidance] strike_guidance_logic=legacy_pn is deprecated; using pn");
+            strike_guidance_logic_ = "pn";
+        } else if (strike_guidance_logic_ != "image_geo_fallback" &&
+                   strike_guidance_logic_ != "pn") {
+            ROS_ERROR("[Guidance] Invalid strike_guidance_logic='%s'; fallback to image_geo_fallback",
+                      strike_guidance_logic_.c_str());
+            strike_guidance_logic_ = "image_geo_fallback";
+        }
+        ROS_WARN("[Guidance] STRIKE guidance selected: %s", strike_guidance_logic_.c_str());
+        //===================制导修改====================
         nh_private_.param<int>("image_confirm_frames", image_confirm_frames_, 3);
         nh_private_.param<double>("image_visible_timeout_sec", image_visible_timeout_sec_, 0.4);
         nh_private_.param<double>("image_reacquire_blend_sec", image_reacquire_blend_sec_, 0.7);
@@ -540,6 +604,13 @@ public:
                 vel_filter_y_.reset();
                 vel_filter_z_.reset();
                 vel_filter_yaw_.reset();
+                //===================制导修改====================
+                pn_target_filter_x_.reset();
+                pn_target_filter_y_.reset();
+                pn_target_filter_z_.reset();
+                pn_filtered_target_valid_ = false;
+                pn_cluster_stale_latch_ = false;
+                //===================制导修改====================
                 if (current_strategy_type_ ==
                     multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
                     guidance_strategy_) {
@@ -563,6 +634,17 @@ public:
         is_target_pose_received_ = true;
         //===================制导修改====================
         last_target_pose_receive_time_ = ros::Time::now();
+
+        // main分支PN Layer 5：10Hz目标阶跃先经独立1Hz OneEuro，再交给50Hz PN。
+        // IMAGE/GEO继续使用上面的current_target_pose_原值，二者互不污染。
+        pn_filtered_target_pose_ = *msg;
+        const double filter_time = msg->header.stamp.isZero()
+            ? ros::Time::now().toSec() : msg->header.stamp.toSec();
+        pn_filtered_target_pose_.pose.position.x = pn_target_filter_x_.filter(nx, filter_time);
+        pn_filtered_target_pose_.pose.position.y = pn_target_filter_y_.filter(ny, filter_time);
+        pn_filtered_target_pose_.pose.position.z = pn_target_filter_z_.filter(nz, filter_time);
+        pn_filtered_target_valid_ = true;
+        pn_last_target_update_time_ = ros::Time::now();
         //===================制导修改====================
     }
 
@@ -650,6 +732,24 @@ public:
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;
         is_uav_pose_received_ = true;
+
+        //===================制导修改====================
+        // main分支handover思想：由内部NWU位置差分估计实际NED速度，PN接管时作为滤波初值。
+        if (has_prev_uav_position_) {
+            const double dt = (msg->header.stamp - prev_uav_position_time_).toSec();
+            if (dt > 0.001 && dt < 0.5) {
+                const double dn = current_uav_pose_.pose.position.x - prev_uav_position_nwu_.x;
+                const double dw = current_uav_pose_.pose.position.y - prev_uav_position_nwu_.y;
+                const double du = current_uav_pose_.pose.position.z - prev_uav_position_nwu_.z;
+                last_known_uav_velocity_ned_.x = dn / dt;
+                last_known_uav_velocity_ned_.y = -dw / dt;
+                last_known_uav_velocity_ned_.z = -du / dt;
+            }
+        }
+        prev_uav_position_nwu_ = current_uav_pose_.pose.position;
+        prev_uav_position_time_ = msg->header.stamp;
+        has_prev_uav_position_ = true;
+        //===================制导修改====================
     }
 
     void losAngleCallback(const geometry_msgs::Point::ConstPtr& msg) {
@@ -673,6 +773,39 @@ public:
             strike_vision_switch_time_ = ros::Time();
             last_strike_cmd_valid_ = false;
             last_strike_cmd_time_ = ros::Time();
+            //===================制导修改====================
+            pn_target_filter_x_.reset();
+            pn_target_filter_y_.reset();
+            pn_target_filter_z_.reset();
+            pn_filtered_target_valid_ = false;
+            pn_last_target_update_time_ = ros::Time();
+            pn_cluster_stale_latch_ = false;
+            if (strike_guidance_logic_ == "pn") {
+                if (current_strategy_type_ ==
+                        multi_uav_strike::GuidanceStrategyType::INTERCEPT &&
+                    guidance_strategy_) {
+                    auto* pn = static_cast<multi_uav_strike::InterceptGuidance*>(
+                        guidance_strategy_.get());
+                    pn->resetLosFilter();
+                }
+                if (has_prev_uav_position_) {
+                    vel_filter_x_.x_prev = last_known_uav_velocity_ned_.x;
+                    vel_filter_y_.x_prev = last_known_uav_velocity_ned_.y;
+                    vel_filter_z_.x_prev = last_known_uav_velocity_ned_.z;
+                    vel_filter_yaw_.x_prev = 0.0;
+                    vel_filter_x_.initialized = true;
+                    vel_filter_y_.initialized = true;
+                    vel_filter_z_.initialized = true;
+                    vel_filter_yaw_.initialized = true;
+                    vel_filter_x_.dx_prev = vel_filter_y_.dx_prev =
+                        vel_filter_z_.dx_prev = vel_filter_yaw_.dx_prev = 0.0;
+                    ROS_WARN("[Guidance] PN handover seed v_NED=(%.2f,%.2f,%.2f)",
+                             last_known_uav_velocity_ned_.x,
+                             last_known_uav_velocity_ned_.y,
+                             last_known_uav_velocity_ned_.z);
+                }
+            }
+            //===================制导修改====================
         }
         //===================制导修改====================
         is_enabled_ = msg->data;
@@ -889,15 +1022,20 @@ public:
         double distance = 0.0;
     };
 
-    StrikeTargetGeometry strikeTargetGeometry() const {
+    StrikeTargetGeometry strikeTargetGeometry(
+        const geometry_msgs::PoseStamped& target_pose) const {
         StrikeTargetGeometry g;
         // current pose/target pose 均为节点内部 NWU；这里统一转换到 NED。
-        g.north = current_target_pose_.pose.position.x - current_uav_pose_.pose.position.x;
-        g.east = -(current_target_pose_.pose.position.y - current_uav_pose_.pose.position.y);
-        g.down = -(current_target_pose_.pose.position.z - current_uav_pose_.pose.position.z);
+        g.north = target_pose.pose.position.x - current_uav_pose_.pose.position.x;
+        g.east = -(target_pose.pose.position.y - current_uav_pose_.pose.position.y);
+        g.down = -(target_pose.pose.position.z - current_uav_pose_.pose.position.z);
         g.horizontal = std::hypot(g.north, g.east);
         g.distance = std::sqrt(g.horizontal * g.horizontal + g.down * g.down);
         return g;
+    }
+
+    StrikeTargetGeometry strikeTargetGeometry() const {
+        return strikeTargetGeometry(current_target_pose_);
     }
 
     bool targetPoseFreshForThisStrike() const {
@@ -1196,14 +1334,40 @@ public:
                             convertVelNedToEnu(vel_cmd);
                         }
                         vel_cmd_pub_.publish(vel_cmd);
-                    } else {
-                    // 原 PN STRIKE 分支完整保留；配置为 legacy_pn 时仍可回退验证。
+                    } else if (strike_guidance_logic_ == "pn") {
+                    // 原 PN STRIKE 分支完整保留，并融合main的目标LPF、stale软降速和handover。
                     //===================制导修改====================
+                    const bool pn_target_from_this_strike = pn_filtered_target_valid_ &&
+                        !pn_last_target_update_time_.isZero() &&
+                        (strike_guidance_enable_time_.isZero() ||
+                         pn_last_target_update_time_ >= strike_guidance_enable_time_);
+                    if (!pn_target_from_this_strike) {
+                        ROS_WARN_THROTTLE(1.0,
+                            "[Guidance] PN waiting fresh filtered target; publishing zero setpoint");
+                        geometry_msgs::Twist hover_cmd;
+                        if (!use_sim_) convertVelNedToEnu(hover_cmd);
+                        vel_cmd_pub_.publish(hover_cmd);
+                        break;
+                    }
+
+                    const bool pn_cluster_stale = !pn_last_target_update_time_.isZero() &&
+                        (ros::Time::now() - pn_last_target_update_time_).toSec() >
+                            pn_cluster_stale_timeout_sec_;
+                    if (pn_cluster_stale && !pn_cluster_stale_latch_) {
+                        ROS_WARN("[Guidance] PN target stale > %.2fs; speed scale=%.2f",
+                                 pn_cluster_stale_timeout_sec_,
+                                 pn_cluster_stale_speed_scale_);
+                    }
+                    pn_cluster_stale_latch_ = pn_cluster_stale;
+
                     auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
                     auto cmd = strategy->computeCommand(
                         current_uav_pose_,
-                        current_target_pose_,
+                        pn_filtered_target_pose_,
                         current_target_twist_);
+                    if (pn_cluster_stale) {
+                        cmd.velocity *= pn_cluster_stale_speed_scale_;
+                    }
                     // InterceptGuidance 输出已经是 NED；这里不能再按 NWU 翻转 Y/Z。
                     // 旧链路的二次翻转会让 East 反向，并把目标在下方时的 D+ 下降量钳成 0。
                     vel_cmd.linear.x = cmd.velocity.x();
@@ -1211,18 +1375,29 @@ public:
 
                     // 基于当前 primary target 的几何 LOS pitch 做下降门控。
                     // 使用 cmd.los_pitch 而不是 gimbal 的全局主目标 LOS，避免多目标时门控错对象。
-                    const double pitch = cmd.los_pitch;                              // 下负上正
-                    const double pitch_threshold = 0.20;                             // rad (2026-08-02: 0.5 → 0.20 ≈ 11.5°)
+                    // const double pitch = cmd.los_pitch;                           // 下负上正
+                    // const double pitch_threshold = 0.20;                          // rad (2026-08-02: 0.5 → 0.20 ≈ 11.5°)
                     //   远距俯冲段 los_pitch 永远 < 28.6°, 旧阈值会把 PN 的 vz 前馈
                     //   压死, UAV 在目标上方水平飞过. 0.20 rad 让 11.5° 以上的俯冲段
                     //   即开始产生下降分量, 短距浅俯冲不再被门控卡住.
-                    const double transition_width = 0.1;                             // rad
-                    const double max_descent_when_level = 0.0;                       // m/s, NED D+
-                    const double smooth_weight = 0.5 * (std::tanh(
-                        (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
-                    double desired_z = cmd.velocity.z();                             // NED: >0 下沉
-                    if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
-                    vel_cmd.linear.z = smooth_weight * desired_z;
+                    // const double transition_width = 0.1;                          // rad
+                    // 原PN垂直门控参数保留：
+                    // const double max_descent_when_level = 0.0;                    // m/s, NED D+
+                    // const double smooth_weight = 0.5 * (std::tanh(
+                    //     (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
+                    // double desired_z = cmd.velocity.z();                          // NED: >0 下沉
+                    // if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
+                    //===================制导修改====================
+                    // 原main PN垂直门控保留：
+                    // vel_cmd.linear.z = smooth_weight * desired_z;
+                    // 融合后两种导引共用斜线下降；PN仅保留自己的水平比例导引和偏航。
+                    const StrikeTargetGeometry pn_geometry =
+                        strikeTargetGeometry(pn_filtered_target_pose_);
+                    const double pn_horizontal_speed = std::hypot(
+                        vel_cmd.linear.x, vel_cmd.linear.y);
+                    vel_cmd.linear.z = computeSlantDescentSpeed(
+                        pn_geometry, pn_horizontal_speed);
+                    //===================制导修改====================
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
                     // === 2026-08-02: STRIKE 偏航跟踪 ===
@@ -1289,17 +1464,17 @@ public:
                     pn_dbg.header.stamp = ros::Time::now();
                     pn_dbg.header.frame_id = "nwu_position_ned_velocity";
                     pn_dbg.uav_position_nwu = current_uav_pose_.pose.position;
-                    pn_dbg.target_position_nwu = current_target_pose_.pose.position;
+                    pn_dbg.target_position_nwu = pn_filtered_target_pose_.pose.position;
                     pn_dbg.strategy_velocity_ned.x = cmd.velocity.x();
                     pn_dbg.strategy_velocity_ned.y = cmd.velocity.y();
                     pn_dbg.strategy_velocity_ned.z = cmd.velocity.z();
                     pn_dbg.gated_velocity_ned = gated_velocity_ned;
                     pn_dbg.filtered_velocity_ned = vel_cmd.linear;
-                    const double rel_x = current_target_pose_.pose.position.x -
+                    const double rel_x = pn_filtered_target_pose_.pose.position.x -
                                          current_uav_pose_.pose.position.x;
-                    const double rel_y = current_target_pose_.pose.position.y -
+                    const double rel_y = pn_filtered_target_pose_.pose.position.y -
                                          current_uav_pose_.pose.position.y;
-                    const double rel_z = current_target_pose_.pose.position.z -
+                    const double rel_z = pn_filtered_target_pose_.pose.position.z -
                                          current_uav_pose_.pose.position.z;
                     pn_dbg.horizontal_distance = std::hypot(rel_x, rel_y);
                     pn_dbg.distance = std::sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z);
@@ -1308,7 +1483,12 @@ public:
                     pn_dbg.los_yaw_rate = cmd.los_yaw_rate;
                     pn_dbg.los_pitch_rate = cmd.los_pitch_rate;
                     pn_dbg.desired_yaw = cmd.desired_yaw;
-                    pn_dbg.pitch_gate_weight = smooth_weight;
+                    //===================制导修改====================
+                    // 原俯仰门控调试量保留：
+                    // pn_dbg.pitch_gate_weight = smooth_weight;
+                    // 当前PN垂直速度不再经过俯仰门控，固定报告完全放行。
+                    pn_dbg.pitch_gate_weight = 1.0;
+                    //===================制导修改====================
 
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
