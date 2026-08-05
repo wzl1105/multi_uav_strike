@@ -1,20 +1,16 @@
 <?xml version="1.0"?>
 <launch>
-    <node name="gimbal_simulator_node" 
-          pkg="multi_uav_strike" 
-          type="gimbal_simulator_node" 
+ <arg name="uav_name" default="uav0" />
+ <group ns="$(arg uav_name)">
+    <node name="gimbal_simulator_node"
+          pkg="multi_uav_strike"
+          type="gimbal_simulator_node"
           output="screen"
           respawn="true">
-
-        <!-- 云台核心参数 -->
-        <param name="image_width" value="1920" type="int" />
-        <param name="image_height" value="1080" type="int" />
-        <param name="fov_deg" value="45.0" type="double" />
-        <param name="gimbal_p_gain" value="0.5" type="double" />
-        <param name="max_yaw_rate" value="1.0" type="double" />
-        <param name="max_pitch_rate" value="0.8" type="double" />
-        <param name="uav_pose_topic" value="/uav_pose" type="string" />
-        <param name="loop_freq" value="100.0" type="double" />
-
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/gimbal_simulator.yaml" />
     </node>
+  </group>
 </launch>

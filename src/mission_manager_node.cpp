@@ -2819,22 +2819,11 @@ public:
             ROS_WARN_THROTTLE(2.0, "[MissionManager] triggerStrike aborted: no locked cluster");
             return;
         }
-        if (locked_cluster_last_seen_us_ != 0) {
-            const double last_seen_age_sec =
-                (ros::Time::now().toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
-            if (last_seen_age_sec > max_strike_cluster_age_sec_) {
-                ROS_WARN_THROTTLE(2.0, "[MissionManager] triggerStrike aborted: stale "
-                                  "locked_cluster_id_=%lu last_seen_age=%.2fs > max=%.2fs "
-                                  "— clearing lock, let waypoint continue to attack_point",
-                                  static_cast<unsigned long>(locked_cluster_id_),
-                                  last_seen_age_sec, max_strike_cluster_age_sec_);
-                locked_cluster_id_            = 0;
-                locked_cluster_time_          = ros::Time();
-                locked_cluster_last_seen_us_  = 0;
-                tracked_target_.is_valid      = false;
-                setLockState(TrackLockState::NOT_LOCKED);
-                return;
-            }
+        // === 2026-08-03: stale 检查禁用 ===
+        //   用户口径:"看到一帧就更新一帧,能打就用 guidance"。max_strike_cluster_age_sec_
+        //   参数保留(yaml 兼容),代码不再用来 abort strike。任何非零 locked_cluster 都打。
+        if (false && locked_cluster_last_seen_us_ != 0) {
+            // (2026-08-03 disabled: 任何 cluster 都打)
         }
         // 新锁定:reset One Euro Filter,确保首次位置不会被旧目标的 x_prev 污染
         target_smooth_x_.reset();
@@ -3414,24 +3403,14 @@ public:
                 //   3056 行才判 is_strike_stale,导致 stale cluster 把锁占住,
                 //   后续 cluster 全部降级 non-primary → 真正目标永远打不了
                 //   新逻辑:stale 在 case 头部短路,只 publish type=3 给 GS,不动锁
-                if (is_strike_stale) {
-                    multi_uav_strike::DetectTarget dt_d = buildDetectTarget(cluster, /*target_type=*/3);
-                    detect_target_pub_.publish(dt_d);
-                    {
-                        multi_uav_strike::DetectTargets batch;
-                        batch.targets.push_back(dt_d);
-                        detect_targets_pub_.publish(batch);
-                    }
-                    // === Bug B 修:不写 reported_to_gs_,让下一帧 cluster 重新进 strike 路径 ===
-                    //   旧版"等下一帧/下一次新检测触发 strike"注释名存实亡:
-                    //     reported_to_gs_[id] 写了 → 下一帧 dedup 直接 continue → 永远不补打
-                    ROS_WARN_THROTTLE(2.0,
-                        "[MissionManager] Cluster[%lu] label=%s SEARCH_STRIKE stale "
-                        "→ publish type=3 (no lock, no strike, re-try next frame)",
-                        cluster.cluster_id, cluster.label.c_str());
-                    break;
+                //
+                // === 2026-08-03: stale 短路也禁用 ===
+                //   用户口径:"看到一帧就更新一帧,能打就用 guidance"。任何 cluster
+                //   (包括 stale / 旧位置 / 短遮挡后重新出现的)都直接走 strike 流程。
+                if (false && is_strike_stale) {
+                    // (2026-08-03 disabled: 不再因 stale 跳过 strike)
                 }
-                // 新鲜命中:正常 strike 流程(Attack(105) deferred-pick 也复用此方法)
+                // 正常 strike 流程(Attack(105) deferred-pick 也复用此方法)
                 processSearchStrikeStrike(cluster, sr);
                 break;
             }
@@ -5248,89 +5227,19 @@ public:
         //        此处改用 (now - last_seen_us) 反映"YOLO 多久没看到目标"。
         //   GUIDANCE_TRACK/STRIKE 中 age > T_hold(2s) → 进入 TARGET_LOST_HOVER。
         //   TARGET_LOST_HOVER 中 age > T_resume(10s) → 回 WAYPOINT_FOLLOW,resume 段扫描。
-        if ((current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
+        //
+        // === 2026-08-03: TARGET_LOST_HOVER / resume 全部禁用 ===
+        //   用户口径:"看不到就按照 WP2 飞",不再锁位置 hover。
+        //   guidance 阶段目标丢失,让 waypoint_executor 继续按 SKILL_AREA 飞向 WP2;
+        //   任何新 cluster 进得来再触发 strike。target_lost_hold_sec_ /
+        //   target_lost_resume_sec_ 参数保留(兼容 yaml),代码不再使用。
+        if (false && (current_phase_ == MissionPhase::PHASE_GUIDANCE_TRACK ||
              current_phase_ == MissionPhase::PHASE_GUIDANCE_STRIKE) &&
             locked_cluster_id_ != 0 && locked_cluster_last_seen_us_ != 0) {
-            double age = (now.toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6;
-            if (age > target_lost_hold_sec_) {
-                ROS_WARN("[MissionManager] Target lost in guidance (cluster=%lu age=%.1fs > hold=%.1fs) "
-                         "→ TARGET_LOST_HOVER (will re-try up to resume=%.1fs, then resume segment scan)",
-                         (unsigned long)locked_cluster_id_, age, target_lost_hold_sec_,
-                         target_lost_resume_sec_);
-                current_phase_                = MissionPhase::PHASE_TARGET_LOST_HOVER;
-                target_lost_hover_active_     = true;
-                target_lost_hover_enter_time_ = now;
-                disableGuidance();
-                std_msgs::String stop_cmd;
-                stop_cmd.data = "stop";
-                waypoint_control_pub_.publish(stop_cmd);
-
-                // === 2026-08-03: 启 setpoint publisher 锁当前位置 ===
-                //   旧的"disableGuidance + stop"会让 PX4 OFFBOARD 500ms~1s 内失流
-                //   → AUTO.LAND failsafe,UAV 永远等不到 target_lost_resume_sec_ 的
-                //   resume 分支。复用 attack_hover 同样的 latch 模式:起 50Hz 位置
-                //   setpoint,锁当前 pose 维持 OFFBOARD 心跳。
-                //   若 setpoint_running_ 已经是 true(例如 attack_hover 启的),直接
-                //   复用,只置 latch 标志以便 resume 时知道是自己启的。
-                if (!setpoint_running_ && is_pose_received_) {
-                    startSetpointPublisher();
-                    takeoff_setpoint_.pose.position.x = current_pose_.pose.position.y;  // y_ned → x_enu (east)
-                    takeoff_setpoint_.pose.position.y = current_pose_.pose.position.x;  // x_ned → y_enu (north)
-                    takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z; // 当前高度 (NED z 取反)
-                    target_lost_hover_setpoint_latched_ = true;
-                    ROS_WARN("[MissionManager] TARGET_LOST_HOVER setpoint publisher latched at current pose "
-                             "(pos=%.2f,%.2f, alt=%.2f) — will hover %.1fs waiting for re-acquire",
-                             takeoff_setpoint_.pose.position.x,
-                             takeoff_setpoint_.pose.position.y,
-                             takeoff_setpoint_.pose.position.z,
-                             target_lost_resume_sec_);
-                } else if (setpoint_running_) {
-                    // 已被 attack_hover 等其他 latch 占用,只标自己的位
-                    target_lost_hover_setpoint_latched_ = true;
-                    ROS_WARN("[MissionManager] TARGET_LOST_HOVER: setpoint publisher already running (attack_hover?), "
-                             "reuse it for OFFBOARD heartbeat during hover");
-                }
-                publishMissionState();
-            }
-        } else if (current_phase_ == MissionPhase::PHASE_TARGET_LOST_HOVER &&
+            // (2026-08-03 disabled: 不再进 TARGET_LOST_HOVER)
+        } else if (false && current_phase_ == MissionPhase::PHASE_TARGET_LOST_HOVER &&
                    target_lost_hover_active_) {
-            // 恢复超时: 用 last_seen_us 优先;若从未锁定(target_lost 期间 0),fallback 进入时间
-            double age = (locked_cluster_last_seen_us_ != 0)
-                             ? (now.toNSec() / 1000ULL - locked_cluster_last_seen_us_) / 1e6
-                             : (now - target_lost_hover_enter_time_).toSec();
-            if (age > target_lost_resume_sec_) {
-                ROS_WARN("[MissionManager] Target lost resume timeout (age=%.1fs > resume=%.1fs) "
-                         "→ WAYPOINT_FOLLOW, resuming segment scan",
-                         age, target_lost_resume_sec_);
-                target_lost_hover_active_ = false;
-                locked_cluster_id_        = 0;
-                locked_cluster_ned_x_     = 0.0;
-                locked_cluster_ned_y_     = 0.0;
-                locked_cluster_ned_alt_   = 0.0;
-                locked_cluster_time_      = ros::Time();
-                tracked_target_.is_valid  = false;
-                // 直视打击真实丢失并完成等待后，切回标准 Attack 航点门控。
-                // executor 此时已缓存当前 WP1->WP2，resume 后从 WP1 正常开始。
-                sr.direct_strike_committed_ = false;
-                publishPrimaryTarget(0);  // estimator 回退最高置信度
-                current_phase_            = MissionPhase::PHASE_WAYPOINT_FOLLOW;
-                // === 2026-08-03: 停 setpoint publisher,让 waypoint_executor 接管 ===
-                //   顺序:先发 resume 给 waypoint_executor(让它开始发速度 setpoint),
-                //   再停本节点自己的 setpoint publisher — 两路 setpoint 不能并存,
-                //   但 waypoint_executor resume 后会从 stop 状态切回正常发速度,
-                //   mission_manager 这边 setpoint publisher 立即停也不会有真空
-                //   (OFFBOARD 收到下一帧 waypoint_executor 速度 setpoint 接管)。
-                std_msgs::String resume_cmd;
-                resume_cmd.data = "resume";
-                waypoint_control_pub_.publish(resume_cmd);
-                if (target_lost_hover_setpoint_latched_) {
-                    target_lost_hover_setpoint_latched_ = false;
-                    if (setpoint_running_) {
-                        stopSetpointPublisher();
-                    }
-                }
-                publishMissionState();
-            }
+            // (2026-08-03 disabled: 不再 resume 回扫描)
         }
 
         switch (sr.state) {
@@ -5636,40 +5545,14 @@ public:
                 //     - 已有兜底:只在 attack_strike_pending_ 已 true 但 gating 一直 WAITING 时跑。
                 //   优先级:此处 EXIT_PENDING(攻击放弃)在 in_task_timeout → FAILED 之前;若 in_task_timeout_
                 //   同时爆,FAILED 覆盖(更严重,符合"内层 timeout 被外层 timeout 顶上"的语义)。
-                if (sr.msg.skill_type == 105 &&
+                //
+                // === 2026-08-03: ABANDONED 兜底禁用 ===
+                //   用户口径:"无论如何也要打,看不到就按 WP2 飞"。
+                //   不再因为没看到目标而 ABANDONED。attack_hover_timeout_sec_ /
+                //   attack_no_target_hold_sec_ 参数保留(yaml 兼容),代码不再用。
+                if (false && sr.msg.skill_type == 105 &&
                     !sr.attack_hover_enter_time_.isZero()) {
-                    // === 2026-07-30: 双超时语义 ===
-                    //   - 见过 WP2 范围内的目标(attack_wp2_target_seen_=true):
-                    //       30s 兜底,防 stale 后一直挂。
-                    //   - 从未见过 WP2 范围内的目标:"确实没目标就悬停"语义,
-                    //       长超时 attack_no_target_hold_sec_(默认 300s),给仿真更多时间看清。
-                    const double hover_timeout = attack_wp2_target_seen_
-                        ? attack_hover_timeout_sec_
-                        : attack_no_target_hold_sec_;
-                    if (hover_timeout > 0.0 &&
-                        (now - sr.attack_hover_enter_time_).toSec() > hover_timeout) {
-                        sr.attack_phase_      = SkillRuntime::AttackPhase::ABANDONED;
-                        sr.state               = SkillState::EXIT_PENDING;
-                        sr.state_enter_time    = now;
-                        sr.last_event          = attack_wp2_target_seen_
-                            ? "IN_TASK to EXIT_PENDING (attack hover timeout)"
-                            : "IN_TASK to EXIT_PENDING (attack no-target hold timeout)";
-                        // 结束 hover:清 latched 标志并停 setpoint publisher。
-                        //   此时 phase=WAYPOINT_FOLLOW,runPx4TakeoffSequence 下个 tick
-                        //   看到标志为 false 才会 stop(否则会因 phase 不对不停,后续 skill
-                        //   接管时残留 publisher 流会冲突)。
-                        attack_hover_setpoint_latched_ = false;
-                        if (setpoint_running_) {
-                            stopSetpointPublisher();
-                        }
-                        ROS_WARN("[MissionManager] Skill[%zu] id=%s Attack(105) HOVER TIMEOUT "
-                                 "(%.1fs > %.1fs, wp2_seen=%s), ABANDONED (pending=%s)",
-                                 current_skill_index_, sr.msg.skill_id.c_str(),
-                                 (now - sr.attack_hover_enter_time_).toSec(),
-                                 hover_timeout,
-                                 attack_wp2_target_seen_ ? "true" : "false",
-                                 attack_strike_pending_ ? "true" : "false");
-                    }
+                    // (2026-08-03 disabled: 不再 ABANDONED)
                 }
 
                 // in_task_timeout 检查
@@ -5785,29 +5668,12 @@ public:
                 // 已 locked_cluster_* 在 clusterStatesCallback 挂起时已缓存,直接 trigger
                 triggerStrike();
             } else {
-                // 3) 挂起超时(默认 60s):放弃当前 strike,转 ABANDONED
-                if (!attack_strike_pending_time_.isZero() &&
-                    attack_strike_pending_time_ != ros::Time() &&
-                    (ros::Time::now() - attack_strike_pending_time_).toSec() >
-                        attack_strike_pending_timeout_sec_) {
-                    ROS_WARN("[MissionManager] Attack(105) strike pending TIMEOUT "
-                             "(%.1fs > %.1fs), abandoning",
-                             (ros::Time::now() - attack_strike_pending_time_).toSec(),
-                             attack_strike_pending_timeout_sec_);
-                    attack_strike_pending_            = false;
-                    attack_strike_pending_cluster_id_ = 0;
-                    sr.attack_phase_                  = SkillRuntime::AttackPhase::ABANDONED;
-                    // 推进当前 skill
-                    if (sr.state == SkillState::IN_TASK) {
-                        sr.state = SkillState::EXIT_PENDING;
-                        sr.state_enter_time = ros::Time::now();
-                        sr.last_event = "IN_TASK to EXIT_PENDING (attack abandon)";
-                        // 结束 hover:同上,清标志停 publisher
-                        attack_hover_setpoint_latched_ = false;
-                        if (setpoint_running_) {
-                            stopSetpointPublisher();
-                        }
-                    }
+                // 3) 挂起超时 — 2026-08-03 禁用
+                //   用户口径:"无论如何也要打,看到一帧就更新一帧,能打就用 guidance"。
+                //   attack_strike_pending_timeout_sec_ 参数保留(yaml 兼容),代码不再用来
+                //   ABANDONED。WAITING 永远等下去,任何新 cluster 进得来再重试。
+                if (false) {
+                    // (2026-08-03 disabled: 整个挂起超时分支不再 ABANDONED)
                 }
             }
         }

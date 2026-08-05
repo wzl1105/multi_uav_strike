@@ -939,23 +939,14 @@ public:
 
         double dx_to_target = target_wp.ned_x - current_ned_x_;
         double dy_to_target = target_wp.ned_y - current_ned_y_;
-        // === Attack(105) SKILL_AREA 飞行轨迹高度钳 ===
-        //   不修改 WP2 坐标,只在飞行目标 z 上钳到 attack_min_altitude_ned_
-        //   (默认 -20m = 20m AGL)。效果:
-        //     - WP1→WP2 段:飞机沿 WP1→WP2 直线飞,目标 z 钳到 20m AGL
-        //       → 用户口径:"沿 WP1→WP2 飞,到 AGL 20m 停"
-        //     - 到达 WP2 水平位置(20m AGL)时,YOLO 命中 → strike 接管;
-        //       YOLO 没命中 → 20m AGL hover 等
-        //   NED 下向=正,ned_z 越大=越低;ned_z > attack_min_altitude_ned_ 表示低于 20m AGL,需要钳到上限
+        // === Attack(105) SKILL_AREA 飞行轨迹高度 ===
+        // 2026-08-03:去掉 20m AGL 高度钳,直接用 target_wp.ned_z。
+        //   原 20m 钳导致:YOLO 命中前 attack_speed 高速冲到 20m 然后停,看不到目标
+        //   之后再也不打。新策略:跟着 WP2 实际高度飞,YOLO 命中就走 guidance strike,
+        //   看不到就一直按 waypoint_exec 沿 WP1→WP2 飞。
         double target_z_for_flight = target_wp.ned_z;
-        if (active_skill_type_ == 105 &&
-            segment_phase_ == SegmentPhase::SKILL_AREA &&
-            target_z_for_flight > attack_min_altitude_ned_) {
-            ROS_WARN_THROTTLE(5.0,
-                "[WaypointExecutor] Attack(105) flight path altitude clamp: target_wp.ned_z=%.2f -> %.2f (20m AGL floor)",
-                target_z_for_flight, attack_min_altitude_ned_);
-            target_z_for_flight = attack_min_altitude_ned_;
-        }
+        // (attack_min_altitude_ned_ 参数仍保留读取兼容,但不再做钳)
+        (void)attack_min_altitude_ned_;
         const double effective_target_z = target_z_for_flight + lidar_altitude_offset_;
         double dz_to_target = effective_target_z - current_ned_z_;
         double dist_to_target = sqrt(dx_to_target*dx_to_target +
@@ -966,6 +957,7 @@ public:
         double dist_h = sqrt(dx_to_target*dx_to_target + dy_to_target*dy_to_target);
 
         double vx, vy;
+        double vz;
         double bearing;
 
         // === 终段 P-control(水平面位置误差 → 速度,平滑收敛到 0)===
@@ -1092,6 +1084,18 @@ public:
             }
         }
 
+        // === 垂直速度(参考 executeWaypointFlight 的限幅)===
+        // (2026-08-03: vz 已在顶层声明,这里只赋值)
+        if (fabs(dz_to_target) > 1.0) {
+            vz = (dz_to_target > 0 ? 1.0 : -1.0) * uav_vertical_speed_;
+        } else {
+            vz = hold_kp_ * dz_to_target;
+        }
+        // 限幅(防御性,虽然上面已经限到 ±uav_vertical_speed_)
+        if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+        if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+
+
         // === Attack(105) SKILL_AREA 接近段(idx>=1):机头朝向 WP2(目标) ===
         //   WP1 → WP2 段,L1 沿段方向算 lookahead,机头可能不正对目标;
         //   对搜索/打击场景,YOLO 朝向必须朝目标,这里强制 bearing = 朝 WP2。
@@ -1111,7 +1115,7 @@ public:
                            dist_to_target, bearing * 180.0 / M_PI);
 
         // === 垂直速度(参考 executeWaypointFlight 的限幅)===
-        double vz;
+        // (2026-08-03: vz 已在顶层声明,这里只赋值)
         if (fabs(dz_to_target) > 1.0) {
             vz = (dz_to_target > 0 ? 1.0 : -1.0) * uav_vertical_speed_;
         } else {
@@ -1120,6 +1124,37 @@ public:
         // 限幅(防御性,虽然上面已经限到 ±uav_vertical_speed_)
         if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
         if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+        // === 2026-08-03: Attack(105) SKILL_AREA — 3D pure pursuit (覆盖 vz 公式) ===
+        //   用户原话:"需要速度矢量指向目标,现在很蠢的飞到了目标上方开始降低高度。"
+        //   之前 L1 控制 (vx, vy) 沿段方向 + v_lateral 修 XTE,vz 单独
+        //   按 target_z dive,结果飞机先水平飞到 WP2 xy 上空,然后才 dive z。
+        //   修复:idx>=0(transit)和 idx>=1 段都用 3D pure pursuit —
+        //   速度矢量直接指向 target(含 z),水平垂直同步收敛。
+        //   bearing 从 (vx, vy) 反算,保证和速度同向。
+        //   terminal(dist_h < final_approach_threshold_)走 P-control 不动。
+        //   位置:必须放在 vz 公式**之后**,否则 vz 公式会覆写我们设的 vz(用 sign(dz) * 3 m/s)。
+        if (active_skill_type_ == 105 &&
+            segment_phase_ == SegmentPhase::SKILL_AREA &&
+            dist_h >= final_approach_threshold_) {
+            // dx_to_target, dy_to_target 已在 line 940 算好,直接复用
+            // dz_to_target 也在 line 951 算好
+            // 3D 距离:水平 + 垂直
+            double dist_3d = std::sqrt(dx_to_target * dx_to_target +
+                                        dy_to_target * dy_to_target +
+                                        dz_to_target * dz_to_target);
+            if (dist_3d > 0.01) {
+                double scale = task_speed_ / dist_3d;
+                vx = dx_to_target * scale;
+                vy = dy_to_target * scale;
+                vz = dz_to_target * scale;
+                // vz 限幅(防御性,理论 scale*v_along ≤ v_along,水平垂直
+                // 速度同时不会超过 v_along,但实际可能有数值误差,保险起见)
+                if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+                if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+                bearing = std::atan2(vy, vx);
+            }
+            // dist_3d < 0.01(已经在 WP2)留原值,terminal P-control 兜底
+        }
 
         // === 应用 AvoidanceCmd(横向严禁需要段方向来分解速度,清掉横向补偿)===
         applyAvoidanceCmd(vx, vy, vz, bearing);
