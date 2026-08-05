@@ -12,6 +12,9 @@
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <cmath>
+//===================制导修改====================
+#include <algorithm>
+//===================制导修改====================
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
@@ -19,6 +22,9 @@
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 #include "multi_uav_strike/InterUavStatus.h"  // /inter_uav/uav_status 心跳(替代 other_uav_poses)
+//===================制导修改====================
+#include "multi_uav_strike/PrimaryImageTarget.h"
+//===================制导修改====================
 
 class GuidanceControlNode {
 private:
@@ -37,6 +43,9 @@ private:
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber heartbeat_sub_;        // 邻居心跳 /inter_uav/uav_status(替代原 other_uav_poses)
     ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
+    //===================制导修改====================
+    ros::Subscriber primary_image_target_sub_;
+    //===================制导修改====================
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -168,6 +177,46 @@ private:
     ros::Time last_heartbeat_purge_;
     double avoidance_safe_distance_;
 
+    //===================制导修改====================
+    enum class StrikeVisionState { GEO_FALLBACK, IMAGE_GUIDANCE };
+    std::string strike_guidance_logic_ = "image_geo_fallback";
+    multi_uav_strike::PrimaryImageTarget current_image_target_;
+    bool image_target_received_ = false;
+    uint32_t last_image_frame_seq_ = 0;
+    uint64_t last_image_stamp_us_ = 0;
+    int image_confirm_count_ = 0;
+    int image_confirm_frames_ = 3;
+    double image_visible_timeout_sec_ = 0.4;
+    double image_reacquire_blend_sec_ = 0.7;
+    double image_max_speed_ = 5.0;
+    double image_max_vertical_speed_ = 1.0;
+    double image_center_deadband_ = 0.03;
+    double image_ray_alpha_ = 0.25;
+    double image_yaw_kp_ = 0.6;
+    double image_yaw_rate_max_ = 0.5;
+    //===================制导修改====================
+    // 2026-08-05 bag 修复：近距减速、垂直视线退化保护、启动新鲜度和指令斜率限制。
+    double strike_slowdown_radius_m_ = 10.0;
+    double strike_horizontal_stop_radius_m_ = 1.0;
+    double strike_terminal_world_direction_radius_m_ = 8.0;
+    double strike_yaw_freeze_radius_m_ = 3.0;
+    double strike_target_pose_timeout_sec_ = 0.5;
+    double strike_max_horizontal_accel_ = 2.0;
+    double strike_max_vertical_accel_ = 1.0;
+    double strike_max_yaw_accel_ = 1.0;
+    ros::Time last_target_pose_receive_time_;
+    ros::Time strike_guidance_enable_time_;
+    ros::Time last_strike_cmd_time_;
+    //===================制导修改====================
+    Eigen::Vector3d filtered_image_ray_nwu_{0.0, 0.0, -1.0};
+    bool image_ray_filter_valid_ = false;
+    StrikeVisionState strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+    ros::Time strike_vision_switch_time_;
+    geometry_msgs::Twist strike_blend_from_ned_;
+    geometry_msgs::Twist last_strike_cmd_ned_;
+    bool last_strike_cmd_valid_ = false;
+    //===================制导修改====================
+
 public:
     GuidanceControlNode() : nh_private_("~"),
         first_strike_evaluated_(false),
@@ -298,6 +347,39 @@ public:
         // STRIKE模式专用参数
         nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
 
+        //===================制导修改====================
+        nh_private_.param<std::string>("strike_guidance_logic", strike_guidance_logic_,
+                                       "image_geo_fallback");
+        nh_private_.param<int>("image_confirm_frames", image_confirm_frames_, 3);
+        nh_private_.param<double>("image_visible_timeout_sec", image_visible_timeout_sec_, 0.4);
+        nh_private_.param<double>("image_reacquire_blend_sec", image_reacquire_blend_sec_, 0.7);
+        nh_private_.param<double>("image_max_speed", image_max_speed_, 5.0);
+        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
+        nh_private_.param<double>("image_center_deadband", image_center_deadband_, 0.03);
+        nh_private_.param<double>("image_ray_alpha", image_ray_alpha_, 0.25);
+        nh_private_.param<double>("image_yaw_kp", image_yaw_kp_, 0.6);
+        nh_private_.param<double>("image_yaw_rate_max", image_yaw_rate_max_, 0.5);
+        //===================制导修改====================
+        nh_private_.param<double>("strike_slowdown_radius_m", strike_slowdown_radius_m_, 10.0);
+        nh_private_.param<double>("strike_horizontal_stop_radius_m",
+                                  strike_horizontal_stop_radius_m_, 1.0);
+        nh_private_.param<double>("strike_terminal_world_direction_radius_m",
+                                  strike_terminal_world_direction_radius_m_, 8.0);
+        nh_private_.param<double>("strike_yaw_freeze_radius_m", strike_yaw_freeze_radius_m_, 3.0);
+        nh_private_.param<double>("strike_target_pose_timeout_sec",
+                                  strike_target_pose_timeout_sec_, 0.5);
+        nh_private_.param<double>("strike_max_horizontal_accel",
+                                  strike_max_horizontal_accel_, 2.0);
+        nh_private_.param<double>("strike_max_vertical_accel",
+                                  strike_max_vertical_accel_, 1.0);
+        nh_private_.param<double>("strike_max_yaw_accel", strike_max_yaw_accel_, 1.0);
+        strike_slowdown_radius_m_ = std::max(
+            strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
+        strike_terminal_world_direction_radius_m_ = std::max(
+            strike_terminal_world_direction_radius_m_, strike_horizontal_stop_radius_m_);
+        //===================制导修改====================
+        //===================制导修改====================
+
         ROS_INFO("[Guidance] Mode: %s, pose_topic: %s", use_sim_ ? "SIMULATION" : "PX4 SITL", pose_topic_.c_str());
     }
 
@@ -348,6 +430,12 @@ public:
         home_position_sub_ = nh_.subscribe(
             "mavros/home_position/home", 10,
             &GuidanceControlNode::homePositionCallback, this);
+
+        //===================制导修改====================
+        primary_image_target_sub_ = nh_.subscribe(
+            "guidance/primary_image_target", 10,
+            &GuidanceControlNode::primaryImageTargetCallback, this);
+        //===================制导修改====================
     }
 
     void initPublishers() {
@@ -441,12 +529,50 @@ public:
 
         current_target_pose_ = *msg;
         is_target_pose_received_ = true;
+        //===================制导修改====================
+        last_target_pose_receive_time_ = ros::Time::now();
+        //===================制导修改====================
     }
 
     void targetTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
         current_target_twist_ = *msg;
         is_target_twist_received_ = true;
     }
+
+    //===================制导修改====================
+    void primaryImageTargetCallback(
+        const multi_uav_strike::PrimaryImageTarget::ConstPtr& msg) {
+        current_image_target_ = *msg;
+        image_target_received_ = true;
+
+        // statesTimerCb 会重复发布同一帧，只有 frame_seq/stamp 真正变化才累计确认帧。
+        const bool is_new_frame = msg->frame_seq != last_image_frame_seq_ ||
+                                  msg->stamp_us != last_image_stamp_us_;
+        if (is_new_frame) {
+            last_image_frame_seq_ = msg->frame_seq;
+            last_image_stamp_us_ = msg->stamp_us;
+            if (msg->visible) {
+                image_confirm_count_ = std::min(image_confirm_count_ + 1,
+                                                image_confirm_frames_);
+                Eigen::Vector3d ray(msg->world_ray_nwu.x,
+                                    msg->world_ray_nwu.y,
+                                    msg->world_ray_nwu.z);
+                if (ray.norm() > 1e-6) {
+                    ray.normalize();
+                    if (!image_ray_filter_valid_) {
+                        filtered_image_ray_nwu_ = ray;
+                        image_ray_filter_valid_ = true;
+                    } else {
+                        filtered_image_ray_nwu_ =
+                            image_ray_alpha_ * ray +
+                            (1.0 - image_ray_alpha_) * filtered_image_ray_nwu_;
+                        filtered_image_ray_nwu_.normalize();
+                    }
+                }
+            }
+        }
+    }
+    //===================制导修改====================
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         if (use_sim_) {
@@ -505,15 +631,49 @@ public:
     }
 
     void enableCallback(const std_msgs::Bool::ConstPtr& msg) {
+        //===================制导修改====================
+        const bool rising_edge = (!is_enabled_ && msg->data);
+        if (rising_edge) {
+            strike_guidance_enable_time_ = ros::Time::now();
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+        }
+        //===================制导修改====================
         is_enabled_ = msg->data;
         if (is_enabled_) {
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance ENABLED (mode: %s)", current_mode_.c_str());
         } else {
+            //===================制导修改====================
+            // 每次退出制导都清掉图像确认、滤波和切换历史，防止下一次 Attack
+            // 继承上一目标的视线或速度混合状态。
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+            //===================制导修改====================
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
     }
 
     void modeCallback(const std_msgs::String::ConstPtr& msg) {
+        //===================制导修改====================
+        const bool entering_strike = (current_mode_ != "strike" && msg->data == "strike");
+        if (entering_strike) {
+            image_confirm_count_ = 0;
+            image_ray_filter_valid_ = false;
+            strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
+            strike_vision_switch_time_ = ros::Time();
+            last_strike_cmd_valid_ = false;
+            last_strike_cmd_time_ = ros::Time();
+            strike_guidance_enable_time_ = ros::Time::now();
+        }
+        //===================制导修改====================
         current_mode_ = msg->data;
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
@@ -676,6 +836,228 @@ public:
         }
     }
 
+    //===================制导修改====================
+    static double clampValue(double value, double low, double high) {
+        return std::max(low, std::min(high, value));
+    }
+
+    double currentYawNed() const {
+        const auto& q = current_uav_pose_.pose.orientation;
+        const double yaw_nwu = std::atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        return -yaw_nwu;
+    }
+
+    struct StrikeTargetGeometry {
+        double north = 0.0;
+        double east = 0.0;
+        double down = 0.0;
+        double horizontal = 0.0;
+        double distance = 0.0;
+    };
+
+    StrikeTargetGeometry strikeTargetGeometry() const {
+        StrikeTargetGeometry g;
+        // current pose/target pose 均为节点内部 NWU；这里统一转换到 NED。
+        g.north = current_target_pose_.pose.position.x - current_uav_pose_.pose.position.x;
+        g.east = -(current_target_pose_.pose.position.y - current_uav_pose_.pose.position.y);
+        g.down = -(current_target_pose_.pose.position.z - current_uav_pose_.pose.position.z);
+        g.horizontal = std::hypot(g.north, g.east);
+        g.distance = std::sqrt(g.horizontal * g.horizontal + g.down * g.down);
+        return g;
+    }
+
+    bool targetPoseFreshForThisStrike() const {
+        if (!is_target_pose_received_ || last_target_pose_receive_time_.isZero()) return false;
+        if (!strike_guidance_enable_time_.isZero() &&
+            last_target_pose_receive_time_ < strike_guidance_enable_time_) return false;
+        const double age = (ros::Time::now() - last_target_pose_receive_time_).toSec();
+        return age >= 0.0 && age <= strike_target_pose_timeout_sec_;
+    }
+
+    double terminalHorizontalSpeed(double requested_speed, double horizontal_distance) const {
+        if (horizontal_distance <= strike_horizontal_stop_radius_m_) return 0.0;
+        if (horizontal_distance >= strike_slowdown_radius_m_) return requested_speed;
+        const double scale =
+            (horizontal_distance - strike_horizontal_stop_radius_m_) /
+            (strike_slowdown_radius_m_ - strike_horizontal_stop_radius_m_);
+        return requested_speed * clampValue(scale, 0.0, 1.0);
+    }
+
+    double terminalYawRate(double desired_yaw, double horizontal_distance) const {
+        const double yaw_error = std::atan2(std::sin(desired_yaw - currentYawNed()),
+                                            std::cos(desired_yaw - currentYawNed()));
+        double yaw_rate = clampValue(image_yaw_kp_ * yaw_error,
+                                     -image_yaw_rate_max_, image_yaw_rate_max_);
+        if (strike_yaw_freeze_radius_m_ > 1e-3) {
+            yaw_rate *= clampValue(horizontal_distance / strike_yaw_freeze_radius_m_, 0.0, 1.0);
+        }
+        return yaw_rate;
+    }
+
+    void computeGeoFallbackVelocity(geometry_msgs::Twist& cmd) {
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        const double requested_speed = std::min(track_max_speed_, image_max_speed_);
+        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+        if (g.horizontal > 0.1 && speed > 0.0) {
+            cmd.linear.x = speed * g.north / g.horizontal;
+            cmd.linear.y = speed * g.east / g.horizontal;
+        }
+        // 末端下降不再除以趋近于零的水平距离，避免垂直指令数值退化。
+        cmd.linear.z = clampValue(g.down, -image_max_vertical_speed_,
+                                          image_max_vertical_speed_);
+        if (g.horizontal > 0.1) {
+            cmd.angular.z = terminalYawRate(std::atan2(g.east, g.north), g.horizontal);
+        }
+    }
+
+    void computeImageVelocity(geometry_msgs::Twist& cmd) {
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        Eigen::Vector3d ray = filtered_image_ray_nwu_;
+        if (ray.norm() < 1e-6) {
+            computeGeoFallbackVelocity(cmd);
+            return;
+        }
+        ray.normalize();
+
+        // bbox 中心只用于速度调度和死区；飞行方向来自同一像素对应的世界视线。
+        double ex = current_image_target_.center_x - 0.5;
+        double ey = current_image_target_.center_y - 0.5;
+        if (std::fabs(ex) < image_center_deadband_) ex = 0.0;
+        if (std::fabs(ey) < image_center_deadband_) ey = 0.0;
+        const double alignment = clampValue(1.0 - std::hypot(ex, ey) / 0.5, 0.25, 1.0);
+        const double requested_speed = std::min(track_max_speed_, image_max_speed_) * alignment;
+        const double speed = terminalHorizontalSpeed(requested_speed, g.horizontal);
+
+        // NWU ray → NED ray，一次转换；发布前仍统一走 convertVelNedToEnu。
+        double north = ray.x();
+        double east = -ray.y();
+        const double down = -ray.z();
+        double horizontal = std::hypot(north, east);
+
+        // bag中8m内图像射线趋近垂直并多次换边。末端仅保留图像可见性和速度调度，
+        // 水平方向改用稳定的cluster世界坐标，避免越顶后瞬间反向满速修正。
+        if (g.horizontal <= strike_terminal_world_direction_radius_m_ && g.horizontal > 0.1) {
+            north = g.north;
+            east = g.east;
+            horizontal = g.horizontal;
+        }
+        if (horizontal > 0.1 && speed > 0.0) {
+            cmd.linear.x = speed * north / horizontal;
+            cmd.linear.y = speed * east / horizontal;
+        }
+        // 保持受限下降；不再让水平减速同时把下降速度降为零。
+        const double descent_sign_source =
+            g.distance > 1e-3 ? g.down : (down >= 0.0 ? 1.0 : -1.0);
+        cmd.linear.z = clampValue(descent_sign_source,
+                                  -image_max_vertical_speed_, image_max_vertical_speed_);
+
+        if (horizontal > 0.1) {
+            cmd.angular.z = terminalYawRate(std::atan2(east, north), g.horizontal);
+        }
+    }
+
+    void applyStrikeCommandSlewLimit(geometry_msgs::Twist& cmd) {
+        const ros::Time now = ros::Time::now();
+        double dt = last_strike_cmd_time_.isZero()
+            ? (1.0 / 50.0) : (now - last_strike_cmd_time_).toSec();
+        dt = clampValue(dt, 1e-3, 0.1);
+        last_strike_cmd_time_ = now;
+
+        const geometry_msgs::Twist previous = last_strike_cmd_valid_
+            ? last_strike_cmd_ned_ : geometry_msgs::Twist();
+        double dx = cmd.linear.x - previous.linear.x;
+        double dy = cmd.linear.y - previous.linear.y;
+        const double delta_horizontal = std::hypot(dx, dy);
+        const double max_horizontal_delta = strike_max_horizontal_accel_ * dt;
+        if (delta_horizontal > max_horizontal_delta && delta_horizontal > 1e-9) {
+            const double scale = max_horizontal_delta / delta_horizontal;
+            dx *= scale;
+            dy *= scale;
+        }
+        cmd.linear.x = previous.linear.x + dx;
+        cmd.linear.y = previous.linear.y + dy;
+        cmd.linear.z = previous.linear.z + clampValue(
+            cmd.linear.z - previous.linear.z,
+            -strike_max_vertical_accel_ * dt,
+             strike_max_vertical_accel_ * dt);
+        cmd.angular.z = previous.angular.z + clampValue(
+            cmd.angular.z - previous.angular.z,
+            -strike_max_yaw_accel_ * dt,
+             strike_max_yaw_accel_ * dt);
+    }
+
+    void computeImageGeoStrikeVelocity(geometry_msgs::Twist& cmd) {
+        const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
+        const bool stamp_valid = image_target_received_ &&
+                                 current_image_target_.stamp_us > 0 &&
+                                 now_us >= current_image_target_.stamp_us;
+        const double image_age = stamp_valid
+            ? (now_us - current_image_target_.stamp_us) * 1e-6
+            : std::numeric_limits<double>::infinity();
+
+        // 新一轮guidance启用后，必须等本轮新发布的target_estimated_pose。
+        // 等待期间输出零速，由50Hz发布维持OFFBOARD，不再沿用上一任务缓存目标。
+        if (!targetPoseFreshForThisStrike()) {
+            ROS_WARN_THROTTLE(1.0,
+                "[Guidance] Waiting fresh target pose for this strike; publishing zero setpoint");
+            return;
+        }
+        const bool image_ready = stamp_valid && current_image_target_.visible &&
+                                 image_age <= image_visible_timeout_sec_ &&
+                                 image_confirm_count_ >= image_confirm_frames_ &&
+                                 image_ray_filter_valid_;
+        const StrikeVisionState desired_state = image_ready
+            ? StrikeVisionState::IMAGE_GUIDANCE
+            : StrikeVisionState::GEO_FALLBACK;
+
+        if (desired_state != strike_vision_state_) {
+            strike_blend_from_ned_ = last_strike_cmd_valid_
+                ? last_strike_cmd_ned_ : geometry_msgs::Twist();
+            strike_vision_state_ = desired_state;
+            strike_vision_switch_time_ = ros::Time::now();
+            if (desired_state == StrikeVisionState::GEO_FALLBACK) {
+                image_confirm_count_ = 0;
+                image_ray_filter_valid_ = false;
+            }
+            ROS_WARN("[Guidance] strike source -> %s (image_age=%.3fs confirm=%d/%d)",
+                     desired_state == StrikeVisionState::IMAGE_GUIDANCE
+                         ? "IMAGE_GUIDANCE" : "GEO_FALLBACK",
+                     image_age, image_confirm_count_, image_confirm_frames_);
+        }
+
+        geometry_msgs::Twist desired;
+        if (strike_vision_state_ == StrikeVisionState::IMAGE_GUIDANCE) {
+            computeImageVelocity(desired);
+        } else {
+            computeGeoFallbackVelocity(desired);
+        }
+
+        const double elapsed = strike_vision_switch_time_.isZero()
+            ? image_reacquire_blend_sec_
+            : (ros::Time::now() - strike_vision_switch_time_).toSec();
+        const double alpha = image_reacquire_blend_sec_ <= 1e-3
+            ? 1.0 : clampValue(elapsed / image_reacquire_blend_sec_, 0.0, 1.0);
+        cmd.linear.x = (1.0 - alpha) * strike_blend_from_ned_.linear.x + alpha * desired.linear.x;
+        cmd.linear.y = (1.0 - alpha) * strike_blend_from_ned_.linear.y + alpha * desired.linear.y;
+        cmd.linear.z = (1.0 - alpha) * strike_blend_from_ned_.linear.z + alpha * desired.linear.z;
+        cmd.angular.z = (1.0 - alpha) * strike_blend_from_ned_.angular.z + alpha * desired.angular.z;
+        applyStrikeCommandSlewLimit(cmd);
+        last_strike_cmd_ned_ = cmd;
+        last_strike_cmd_valid_ = true;
+
+        const StrikeTargetGeometry g = strikeTargetGeometry();
+        ROS_INFO_THROTTLE(1.0,
+            "[Guidance] %s age=%.2fs horiz=%.2fm dist=%.2fm bbox=(%.3f,%.3f) "
+            "cmd_ned=(%.2f,%.2f,%.2f yaw_rate=%.2f)",
+            strike_vision_state_ == StrikeVisionState::IMAGE_GUIDANCE ? "IMAGE" : "GEO",
+            image_age, g.horizontal, g.distance,
+            current_image_target_.center_x, current_image_target_.center_y,
+            cmd.linear.x, cmd.linear.y, cmd.linear.z, cmd.angular.z);
+    }
+    //===================制导修改====================
+
     void guidanceTimerCallback(const ros::TimerEvent&) {
         // SEARCH_ONLY 模式下 guidance 不工作
         if (!is_enabled_) {
@@ -734,6 +1116,19 @@ public:
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
+                    //===================制导修改====================
+                    if (strike_guidance_logic_ == "image_geo_fallback") {
+                        geometry_msgs::Twist vel_cmd;
+                        computeImageGeoStrikeVelocity(vel_cmd);
+                        evaluateStrike();
+                        filterVelocityCmd(vel_cmd);
+                        if (!use_sim_) {
+                            convertVelNedToEnu(vel_cmd);
+                        }
+                        vel_cmd_pub_.publish(vel_cmd);
+                    } else {
+                    // 原 PN STRIKE 分支完整保留；配置为 legacy_pn 时仍可回退验证。
+                    //===================制导修改====================
                     auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
                     auto cmd = strategy->computeCommand(
                         current_uav_pose_,
@@ -851,6 +1246,9 @@ public:
                     vel_cmd_pub_.publish(vel_cmd);
                     pn_debug_pub_.publish(pn_dbg);
                     publishInterceptPointMarker(cmd.intercept_point_nwu);
+                    //===================制导修改====================
+                    }
+                    //===================制导修改====================
                 }
                 break;
             }

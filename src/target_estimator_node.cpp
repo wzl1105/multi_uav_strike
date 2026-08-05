@@ -45,6 +45,9 @@
 #include <multi_uav_strike/ClusterTarget.h>
 #include <multi_uav_strike/ClusterState.h>
 #include <multi_uav_strike/MissionState.h>
+//===================制导修改====================
+#include <multi_uav_strike/PrimaryImageTarget.h>
+//===================制导修改====================
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -96,6 +99,16 @@ public:
         //   未晋升的 tentative 用更短的 tentative_ttl_sec_ 过期丢弃。
         uint32_t  hit_count       = 0;
         bool      is_promoted     = false;
+        //===================制导修改====================
+        // 保存与该 cluster 最近一次关联的原始图像观测。世界坐标只用于聚类，
+        // 图像导引直接使用 bbox 中心对应的相机视线，不再对 LOS 角速度求导。
+        uint32_t  image_frame_seq = 0;
+        float     image_center_x  = 0.5f;
+        float     image_center_y  = 0.5f;
+        float     image_width     = 0.0f;
+        float     image_height    = 0.0f;
+        Eigen::Vector3d image_world_ray_nwu{0.0, 0.0, -1.0};
+        //===================制导修改====================
     };
 
     TargetClusterer() {
@@ -194,6 +207,10 @@ public:
                                     "raw_detection_marker", 10);
         target_est_gps_pub_     = nh_.advertise<sensor_msgs::NavSatFix>(
                                     "target_estimated_gps", 10);
+        //===================制导修改====================
+        primary_image_target_pub_ = nh_.advertise<multi_uav_strike::PrimaryImageTarget>(
+                                    "guidance/primary_image_target", 10);
+        //===================制导修改====================
 
         // 周期任务
         states_timer_ = nh_.createTimer(ros::Duration(1.0 / states_publish_freq_),
@@ -307,6 +324,9 @@ public:
             c.ned_alt = cand_tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = det.stamp_us;
+            //===================制导修改====================
+            updateClusterImageObservation(c, det, raw_cx, raw_cy);
+            //===================制导修改====================
             // === 2026-07-16: 命中计数 + 晋升门禁 ===
             // === 2026-07-31: Attack 阶段降低 hit 门槛 ===
             //   is_attack_active_ 由 mission_state_cb 维护 (skill_type==105 && phase 4/5)
@@ -336,6 +356,9 @@ public:
         nc.best_confidence = det.confidence;
         nc.first_seen_us   = det.stamp_us;
         nc.last_seen_us    = det.stamp_us;
+        //===================制导修改====================
+        updateClusterImageObservation(nc, det, raw_cx, raw_cy);
+        //===================制导修改====================
         nc.img_data        = det.img_data;
         nc.img_format      = det.img_data.empty() ? 0 : 1;
         // === 2026-07-16: 首次进入 tentative 态 ===
@@ -557,6 +580,9 @@ public:
         if (primary != nullptr) {
             publishPrimaryGps(*primary);
             publishPrimaryPose(*primary);
+            //===================制导修改====================
+            publishPrimaryImageTarget(*primary);
+            //===================制导修改====================
         }
     }
 
@@ -636,6 +662,9 @@ private:
     ros::Publisher target_est_marker_pub_;
     ros::Publisher raw_det_marker_pub_;          // 单帧识别 (红色点)
     ros::Publisher target_est_gps_pub_;
+    //===================制导修改====================
+    ros::Publisher primary_image_target_pub_;
+    //===================制导修改====================
     std::string viz_frame_;                      // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
     ros::Timer states_timer_;
     ros::Timer cleanup_timer_;
@@ -658,6 +687,50 @@ private:
     std::unordered_map<uint64_t, TargetCluster> clusters_;
     uint64_t next_cluster_id_ = 0;
     int     raw_marker_seq_    = 0;   // raw_detection_marker id 计数器, MarkerArray 同 ns 不能重复
+
+    //===================制导修改====================
+    Eigen::Vector3d pixelWorldRay(double cx, double cy) const {
+        const double u_ndc = (cx - image_width_  / 2.0) / focal_x_;
+        const double v_ndc = (cy - image_height_ / 2.0) / focal_y_;
+        Eigen::Vector3d cam_ray(-v_ndc, u_ndc, 1.0);
+        cam_ray.normalize();
+        Eigen::Vector3d ray = current_camera_world_quat_.toRotationMatrix() * cam_ray;
+        if (ray.norm() > 1e-6) ray.normalize();
+        return ray;
+    }
+
+    void updateClusterImageObservation(TargetCluster& c,
+                                       const multi_uav_strike::YoloDetection& det,
+                                       double raw_cx, double raw_cy) {
+        c.image_frame_seq = det.frame_seq;
+        c.image_center_x = static_cast<float>(raw_cx / image_width_);
+        c.image_center_y = static_cast<float>(raw_cy / image_height_);
+        c.image_width = det.x_max - det.x_min;
+        c.image_height = det.y_max - det.y_min;
+        c.image_world_ray_nwu = pixelWorldRay(raw_cx, raw_cy);
+    }
+
+    void publishPrimaryImageTarget(const TargetCluster& c) {
+        multi_uav_strike::PrimaryImageTarget msg;
+        msg.header.stamp.fromNSec(c.last_seen_us * 1000ULL);
+        msg.header.frame_id = viz_frame_;
+        msg.frame_seq = c.image_frame_seq;
+        msg.stamp_us = c.last_seen_us;
+        msg.cluster_id = c.id;
+        msg.label = c.label;
+        msg.confidence = c.best_confidence;
+        msg.center_x = c.image_center_x;
+        msg.center_y = c.image_center_y;
+        msg.width = c.image_width;
+        msg.height = c.image_height;
+        msg.world_ray_nwu.x = c.image_world_ray_nwu.x();
+        msg.world_ray_nwu.y = c.image_world_ray_nwu.y();
+        msg.world_ray_nwu.z = c.image_world_ray_nwu.z();
+        const double age = (ros::Time::now().toNSec() / 1000ULL - c.last_seen_us) * 1e-6;
+        msg.visible = c.is_promoted && age >= 0.0 && age <= 0.5;
+        primary_image_target_pub_.publish(msg);
+    }
+    //===================制导修改====================
 
     // ============ 工具 ============
 

@@ -7,6 +7,42 @@
 # 制导策略
 guidance_strategy: "intercept"   # intercept / minsnap / los
 
+# //===================制导修改====================
+# STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
+# legacy_pn=保留并启用原来的 InterceptGuidance(PN) 分支。
+strike_guidance_logic: "image_geo_fallback"
+
+# 连续新图像帧达到此数量后才允许从坐标备份切入图像导引，避免单帧闪烁。
+image_confirm_frames: 3
+# 锁定目标图像观测超过此时间视为不可见，转世界坐标纯追踪；长时丢失仍由
+# mission_manager 的 target_lost_hold_sec 进入 TARGET_LOST_HOVER。
+image_visible_timeout_sec: 0.4
+# IMAGE/GEO 两种速度源切换时的线性混合时间。
+image_reacquire_blend_sec: 0.7
+# 首轮实飞采用保守限速；不会直接使用上游异常大的 task_speed。
+image_max_speed: 5.0
+image_max_vertical_speed: 1.0
+# bbox 中心死区、世界视线 EMA 以及偏航速率限制。
+image_center_deadband: 0.03
+image_ray_alpha: 0.25
+image_yaw_kp: 0.6
+image_yaw_rate_max: 0.5
+
+# 本次 bag 中 8m 内图像射线接近垂直，水平分量反复换向；末端改用已锁定目标的
+# 世界坐标方向，并随水平距离连续减速，1m 内停止水平追逐。
+strike_slowdown_radius_m: 10.0
+strike_horizontal_stop_radius_m: 1.0
+strike_terminal_world_direction_radius_m: 8.0
+# 近目标逐渐冻结偏航，避免机头在目标正上方来回寻找像面中心。
+strike_yaw_freeze_radius_m: 3.0
+# 每次进入 STRIKE 后必须收到本轮新目标坐标，且坐标持续保持新鲜。
+strike_target_pose_timeout_sec: 0.5
+# IMAGE/GEO 和末端方向变化统一经过速度指令斜率限制。
+strike_max_horizontal_accel: 2.0
+strike_max_vertical_accel: 1.0
+strike_max_yaw_accel: 1.0
+# //===================制导修改====================
+
 # 制导通用参数（被 guidance_strategies 加载）
 intercept_time_horizon: 5.0
 v_max: 5.0

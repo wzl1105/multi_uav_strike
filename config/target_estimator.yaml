@@ -55,6 +55,10 @@ fov_v_deg: 52.0               # 垂直 FOV(度);0 = 按方形像素从 fov_h 推
 
 # ---- 发布频率 ----
 states_publish_freq: 10.0     # cluster_states / target_estimated_marker / target_estimated_gps/pose 发布频率 (Hz)
+# //===================制导修改====================
+# guidance/primary_image_target 与 states_publish_freq 同步发布；消息内 stamp_us 保留
+# YOLO 真正命中时刻，制导端不会把周期重复快照误判为新检测帧。
+# //===================制导修改====================
 cleanup_freq: 1.0             # 过期 cluster 清理频率 (Hz)
 
 # ---- UAV Pose 输入 ----
