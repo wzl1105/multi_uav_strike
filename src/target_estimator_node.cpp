@@ -142,7 +142,17 @@ public:
         //   - alpha 越大 (0.5+) 越接近原始,平滑弱;越小 (0.1~0.2) 越平滑但响应慢。
         //   - 静止相机基本无 alpha 影响(噪声=0 时 raw 和 EMA 同值);
         //     真正起作用的是相机机动 / 目标快速移动 / 像素噪声三个场景。
-        p.param<double>("ema_alpha",       ema_alpha_,       0.3);
+        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 3) ===
+        //   旧 0.3 在 16:30 bag 上导致 cluster.ned_x std=0.22m,PN 看到单帧 0.4m 跳变
+        //   新 0.1 把单帧输入噪声乘 0.1 加权进 EMA,稳态方差 ≈ σ²×α/(2-α) ≈ 5.3%×σ²
+        //   (旧 17.6%),std 砍 ~42%。收敛时间从 ~3 帧涨到 ~10 帧(~1s),
+        //   STRIKE 5-15s 时间窗内 cluster 已接近稳态,后续输入噪声影响微弱。
+        p.param<double>("ema_alpha",       ema_alpha_,       0.1);
+        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
+        //   cam_pos 用 EMA LPF (~2Hz cutoff @ 50Hz tick ≈ alpha 0.13)
+        //   → body 抖动 (YOLO 投影 cam_pos 用瞬时 uav_pose) 不会再以全幅进 cluster。
+        //   0.15 是经验值:足够压制 0.5-1Hz body 抖动 (~75% 衰减),又不让快速位置变化(目标切换)滞后 >0.3s
+        p.param<double>("cam_pos_lpf_alpha", cam_pos_lpf_alpha_, 0.15);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
@@ -487,6 +497,23 @@ public:
         }
         current_uav_pose_.header.stamp = msg->header.stamp;
         is_uav_pose_received_ = true;
+
+        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) — cam_pos LPF ===
+        //   给 uav pose 加 2Hz 一阶 IIR,projection 用平滑后的 cam_pos
+        //   → body 抖动不再以全幅进 target_world,断开 YOLO→PN→body→YOLO 正反馈。
+        if (!cam_pos_lpf_init_) {
+            cam_pos_filt_x_ = current_uav_pose_.pose.position.x;
+            cam_pos_filt_y_ = current_uav_pose_.pose.position.y;
+            cam_pos_filt_z_ = current_uav_pose_.pose.position.z;
+            cam_pos_lpf_init_ = true;
+        } else {
+            cam_pos_filt_x_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.x
+                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_x_;
+            cam_pos_filt_y_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.y
+                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_y_;
+            cam_pos_filt_z_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.z
+                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_z_;
+        }
     }
 
     void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
@@ -681,6 +708,18 @@ private:
     bool is_gimbal_pose_received_ = false;
     bool is_camera_pose_received_ = false;
 
+    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
+    //   给 cam_pos 加 2Hz 一阶 IIR LPF,切断 body 抖动 → cam_pos → projection → cluster
+    //   → PN → body 抖动的正反馈。
+    //   EMA 时间常数 tau = (1-alpha)/alpha → alpha = dt / (tau+dt) ≈ 0.063 @ 50Hz, 2Hz cutoff
+    //   即 alpha ≈ 0.063 per 50Hz tick → alpha_5hz ≈ 0.25 (5Hz tick)
+    //   折衷取 0.15 让快速移动(目标切换)不滞后太多,稳态噪声压 75%。
+    double      cam_pos_lpf_alpha_   = 0.15;   // EMA 系数 (yaml: ~cam_pos_lpf_alpha)
+    bool        cam_pos_lpf_init_    = false;
+    double      cam_pos_filt_x_      = 0.0;   // LPF 后的 uav pose (NWU),投影用这个
+    double      cam_pos_filt_y_      = 0.0;
+    double      cam_pos_filt_z_      = 0.0;
+
     uint64_t primary_cluster_id_ = 0;   // 0 = mission 未指定, 回退最高置信度
 
     std::mutex clusters_mtx_;
@@ -802,10 +841,16 @@ private:
         Eigen::Vector3d world_ray = R_world_cam * cam_ray;
 
         // ---- Step 3: 与地面平面求交 ----
+        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
+        //   旧:用瞬时 current_uav_pose_ 作 cam_pos → body 抖动 → cam_pos 抖动 →
+        //       target_world 抖动 → cluster 抖动 → PN 输出抖动 → body 抖动(正反馈)
+        //   新:用 LPF 过的 cam_pos_filt_*,把 body 抖动从 YOLO 投影入口就切断
+        //   (注意:R_world_cam 仍用瞬时 yaw — yaw 变化通过图像像素位移进入 projection
+        //    是物理事实,无法滤波,但 pose 平滑已足够削弱主要耦合)
         Eigen::Vector3d cam_pos(
-            current_uav_pose_.pose.position.x,
-            current_uav_pose_.pose.position.y,
-            current_uav_pose_.pose.position.z);
+            cam_pos_filt_x_,
+            cam_pos_filt_y_,
+            cam_pos_filt_z_);
         double dz = target_z_prior_ - cam_pos.z();
 
         bool proj_ok = true;

@@ -189,7 +189,7 @@
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
       <!-- Waydroid 容器地址；可在启动前用 TZS_GCS_IP 覆盖。 -->
-      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.240.112)" />
+      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.43.5)" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />
@@ -221,7 +221,7 @@
   <!-- 11. ROSBag 自动记录：完整控制链，排除大图像话题                         -->
   <!-- ====================================================================== -->
   <arg name="record_bag" default="true" />
-  <arg name="bag_dir" default="$(env HOME)/BAG" />
+  <arg name="bag_dir" default="$(env HOME)/LOG" />
   <arg name="bag_prefix" default="$(arg uav_name)_strike" />
 
   <group if="$(arg record_bag)">

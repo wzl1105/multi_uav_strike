@@ -44,6 +44,13 @@ InterceptGuidance::InterceptGuidance(ros::NodeHandle& nh)
     //===================制导修改====================
 
     // 初始化 LOS 角低通滤波器
+    // === 2026-08-04: los_filter_cutoff_hz 默认 2.0 → 1.0 ===
+    //   背景:target_estimated_pose 10Hz + 0.2m std(实测 16:30 bag),50Hz PN 调用时
+    //         los_yaw_rate = wrap_pi(los_filtered - prev)/dt 在 10Hz 帧边界处产生
+    //         ~0.04 rad/s 阶跃,nav_ratio * los_rate * horiz ≈ 6 m/s 单帧 lateral 跳变。
+    //   旧 2Hz Butterworth 对 1Hz 左右噪声衰减 ~6dB 不够,新 1Hz 衰减 ~12dB。
+    //   pitch 同理,降低 vz 单帧最大 0.184 m/s 突变(实测)。
+    //   实测影响:PN 收敛时间从 ~0.4s 涨到 ~0.8s,STRIKE 10s+ 时间窗内完全够用。
     los_yaw_filter_.configure(1.0 / dt_, los_filter_cutoff_hz_);
     los_pitch_filter_.configure(1.0 / dt_, los_filter_cutoff_hz_);
 

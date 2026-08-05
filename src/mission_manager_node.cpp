@@ -1896,6 +1896,21 @@ public:
         attack_wp1_reached_time_     = ros::Time();
         attack_strike_phase_active_  = false;
 
+        // === 2026-08-05: 新 TaskFlow 到达 → 立即 stop waypoint_executor ===
+        //   背景:之前在 SEARCH_TRACK (skill 102, phase=4) 时 waypoint_executor 还在发
+        //   setpoint_velocity,如果此时收到 attack-targets (skill 105),skill_queue 被清空后
+        //   waypoint_executor 还在过渡态 (旧 SKILL_AREA → PENDING) 会继续以旧路径发速度。
+        //   guidance_control 同时也发(STRIKE 模式接管后),两者交替穿插 → PX4 收到混乱指令。
+        //   修复:taskFlowCallback 一进来,无论新 flow 是什么 skill,先 stop waypoint_executor
+        //   让它立刻 is_executing_=false,然后再清空 skill_queue 推新 skill,避免 1s 重叠窗口。
+        //   waypoint_executor.controlCallback 收到 "stop" 后调 stop() → publishZeroVelocity,
+        //   再下次 50Hz tick 起不再发 setpoint,只保留 status/current_target 上报。
+        {
+            std_msgs::String stop_cmd;
+            stop_cmd.data = "stop";
+            waypoint_control_pub_.publish(stop_cmd);
+        }
+
         // 把 skill 流拷进运行时队列
         skill_queue_.clear();
         skill_queue_.reserve(msg->skills.size());
@@ -2741,11 +2756,29 @@ public:
 
         // 无论打还是暂存,清掉锁定态(下一次识别需要重新等确认)
         // 注:action=1/2 已在前面的 case 里 return,这里只到 action=0(打)路径
-        tracked_target_.is_valid = false;
-        setLockState(TrackLockState::NOT_LOCKED);
-        // 多目标: 打完/暂存后清主目标,estimator 在下一帧 cluster_states 重新锚定
-        //   下一个未上报的 cluster(若有)
-        publishPrimaryTarget(0);
+        // === 2026-08-05 修:action=0 (打) 路径不再清锁定态 ===
+        //   旧 bug:打完立刻清 tracked_target_.is_valid + publishPrimaryTarget(0),
+        //   下一帧 clusterStatesCallback 进 SEARCH_STRIKE 分支看到 is_valid=false →
+        //   走 dispatch 路径按"距 WP2 最近 + 最高置信度"重选 primary,覆盖 triggerStrike 锁定的目标。
+        //   实测:用户跟踪 cluster 1 (person, conf 0.88) 发 attack_cmd 打 person,
+        //   结果被 cluster 2 (car, conf 0.94, WP2-gate 内) 覆盖,打了车。
+        //   修法:action=0 (打) 时保持 is_valid=true + publishPrimaryTarget(locked_cluster_id_),
+        //   让 clusterStatesCallback 跳 dispatch 路径,沿用 triggerStrike 锁定的目标直到打击结束。
+        //   解锁时机:strike_distance_threshold_ 达到 → direct_strike_committed_=true 流程内;
+        //   或者 phase 切到 GUIDANCE_TRACK/GUIDANCE_STRIKE 之外的下一阶段(complete/failed)。
+        if (msg->action != 0) {
+            tracked_target_.is_valid = false;
+            setLockState(TrackLockState::NOT_LOCKED);
+            // 多目标: 打完/暂存后清主目标,estimator 在下一帧 cluster_states 重新锚定
+            //   下一个未上报的 cluster(若有)
+            publishPrimaryTarget(0);
+        } else {
+            // action=0 (打):保持锁定,只更新 primary_target 指向 locked_cluster_id_
+            //   (target_estimator 仍可能拿到老 primary 值,这里强行覆盖)
+            if (locked_cluster_id_ != 0) {
+                publishPrimaryTarget(locked_cluster_id_);
+            }
+        }
     }
 
     /**
