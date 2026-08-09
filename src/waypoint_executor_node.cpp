@@ -680,21 +680,19 @@ public:
     }
 
     bool canPublishVelocitySetpoint() const {
-        // 仿真没有 mavros/state，保持原有发布行为。
-        if (use_sim_) return true;
-
-        // MissionPhase 是速度通道的唯一权威门控。旧版还要求 waypoint_executor
-        // 自己异步缓存 mavros/state；日志已证明 phase=WAYPOINT_FOLLOW 且控制计算正常，
-        // 但 MAVROS 缓存条件未满足会静默挡住所有 publish，造成永远收不到 handoff ack。
+        //=========setpoint====//
         if (!mission_state_received_) return false;
+        if (!use_sim_ &&
+            (!mavros_state_received_ || !current_mavros_state_.connected ||
+             !current_mavros_state_.armed)) {
+            return false;
+        }
 
-        // 明确列出允许 waypoint 速度输出的阶段，不能简单用 phase>=2：
-        // COMPLETE/FAILED/OVERRIDDEN 的枚举值也大于 2，但这些阶段必须禁止输出。
-        return current_mission_phase_ == 2 ||  // HOVERING（已达到起飞高度）
-               current_mission_phase_ == 3 ||  // WAYPOINT_FOLLOW
-               current_mission_phase_ == 6 ||  // RETURNING（航点返航路径）
-               current_mission_phase_ == 9 ||  // HOLDING
-               current_mission_phase_ == 11;   // TARGET_LOST_HOVER
+        // 起飞和起飞高度悬停只允许 position。搜索航线、Attack 的 WP1→WP2
+        // 以及返航航线才允许 waypoint velocity；其它阶段一律不发布。
+        return current_mission_phase_ == 3 ||  // WAYPOINT_FOLLOW
+               current_mission_phase_ == 6;    // RETURNING
+        //=========setpoint====//
     }
 
     // ============== 回调函数 ==============
@@ -882,8 +880,13 @@ public:
             if (*cur_idx >= cur_queue->size()) {
                 // 当前 phase 已走完
                 if (segment_phase_ == SegmentPhase::SKILL_AREA) {
-                    // 最后一个 phase,没有下一段 → 安全保持(下方主循环仍会跑一次)
-                    break;
+                    // 最后一个 phase 没有下一段。必须在这里结束并发布零速度；
+                    // 若继续落到下方几何计算，cur_idx 已等于 size，随后对
+                    // (*cur_queue)[*cur_idx] 的访问越界，会把上一条任务残留内存
+                    // 当成新目标，导致飞机到达攻击点后又沿旧航线飞走。
+                    advanceSegmentPhase();
+                    publishZeroVelocity();
+                    return;
                 }
                 advanceSegmentPhase();
                 // 重新选当前 queue(idx 可能已被 advanceSegmentPhase 重置)
@@ -910,7 +913,11 @@ public:
             const Waypoint& tg = (*cur_queue)[*cur_idx];
             double dx_t = tg.ned_x - current_ned_x_;
             double dy_t = tg.ned_y - current_ned_y_;
-            double dz_t = tg.ned_z - current_ned_z_;
+            // 到达判定必须与下方实际发送给飞控的高度目标一致。当前 Attack
+            // 已按 WP2 原始高度飞行，因此这里也必须使用同一个原始高度。
+            double arrival_target_z = tg.ned_z;
+            arrival_target_z += lidar_altitude_offset_;
+            double dz_t = arrival_target_z - current_ned_z_;
             double dist_h_check = std::sqrt(dx_t*dx_t + dy_t*dy_t);
             double dist_to_target_check = std::sqrt(dist_h_check*dist_h_check + dz_t*dz_t);
             if (dist_to_target_check >= arrival_threshold_) {
@@ -1037,36 +1044,57 @@ public:
                 // v_lateral 与 v_along 垂直,直接 XTE-P 控制 v_lateral = -XTE / tau_xte。
                 // 两者组成 (vx, vy) 直接发到 PX4 速度层,绕开 yaw 角度链路二次转译。
                 double dist_along_to_target = seg_len - along;
-                double brake_dist = (dist_along_to_target > 0.0)
-                                        ? dist_along_to_target
-                                        : dist_h;
-                double v_along = std::min(cur_speed,
-                                           sqrt(2.0 * decel_limit_ * brake_dist));
-                // 加速度限幅(起步/跨航点平滑过渡)
-                const double dt = 1.0 / executor_rate_;
-                double v_max_accel = last_v_mag_ + accel_limit_ * dt;
-                if (v_along > v_max_accel) v_along = v_max_accel;
-                if (v_along < 0.0) v_along = 0.0;
-                last_v_mag_ = v_along;
 
-                // XTE 直接 P 控制:XTE 收敛时间常数 = tau_xte(默认 1.5s)
-                double v_lateral = 0.0;
-                if (xte_tau_lookahead_ > 0.0) {
-                    v_lateral = -xte / xte_tau_lookahead_;
-                    // 毕达哥拉斯约束(总速度不超过 v_cruise)
-                    double v_total_sq = v_along * v_along + v_lateral * v_lateral;
-                    double v_cruise_sq = cur_speed * cur_speed;
-                    if (v_total_sq > v_cruise_sq) {
-                        double scale = cur_speed / std::sqrt(v_total_sq);
-                        v_along *= scale;
-                        v_lateral *= scale;
+                // 飞机已经越过段终点时，不能继续沿 +u 方向生成速度。
+                // 旧逻辑把 brake_dist 回退成 dist_h，却仍保持 v_along > 0，
+                // 因而会以任务速度沿航线延长线无限飞离。越界后直接切换为
+                // 点目标 P 控制，速度方向始终指回当前航点；这也覆盖 guidance
+                // 恢复航点控制时飞机已落在终点另一侧的场景。
+                if (dist_along_to_target <= 0.0) {
+                    ROS_WARN_THROTTLE(2.0,
+                        "[WaypointExecutor] Passed segment endpoint by %.2fm; "
+                        "switching to direct waypoint recovery (dist=%.2fm)",
+                        -dist_along_to_target, dist_h);
+                    double v_return = std::min(cur_speed, hold_kp_ * dist_h);
+                    if (dist_h > 0.01) {
+                        vx = (dx_to_target / dist_h) * v_return;
+                        vy = (dy_to_target / dist_h) * v_return;
+                    } else {
+                        vx = 0.0;
+                        vy = 0.0;
                     }
+                    bearing = atan2(dy_to_target, dx_to_target);
+                    last_v_mag_ = v_return;
+                } else {
+                    double brake_dist = dist_along_to_target;
+                    double v_along = std::min(cur_speed,
+                                               sqrt(2.0 * decel_limit_ * brake_dist));
+                    // 加速度限幅(起步/跨航点平滑过渡)
+                    const double dt = 1.0 / executor_rate_;
+                    double v_max_accel = last_v_mag_ + accel_limit_ * dt;
+                    if (v_along > v_max_accel) v_along = v_max_accel;
+                    if (v_along < 0.0) v_along = 0.0;
+                    last_v_mag_ = v_along;
+
+                    // XTE 直接 P 控制:XTE 收敛时间常数 = tau_xte(默认 1.5s)
+                    double v_lateral = 0.0;
+                    if (xte_tau_lookahead_ > 0.0) {
+                        v_lateral = -xte / xte_tau_lookahead_;
+                        // 毕达哥拉斯约束(总速度不超过 v_cruise)
+                        double v_total_sq = v_along * v_along + v_lateral * v_lateral;
+                        double v_cruise_sq = cur_speed * cur_speed;
+                        if (v_total_sq > v_cruise_sq) {
+                            double scale = cur_speed / std::sqrt(v_total_sq);
+                            v_along *= scale;
+                            v_lateral *= scale;
+                        }
+                    }
+                    // 装配 (vx, vy):v = v_along * (ux, uy) + v_lateral * (-uy, ux)
+                    vx = v_along * ux - v_lateral * uy;
+                    vy = v_along * uy + v_lateral * ux;
+                    // bearing 仅作 yaw P-controller 参考(避免 yaw 控制器误推算反向)
+                    bearing = std::atan2(vy, vx);
                 }
-                // 装配 (vx, vy):v = v_along * (ux, uy) + v_lateral * (-uy, ux)
-                vx = v_along * ux - v_lateral * uy;
-                vy = v_along * uy + v_lateral * ux;
-                // bearing 仅作 yaw P-controller 参考(避免 yaw 控制器误推算反向)
-                bearing = std::atan2(vy, vx);
 
                 // ===== XTE bearing 阻尼(2026-08-02 兼容低速 + 高速)=====
                 // 经验问题:低速(4 m/s)L1 卡 L1_min=3 m 时,飞机 yaw 跟踪 L1 bearing
@@ -1308,6 +1336,23 @@ public:
         ROS_WARN("[WaypointExecutor] Work mode changed: %s -> %s",
                  current_work_mode_.c_str(), new_mode.c_str());
         current_work_mode_ = new_mode;
+
+        //=============一定打击=========//
+        // typed Skill 的分段航线不由 WorkMode 决定是否运行。Search-Strike/Attack
+        // 在尚未发现目标时必须继续飞 WP1→WP2；只有 guidance/enable=true 才能
+        // 通过 guidanceEnableCallback() 取得控制权并暂停航点 velocity。
+        // 旧逻辑在 SEARCH_ONLY→SEARCH_STRIKE 时无条件 is_executing_=false，导致
+        // 第一次 Attack 只发零速度，必须重复下发 Skill 才会被 skillCallback 重新启动。
+        const bool segmented_skill_active =
+            segment_phase_ == SegmentPhase::ARRIVE ||
+            segment_phase_ == SegmentPhase::SKILL_AREA;
+        if (segmented_skill_active) {
+            ROS_WARN("[WaypointExecutor] WorkMode changed during segmented skill=%s; "
+                     "keeping waypoint execution=%s until guidance ownership changes",
+                     active_skill_id_.c_str(), is_executing_ ? "true" : "false");
+            return;
+        }
+        //=============一定打击=========//
 
         // 切出 SEARCH_ONLY 模式时：暂停执行并发零速，但**保留航点队列**，
         // 这样之后切回 SEARCH_ONLY 时能从 current_waypoint_index_ 继续执行。
@@ -1699,7 +1744,20 @@ public:
         active_skill_id_ = msg->skill_id;
         active_skill_type_ = msg->skill_type;
         cruise_speed_    = msg->cruise_speed > 0.0 ? msg->cruise_speed : uav_speed_;
-        task_speed_      = msg->task_speed > 0.0 ? msg->task_speed : uav_speed_;
+        //===================制导修改====================
+        if (msg->skill_type == 105) {
+            if (!std::isfinite(static_cast<double>(msg->task_speed)) ||
+                msg->task_speed <= 0.0f) {
+                ROS_ERROR("[WaypointExecutor] Reject Attack(105) skill=%s: explicit positive "
+                          "task_speed is required (received %.3f)",
+                          msg->skill_id.c_str(), static_cast<double>(msg->task_speed));
+                return;
+            }
+            task_speed_ = std::min(static_cast<double>(msg->task_speed), 40.0);
+        } else {
+            task_speed_ = msg->task_speed > 0.0 ? msg->task_speed : uav_speed_;
+        }
+        //===================制导修改====================
 
         // arrive_path
         arrive_queue_.clear();

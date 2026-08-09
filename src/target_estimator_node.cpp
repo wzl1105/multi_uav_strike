@@ -45,6 +45,7 @@
 #include <multi_uav_strike/ClusterTarget.h>
 #include <multi_uav_strike/ClusterState.h>
 #include <multi_uav_strike/MissionState.h>
+#include <multi_uav_strike/WaypointStatus.h>
 //===================制导修改====================
 #include <multi_uav_strike/PrimaryImageTarget.h>
 //===================制导修改====================
@@ -55,6 +56,8 @@
 
 #include <cmath>
 #include <cctype>
+#include <deque>
+#include <iterator>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +114,17 @@ public:
         //===================制导修改====================
     };
 
+    struct CameraPoseSample {
+        ros::Time stamp;
+        Eigen::Vector3d position_nwu{0.0, 0.0, 0.0};
+        Eigen::Quaterniond orientation_world_camera{1.0, 0.0, 0.0, 0.0};
+    };
+
+    struct YawRateSample {
+        ros::Time stamp;
+        double yaw_rate_rad_s = 0.0;
+    };
+
     TargetClusterer() {
         ros::NodeHandle p("~");
         // 仿真/真机切换
@@ -148,12 +162,18 @@ public:
         //   (旧 17.6%),std 砍 ~42%。收敛时间从 ~3 帧涨到 ~10 帧(~1s),
         //   STRIKE 5-15s 时间窗内 cluster 已接近稳态,后续输入噪声影响微弱。
         p.param<double>("ema_alpha",       ema_alpha_,       0.1);
-        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
-        //   cam_pos 用 EMA LPF (~2Hz cutoff @ 50Hz tick ≈ alpha 0.13)
-        //   → body 抖动 (YOLO 投影 cam_pos 用瞬时 uav_pose) 不会再以全幅进 cluster。
-        //   0.15 是经验值:足够压制 0.5-1Hz body 抖动 (~75% 衰减),又不让快速位置变化(目标切换)滞后 >0.3s
-        p.param<double>("cam_pos_lpf_alpha", cam_pos_lpf_alpha_, 0.15);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
+        // Detection timestamps are matched to the nearest full camera pose.
+        // The warning threshold is diagnostic only: a large time delta never
+        // rejects an observation as long as the pose buffer is non-empty.
+        p.param<double>("pose_buffer_duration_sec", pose_buffer_duration_sec_, 5.0);
+        p.param<double>("pose_sync_warn_threshold_sec", pose_sync_warn_threshold_sec_, 0.1);
+        p.param<double>("max_cluster_yaw_rate_rad_s", max_cluster_yaw_rate_rad_s_, 0.2);
+        p.param<double>("yaw_rate_sample_max_dt_sec", yaw_rate_sample_max_dt_sec_, 0.5);
+        pose_buffer_duration_sec_ = std::max(0.1, pose_buffer_duration_sec_);
+        pose_sync_warn_threshold_sec_ = std::max(0.0, pose_sync_warn_threshold_sec_);
+        max_cluster_yaw_rate_rad_s_ = std::max(0.0, max_cluster_yaw_rate_rad_s_);
+        yaw_rate_sample_max_dt_sec_ = std::max(0.001, yaw_rate_sample_max_dt_sec_);
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
         p.param<double>("cleanup_freq",        cleanup_freq_,        1.0);
@@ -196,6 +216,8 @@ public:
         //   这里只读不写,无新 publisher / timer / launch 改动
         mission_state_sub_   = nh_.subscribe("mission/mission_state", 10,
                                             &TargetClusterer::missionStateCallback, this);
+        waypoint_status_sub_ = nh_.subscribe("waypoint_executor/status", 10,
+                                            &TargetClusterer::waypointStatusCallback, this);
 
         // 发布
         // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
@@ -240,8 +262,39 @@ public:
 
     // 每帧 batch YoloDetections:每条 detection 独立反投影 + 聚类
     void yoloBatchCallback(const multi_uav_strike::YoloDetections::ConstPtr& msg) {
-        // === 2026-07-16: 改用稳像 camera/pose 作为反投影真源 ===
-        if (!is_uav_pose_received_ || !is_camera_pose_received_) return;
+        if (msg->detections.empty()) return;
+
+        //=============一定打击=========//
+        // Clustering starts only after the first waypoint of the Search(102)
+        // area has been reached.  The latch is deliberately retained when the
+        // mission subsequently enters Attack(105), so perception does not stop
+        // or restart at the Attack path's first waypoint.
+        if (!isFirstWaypointGateOpen()) return;
+        //=============一定打击=========//
+
+        const auto& frame = msg->detections.front();
+        YawRateSample matched_yaw_rate;
+        if (!findNearestYawRate(frame, matched_yaw_rate)) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Skip YOLO batch: no valid yaw-rate sample "
+                "frame_seq=%u det=%.6f",
+                frame.frame_seq, detectionStamp(frame).toSec());
+            return;
+        }
+        if (std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
+            max_cluster_yaw_rate_rad_s_ + 1e-9) {
+            ROS_WARN_THROTTLE(1.0,
+                "[TargetClusterer] Skip YOLO batch: yaw rate too high "
+                "frame_seq=%u det=%.6f yaw_sample=%.6f rate=%.3frad/s limit=%.3f",
+                frame.frame_seq, detectionStamp(frame).toSec(),
+                matched_yaw_rate.stamp.toSec(), matched_yaw_rate.yaw_rate_rad_s,
+                max_cluster_yaw_rate_rad_s_);
+            return;
+        }
+
+        // camera/pose carries both the camera origin and the stabilized world
+        // orientation. Each detection selects its nearest timestamped sample.
+        if (!is_camera_pose_received_) return;
         for (const auto& det : msg->detections) {
             processSingleDetection(det);
         }
@@ -250,12 +303,23 @@ public:
     // 单条 detection → 反投影地面点 → 命中已有 cluster (label + 2D 距离) 或新建
     void processSingleDetection(const multi_uav_strike::YoloDetection& det) {
         if (!det.is_in_fov) return;
-        if (!is_uav_pose_received_ || !is_camera_pose_received_) return;
+        if (!is_camera_pose_received_) return;
 
         // === 2026-07-16: Plan A 像素空间 EMA ===
         //   先取原始 bbox 中心像素,后面再做 EMA → 投影
         const double raw_cx = (det.x_min + det.x_max) * 0.5 * image_width_;
         const double raw_cy = (det.y_min + det.y_max) * 0.5 * image_height_;
+
+        CameraPoseSample matched_camera_pose;
+        if (!findNearestCameraPose(det, matched_camera_pose)) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Drop detection frame_seq=%u: camera pose buffer is empty",
+                det.frame_seq);
+            return;
+        }
+        const uint64_t observation_stamp_us = det.stamp_us != 0
+            ? det.stamp_us
+            : matched_camera_pose.stamp.toNSec() / 1000ULL;
 
         std::lock_guard<std::mutex> g(clusters_mtx_);
         // === 2026-07-31: 归一化 label (YOLO 数字串 → 语义串) ===
@@ -269,7 +333,8 @@ public:
         //   注:c.ned_x/ned_y 是上一帧像素 EMA 投影后的稳定值,用做匹配参考点不会
         //       跟随单帧噪声漂移。
         double cand_tx = 0.0, cand_ty = 0.0, cand_tz = 0.0;
-        const bool cand_valid = projectPixelToGround(raw_cx, raw_cy, cand_tx, cand_ty, cand_tz);
+        const bool cand_valid = projectPixelToGround(
+            raw_cx, raw_cy, matched_camera_pose, cand_tx, cand_ty, cand_tz);
         // === 2026-07-16: 原始单帧识别投影(红色点)===
         //   不参与聚类/EMA,完全反映当帧探测器说的瞬时位置,0.3s 后自动消失
         if (cand_valid) {
@@ -333,9 +398,9 @@ public:
             }
             c.ned_alt = cand_tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
-            c.last_seen_us = det.stamp_us;
+            c.last_seen_us = observation_stamp_us;
             //===================制导修改====================
-            updateClusterImageObservation(c, det, raw_cx, raw_cy);
+            updateClusterImageObservation(c, det, raw_cx, raw_cy, matched_camera_pose);
             //===================制导修改====================
             // === 2026-07-16: 命中计数 + 晋升门禁 ===
             // === 2026-07-31: Attack 阶段降低 hit 门槛 ===
@@ -364,10 +429,10 @@ public:
         nc.ned_alt         = cand_tz;
         nc.world_ema_valid = true;
         nc.best_confidence = det.confidence;
-        nc.first_seen_us   = det.stamp_us;
-        nc.last_seen_us    = det.stamp_us;
+        nc.first_seen_us   = observation_stamp_us;
+        nc.last_seen_us    = observation_stamp_us;
         //===================制导修改====================
-        updateClusterImageObservation(nc, det, raw_cx, raw_cy);
+        updateClusterImageObservation(nc, det, raw_cx, raw_cy, matched_camera_pose);
         //===================制导修改====================
         nc.img_data        = det.img_data;
         nc.img_format      = det.img_data.empty() ? 0 : 1;
@@ -377,7 +442,7 @@ public:
         clusters_[nc.id]   = nc;
 
         ROS_INFO_THROTTLE(1.0, "[TargetClusterer] NEW tentative id=%lu label=%s "
-                              "(ned=%.1f,%.1f,%.1f conf=%.2f hit=%u/%d, total=%zu)",
+                              "(nwu=%.1f,%.1f,%.1f conf=%.2f hit=%u/%d, total=%zu)",
                            nc.id, nc.label.c_str(), nc.ned_x, nc.ned_y, nc.ned_alt,
                            nc.best_confidence, nc.hit_count, min_hit_count_,
                            clusters_.size());
@@ -391,9 +456,8 @@ public:
         }
     }
 
-    // === 2026-07-16: 抽出 cluster_event 发送逻辑 ===
-    //   同一 cluster 整个生命周期只发一次(首次晋升时),
-    //   mission_manager 据此决定上报/跟踪/打击。
+    // ClusterEvent stores the promoted target position in NWU coordinates.
+    // Each cluster emits this event once, when it is first promoted.
     void emitClusterEvent(const TargetCluster& c) {
         multi_uav_strike::ClusterEvent ev;
         ev.cluster_id    = c.id;
@@ -401,14 +465,19 @@ public:
         ev.label         = c.label;
         ev.confidence    = c.best_confidence;
         ev.first_seen_us = c.first_seen_us;
-        ev.ned_x         = c.ned_x;
-        ev.ned_y         = c.ned_y;
-        ev.ned_alt       = c.ned_alt;
+        ev.nwu_x         = c.ned_x;
+        ev.nwu_y         = c.ned_y;
+        ev.nwu_alt       = c.ned_alt;
+        ev.gps_valid     = clusterToGps(
+            c, ev.gps_latitude, ev.gps_longitude, ev.gps_altitude);
         cluster_event_pub_.publish(ev);
 
         ROS_INFO("[TargetClusterer] PROMOTE cluster id=%lu label=%s "
-                 "(ned=%.1f,%.1f,%.1f conf=%.2f hit=%u)",
+                 "(nwu=%.1f,%.1f,%.1f gps=%s[%.7f,%.7f,%.1f] "
+                 "conf=%.2f hit=%u)",
                  c.id, c.label.c_str(), c.ned_x, c.ned_y, c.ned_alt,
+                 ev.gps_valid ? "valid" : "invalid",
+                 ev.gps_latitude, ev.gps_longitude, ev.gps_altitude,
                  c.best_confidence, c.hit_count);
     }
 
@@ -433,13 +502,235 @@ public:
     // 不再做 uav_quat * setRPY(pitch) 重建,直接用 gimbal 算好的稳像世界 quat,
     // 保证前向/反向投影用同一个 R_world_cam,且完全不依赖 UAV roll/机体 pitch。
     void cameraPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        current_camera_world_quat_ = Eigen::Quaterniond(
+        CameraPoseSample sample;
+        sample.stamp = msg->header.stamp;
+        if (sample.stamp.isZero()) {
+            sample.stamp = ros::Time::now();
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] camera/pose has zero timestamp; using receive time");
+        }
+        sample.position_nwu = Eigen::Vector3d(
+            msg->pose.position.x,
+            msg->pose.position.y,
+            msg->pose.position.z);
+        sample.orientation_world_camera = Eigen::Quaterniond(
             msg->pose.orientation.w,
             msg->pose.orientation.x,
             msg->pose.orientation.y,
             msg->pose.orientation.z);
-        current_camera_world_quat_.normalize();
+        if (sample.orientation_world_camera.norm() < 1e-9) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] camera/pose has invalid quaternion; sample ignored");
+            return;
+        }
+        sample.orientation_world_camera.normalize();
+
+        {
+            std::lock_guard<std::mutex> lock(camera_pose_buffer_mtx_);
+            if (camera_pose_buffer_.empty() ||
+                sample.stamp >= camera_pose_buffer_.back().stamp) {
+                camera_pose_buffer_.push_back(sample);
+            } else {
+                const auto pos = std::lower_bound(
+                    camera_pose_buffer_.begin(), camera_pose_buffer_.end(), sample.stamp,
+                    [](const CameraPoseSample& lhs, const ros::Time& rhs) {
+                        return lhs.stamp < rhs;
+                    });
+                camera_pose_buffer_.insert(pos, sample);
+            }
+
+            const ros::Time newest_stamp = camera_pose_buffer_.back().stamp;
+            while (camera_pose_buffer_.size() > 1 &&
+                   (newest_stamp - camera_pose_buffer_.front().stamp).toSec() >
+                       pose_buffer_duration_sec_) {
+                camera_pose_buffer_.pop_front();
+            }
+        }
         is_camera_pose_received_ = true;
+    }
+
+    // Select the camera pose with the smallest absolute timestamp delta.
+    // Equal deltas intentionally choose the earlier sample. Time delta is
+    // diagnostic only and never rejects a detection.
+    bool findNearestCameraPose(const multi_uav_strike::YoloDetection& det,
+                               CameraPoseSample& selected) {
+        std::lock_guard<std::mutex> lock(camera_pose_buffer_mtx_);
+        if (camera_pose_buffer_.empty()) return false;
+
+        ros::Time detection_stamp;
+        if (det.stamp_us == 0) {
+            selected = camera_pose_buffer_.back();
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Detection frame_seq=%u has zero timestamp; "
+                "using latest camera pose t=%.6f",
+                det.frame_seq, selected.stamp.toSec());
+            return true;
+        }
+        detection_stamp.fromNSec(det.stamp_us * 1000ULL);
+
+        const auto next = std::lower_bound(
+            camera_pose_buffer_.begin(), camera_pose_buffer_.end(), detection_stamp,
+            [](const CameraPoseSample& lhs, const ros::Time& rhs) {
+                return lhs.stamp < rhs;
+            });
+
+        if (next == camera_pose_buffer_.begin()) {
+            selected = *next;
+        } else if (next == camera_pose_buffer_.end()) {
+            selected = camera_pose_buffer_.back();
+        } else {
+            const auto prev = std::prev(next);
+            const double prev_delta = std::fabs((detection_stamp - prev->stamp).toSec());
+            const double next_delta = std::fabs((next->stamp - detection_stamp).toSec());
+            selected = (prev_delta <= next_delta) ? *prev : *next;
+        }
+
+        const double selected_delta =
+            std::fabs((selected.stamp - detection_stamp).toSec());
+        if (selected_delta > pose_sync_warn_threshold_sec_) {
+            ROS_WARN_THROTTLE(1.0,
+                "[TargetClusterer] Large detection/pose time delta: frame_seq=%u "
+                "det=%.6f selected=%.6f delta=%.3fs buffer=[%.6f, %.6f] "
+                "(observation still accepted)",
+                det.frame_seq, detection_stamp.toSec(), selected.stamp.toSec(),
+                selected_delta, camera_pose_buffer_.front().stamp.toSec(),
+                camera_pose_buffer_.back().stamp.toSec());
+        }
+        return true;
+    }
+
+    static ros::Time detectionStamp(
+        const multi_uav_strike::YoloDetection& det) {
+        ros::Time stamp;
+        if (det.stamp_us != 0) stamp.fromNSec(det.stamp_us * 1000ULL);
+        return stamp;
+    }
+
+    //=============一定打击=========//
+    void updateFirstWaypointLatch() {
+        if (search_area_first_waypoint_reached_ || !current_skill_executing_ ||
+            current_skill_type_ != 102 ||
+            !waypoint_status_received_) {
+            return;
+        }
+        if (latest_waypoint_status_.skill_id != current_skill_id_) return;
+        if (latest_waypoint_status_.skill_total > 0 &&
+            latest_waypoint_status_.skill_idx >= 1) {
+            search_area_first_waypoint_reached_ = true;
+            cluster_skill_active_ = true;
+            ROS_INFO("[TargetClusterer] Search-area first-waypoint clustering gate opened: "
+                     "skill_id=%s skill_idx=%u/%u",
+                     current_skill_id_.c_str(),
+                     latest_waypoint_status_.skill_idx,
+                     latest_waypoint_status_.skill_total);
+        }
+    }
+
+    bool isFirstWaypointGateOpen() const {
+        if (!mission_state_received_ || !cluster_skill_active_) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Skip YOLO batch: search-area gate closed");
+            return false;
+        }
+        if (!search_area_first_waypoint_reached_) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Skip YOLO batch: Search(102) area first waypoint not reached");
+            return false;
+        }
+        return true;
+    }
+    //=============一定打击=========//
+
+    void resetYawRateBaseline(const ros::Time& stamp, double yaw) {
+        previous_yaw_stamp_ = stamp;
+        previous_yaw_rad_ = yaw;
+        yaw_baseline_valid_ = !stamp.isZero();
+        std::lock_guard<std::mutex> lock(yaw_rate_buffer_mtx_);
+        yaw_rate_buffer_.clear();
+    }
+
+    void updateYawRateSample() {
+        ros::Time stamp = current_uav_pose_.header.stamp;
+        const auto& q_msg = current_uav_pose_.pose.orientation;
+        Eigen::Quaterniond q(q_msg.w, q_msg.x, q_msg.y, q_msg.z);
+        if (stamp.isZero() || !std::isfinite(q.norm()) || q.norm() < 1e-9) {
+            yaw_baseline_valid_ = false;
+            std::lock_guard<std::mutex> lock(yaw_rate_buffer_mtx_);
+            yaw_rate_buffer_.clear();
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Reset yaw-rate baseline: invalid UAV pose stamp/quaternion");
+            return;
+        }
+        q.normalize();
+        const double yaw = std::atan2(
+            2.0 * (q.w() * q.z() + q.x() * q.y()),
+            1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+
+        if (!yaw_baseline_valid_) {
+            resetYawRateBaseline(stamp, yaw);
+            return;
+        }
+
+        const double dt = (stamp - previous_yaw_stamp_).toSec();
+        if (!std::isfinite(dt) || dt <= 0.0 ||
+            dt > yaw_rate_sample_max_dt_sec_) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Reset yaw-rate baseline: invalid pose dt=%.3fs",
+                dt);
+            resetYawRateBaseline(stamp, yaw);
+            return;
+        }
+
+        // atan2(sin, cos) gives the shortest angular difference across +/-pi.
+        const double raw_delta = yaw - previous_yaw_rad_;
+        const double yaw_delta = std::atan2(std::sin(raw_delta), std::cos(raw_delta));
+        YawRateSample sample;
+        sample.stamp = stamp;
+        sample.yaw_rate_rad_s = yaw_delta / dt;
+        previous_yaw_stamp_ = stamp;
+        previous_yaw_rad_ = yaw;
+
+        std::lock_guard<std::mutex> lock(yaw_rate_buffer_mtx_);
+        yaw_rate_buffer_.push_back(sample);
+        while (yaw_rate_buffer_.size() > 1 &&
+               (sample.stamp - yaw_rate_buffer_.front().stamp).toSec() >
+                   pose_buffer_duration_sec_) {
+            yaw_rate_buffer_.pop_front();
+        }
+    }
+
+    bool findNearestYawRate(const multi_uav_strike::YoloDetection& det,
+                            YawRateSample& selected) {
+        std::lock_guard<std::mutex> lock(yaw_rate_buffer_mtx_);
+        if (yaw_rate_buffer_.empty()) return false;
+        if (det.stamp_us == 0) {
+            selected = yaw_rate_buffer_.back();
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Detection frame_seq=%u has zero timestamp; "
+                "using latest yaw-rate sample t=%.6f",
+                det.frame_seq, selected.stamp.toSec());
+            return true;
+        }
+
+        const ros::Time detection_stamp = detectionStamp(det);
+        const auto next = std::lower_bound(
+            yaw_rate_buffer_.begin(), yaw_rate_buffer_.end(), detection_stamp,
+            [](const YawRateSample& lhs, const ros::Time& rhs) {
+                return lhs.stamp < rhs;
+            });
+        if (next == yaw_rate_buffer_.begin()) {
+            selected = *next;
+        } else if (next == yaw_rate_buffer_.end()) {
+            selected = yaw_rate_buffer_.back();
+        } else {
+            const auto prev = std::prev(next);
+            const double prev_delta =
+                std::fabs((detection_stamp - prev->stamp).toSec());
+            const double next_delta =
+                std::fabs((next->stamp - detection_stamp).toSec());
+            selected = (prev_delta <= next_delta) ? *prev : *next;
+        }
+        return true;
     }
 
     void primaryTargetCallback(const std_msgs::UInt64::ConstPtr& msg) {
@@ -458,6 +749,52 @@ public:
     //   改用 state==1 (EXECUTING) 后, IN_TASK 整个段 (phase 2/3/4/5 都算) 都激活降门槛,
     //   Cluster 能在 0.6s 内 promote, 而不是等 2s 攒到 20 hit 时已经 stale。
     void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        mission_state_received_ = true;
+        current_skill_flow_id_ = msg->skill_flow_id;
+        current_skill_id_ = msg->skill_id;
+        current_skill_type_ = msg->skill_type;
+        current_skill_executing_ = (msg->state == 1 /* EXECUTING */);
+        //=============一定打击=========//
+        // Only a newly activated Search(102) defines a new clustering session.
+        // Attack(105) consumes and keeps updating that session; it must neither
+        // clear clusters nor impose its own first-waypoint gate.
+        const bool search_executing = current_skill_executing_ &&
+            current_skill_type_ == 102;
+        cluster_skill_active_ = search_executing ||
+            (search_area_first_waypoint_reached_ &&
+             current_skill_executing_ && current_skill_type_ == 105);
+
+        // Clear once when a new Search key first becomes active. A pause/resume
+        // of the same key keeps the current search area's clusters.
+        // next_cluster_id_ remains monotonic so cleared IDs are never reused.
+        const bool new_skill_activation = search_executing &&
+            (!activated_skill_key_valid_ ||
+             current_skill_id_ != activated_skill_id_ ||
+             current_skill_flow_id_ != activated_skill_flow_id_);
+        if (new_skill_activation) {
+            activated_skill_key_valid_ = true;
+            activated_skill_id_ = current_skill_id_;
+            activated_skill_flow_id_ = current_skill_flow_id_;
+            search_area_first_waypoint_reached_ = false;
+            cluster_skill_active_ = true;
+            size_t cleared_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(clusters_mtx_);
+                cleared_count = clusters_.size();
+                clusters_.clear();
+                primary_cluster_id_ = 0;
+            }
+            multi_uav_strike::ClusterState empty_state;
+            cluster_states_pub_.publish(empty_state);
+            publishEmptyGps();
+            ROS_INFO("[TargetClusterer] New Search area activated: "
+                     "flow_id=%s skill_id=%s type=%d; cleared %zu clusters",
+                     current_skill_flow_id_.c_str(), current_skill_id_.c_str(),
+                     current_skill_type_, cleared_count);
+        }
+        //=============一定打击=========//
+
+        updateFirstWaypointLatch();
         const bool is_105       = (msg->skill_type == 105);
         const bool is_executing = (msg->state == 1 /*EXECUTING*/);
         is_attack_active_ = is_105 && is_executing;
@@ -497,23 +834,8 @@ public:
         }
         current_uav_pose_.header.stamp = msg->header.stamp;
         is_uav_pose_received_ = true;
+        updateYawRateSample();
 
-        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) — cam_pos LPF ===
-        //   给 uav pose 加 2Hz 一阶 IIR,projection 用平滑后的 cam_pos
-        //   → body 抖动不再以全幅进 target_world,断开 YOLO→PN→body→YOLO 正反馈。
-        if (!cam_pos_lpf_init_) {
-            cam_pos_filt_x_ = current_uav_pose_.pose.position.x;
-            cam_pos_filt_y_ = current_uav_pose_.pose.position.y;
-            cam_pos_filt_z_ = current_uav_pose_.pose.position.z;
-            cam_pos_lpf_init_ = true;
-        } else {
-            cam_pos_filt_x_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.x
-                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_x_;
-            cam_pos_filt_y_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.y
-                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_y_;
-            cam_pos_filt_z_ = cam_pos_lpf_alpha_ * current_uav_pose_.pose.position.z
-                              + (1.0 - cam_pos_lpf_alpha_) * cam_pos_filt_z_;
-        }
     }
 
     void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
@@ -547,6 +869,8 @@ public:
     void statesTimerCb(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> g(clusters_mtx_);
         if (clusters_.empty()) {
+            multi_uav_strike::ClusterState empty_state;
+            cluster_states_pub_.publish(empty_state);
             publishEmptyGps();
             return;
         }
@@ -682,6 +1006,7 @@ private:
     ros::Subscriber home_position_sub_;
     ros::Subscriber primary_target_sub_;
     ros::Subscriber mission_state_sub_;
+    ros::Subscriber waypoint_status_sub_;
 
     ros::Publisher cluster_event_pub_;
     ros::Publisher cluster_states_pub_;
@@ -701,24 +1026,38 @@ private:
     sensor_msgs::NavSatFix      home_gps_;     // PX4 home, 锁一次作为 GPS 输出的参考原点
     bool                       is_home_locked_ = false;
     double                      current_gimbal_pitch_ = 0.0;
-    // === 2026-07-16: 稳像世界 quat,直接来自 gimbal 的 camera/pose ===
-    Eigen::Quaterniond          current_camera_world_quat_{1.0, 0.0, 0.0, 0.0};
     bool is_uav_pose_received_    = false;
     bool is_gps_received_         = false;
     bool is_gimbal_pose_received_ = false;
     bool is_camera_pose_received_ = false;
 
-    // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
-    //   给 cam_pos 加 2Hz 一阶 IIR LPF,切断 body 抖动 → cam_pos → projection → cluster
-    //   → PN → body 抖动的正反馈。
-    //   EMA 时间常数 tau = (1-alpha)/alpha → alpha = dt / (tau+dt) ≈ 0.063 @ 50Hz, 2Hz cutoff
-    //   即 alpha ≈ 0.063 per 50Hz tick → alpha_5hz ≈ 0.25 (5Hz tick)
-    //   折衷取 0.15 让快速移动(目标切换)不滞后太多,稳态噪声压 75%。
-    double      cam_pos_lpf_alpha_   = 0.15;   // EMA 系数 (yaml: ~cam_pos_lpf_alpha)
-    bool        cam_pos_lpf_init_    = false;
-    double      cam_pos_filt_x_      = 0.0;   // LPF 后的 uav pose (NWU),投影用这个
-    double      cam_pos_filt_y_      = 0.0;
-    double      cam_pos_filt_z_      = 0.0;
+    double pose_buffer_duration_sec_ = 5.0;
+    double pose_sync_warn_threshold_sec_ = 0.1;
+    std::mutex camera_pose_buffer_mtx_;
+    std::deque<CameraPoseSample> camera_pose_buffer_;
+
+    double max_cluster_yaw_rate_rad_s_ = 0.2;
+    double yaw_rate_sample_max_dt_sec_ = 0.5;
+    std::mutex yaw_rate_buffer_mtx_;
+    std::deque<YawRateSample> yaw_rate_buffer_;
+    bool yaw_baseline_valid_ = false;
+    ros::Time previous_yaw_stamp_;
+    double previous_yaw_rad_ = 0.0;
+
+    bool mission_state_received_ = false;
+    bool waypoint_status_received_ = false;
+    bool current_skill_executing_ = false;
+    bool cluster_skill_active_ = false;
+    //=============一定打击=========//
+    bool search_area_first_waypoint_reached_ = false;
+    //=============一定打击=========//
+    int32_t current_skill_type_ = 0;
+    std::string current_skill_flow_id_;
+    std::string current_skill_id_;
+    multi_uav_strike::WaypointStatus latest_waypoint_status_;
+    bool activated_skill_key_valid_ = false;
+    std::string activated_skill_flow_id_;
+    std::string activated_skill_id_;
 
     uint64_t primary_cluster_id_ = 0;   // 0 = mission 未指定, 回退最高置信度
 
@@ -728,25 +1067,35 @@ private:
     int     raw_marker_seq_    = 0;   // raw_detection_marker id 计数器, MarkerArray 同 ns 不能重复
 
     //===================制导修改====================
-    Eigen::Vector3d pixelWorldRay(double cx, double cy) const {
+    Eigen::Vector3d pixelWorldRay(double cx, double cy,
+                                  const CameraPoseSample& camera_pose) const {
         const double u_ndc = (cx - image_width_  / 2.0) / focal_x_;
         const double v_ndc = (cy - image_height_ / 2.0) / focal_y_;
         Eigen::Vector3d cam_ray(-v_ndc, u_ndc, 1.0);
         cam_ray.normalize();
-        Eigen::Vector3d ray = current_camera_world_quat_.toRotationMatrix() * cam_ray;
+        Eigen::Vector3d ray =
+            camera_pose.orientation_world_camera.toRotationMatrix() * cam_ray;
         if (ray.norm() > 1e-6) ray.normalize();
         return ray;
     }
 
+    void waypointStatusCallback(
+        const multi_uav_strike::WaypointStatus::ConstPtr& msg) {
+        latest_waypoint_status_ = *msg;
+        waypoint_status_received_ = true;
+        updateFirstWaypointLatch();
+    }
+
     void updateClusterImageObservation(TargetCluster& c,
                                        const multi_uav_strike::YoloDetection& det,
-                                       double raw_cx, double raw_cy) {
+                                       double raw_cx, double raw_cy,
+                                       const CameraPoseSample& camera_pose) {
         c.image_frame_seq = det.frame_seq;
         c.image_center_x = static_cast<float>(raw_cx / image_width_);
         c.image_center_y = static_cast<float>(raw_cy / image_height_);
         c.image_width = det.x_max - det.x_min;
         c.image_height = det.y_max - det.y_min;
-        c.image_world_ray_nwu = pixelWorldRay(raw_cx, raw_cy);
+        c.image_world_ray_nwu = pixelWorldRay(raw_cx, raw_cy, camera_pose);
     }
 
     void publishPrimaryImageTarget(const TargetCluster& c) {
@@ -818,16 +1167,18 @@ private:
     //   3) world 射线 = R_world_cam * t_cam (R_world_cam 来自 gimbal 的稳像 camera/pose)
     //   4) 射线与 z = target_z_prior_ 平面求交 → 目标世界 (NWU) 坐标
     bool projectBboxToGround(const multi_uav_strike::YoloDetection& det,
+                             const CameraPoseSample& camera_pose,
                              double& tx, double& ty, double& tz) {
         double cx = (det.x_min + det.x_max) * 0.5 * image_width_;
         double cy = (det.y_min + det.y_max) * 0.5 * image_height_;
-        return projectPixelToGround(cx, cy, tx, ty, tz);
+        return projectPixelToGround(cx, cy, camera_pose, tx, ty, tz);
     }
 
     // === 2026-07-16: 像素级 helper (Plan A 用) ===
     //   processSingleDetection 先在像素空间做 EMA,再调本函数投影到世界。
     //   几何部分与 projectBboxToGround 完全相同,只是输入换成已平滑的像素。
     bool projectPixelToGround(double cx, double cy,
+                              const CameraPoseSample& camera_pose,
                               double& tx, double& ty, double& tz) {
         // ---- Step 1: 像素 → 相机帧射线 ----
         double u_ndc = (cx - image_width_  / 2.0) / focal_x_;
@@ -836,21 +1187,16 @@ private:
         cam_ray.normalize();
 
         // ---- Step 2: 相机射线 → 世界射线 (用稳像 camera/pose) ----
-        Eigen::Matrix3d R_world_cam = current_camera_world_quat_.toRotationMatrix();
+        Eigen::Matrix3d R_world_cam =
+            camera_pose.orientation_world_camera.toRotationMatrix();
         Eigen::Vector3d opt_axis = R_world_cam.col(2);  // 光轴 (cam +z) 世界方向
         Eigen::Vector3d world_ray = R_world_cam * cam_ray;
 
         // ---- Step 3: 与地面平面求交 ----
-        // === 2026-08-04: STRIKE 反馈环解耦 (Layer 4) ===
-        //   旧:用瞬时 current_uav_pose_ 作 cam_pos → body 抖动 → cam_pos 抖动 →
-        //       target_world 抖动 → cluster 抖动 → PN 输出抖动 → body 抖动(正反馈)
-        //   新:用 LPF 过的 cam_pos_filt_*,把 body 抖动从 YOLO 投影入口就切断
-        //   (注意:R_world_cam 仍用瞬时 yaw — yaw 变化通过图像像素位移进入 projection
-        //    是物理事实,无法滤波,但 pose 平滑已足够削弱主要耦合)
-        Eigen::Vector3d cam_pos(
-            cam_pos_filt_x_,
-            cam_pos_filt_y_,
-            cam_pos_filt_z_);
+        // Use the camera origin captured closest to this detection timestamp.
+        // Applying an asynchronously updated position LPF here would reintroduce
+        // temporal lag and defeat the timestamp alignment.
+        const Eigen::Vector3d cam_pos = camera_pose.position_nwu;
         double dz = target_z_prior_ - cam_pos.z();
 
         bool proj_ok = true;
@@ -881,6 +1227,7 @@ private:
         // 沿投影链路按顺序检查, 第一个失败即定位错误环节 + 打印全链路中间值
         diagnoseProjection(cx, cy, u_ndc, v_ndc, cam_ray,
                            R_world_cam, opt_axis, world_ray,
+                           camera_pose.orientation_world_camera,
                            cam_pos, dz, t, target_world, proj_ok);
 
         return proj_ok;
@@ -895,6 +1242,7 @@ private:
                             const Eigen::Matrix3d& R_world_cam,
                             const Eigen::Vector3d& opt_axis,
                             const Eigen::Vector3d& world_ray,
+                            const Eigen::Quaterniond& camera_quat,
                             const Eigen::Vector3d& cam_pos,
                             double dz, double t,
                             const Eigen::Vector3d& target_world,
@@ -918,8 +1266,8 @@ private:
                 "cam quat (wxyz)=(%.3f,%.3f,%.3f,%.3f) | "
                 "R.col(2)=(%.3f,%.3f,%.3f)",
                 opt_axis.z(),
-                current_camera_world_quat_.w(), current_camera_world_quat_.x(),
-                current_camera_world_quat_.y(), current_camera_world_quat_.z(),
+                camera_quat.w(), camera_quat.x(),
+                camera_quat.y(), camera_quat.z(),
                 opt_axis.x(), opt_axis.y(), opt_axis.z());
             return;
         }
@@ -1076,6 +1424,33 @@ private:
         target_est_gps_pub_.publish(msg);
     }
 
+    bool clusterToGps(const TargetCluster& c,
+                      double& latitude, double& longitude,
+                      double& altitude) const {
+        latitude = 0.0;
+        longitude = 0.0;
+        altitude = 0.0;
+        if (!is_home_locked_) return false;
+
+        // Cluster coordinates are NWU relative to the locked PX4 home.
+        const double north_m = c.ned_x;
+        const double east_m = -c.ned_y;
+        const double up_m = c.ned_alt;
+        const double home_lat_rad = home_gps_.latitude * M_PI / 180.0;
+        const double cos_lat = std::cos(home_lat_rad);
+        if (!std::isfinite(cos_lat) || std::fabs(cos_lat) < 1e-9) {
+            return false;
+        }
+
+        constexpr double DEG_PER_M_LAT = 1.0 / 111320.0;
+        const double deg_per_m_lon = 1.0 / (111320.0 * cos_lat);
+        latitude = home_gps_.latitude + north_m * DEG_PER_M_LAT;
+        longitude = home_gps_.longitude + east_m * deg_per_m_lon;
+        altitude = home_gps_.altitude + up_m;
+        return std::isfinite(latitude) && std::isfinite(longitude) &&
+               std::isfinite(altitude);
+    }
+
     void publishPrimaryGps(const TargetCluster& c) {
         sensor_msgs::NavSatFix msg;
         msg.header.stamp = ros::Time::now();
@@ -1084,23 +1459,13 @@ private:
         // === 2026-07-28: 必须用 PX4 home 作为参考,不是 UAV 当前 GPS ===
         //   c.ned_x/ned_y 已经是反投影到 map 系的绝对坐标(与 publishPrimaryPose 一致),
         //   原版减去 UAV 当前位置再叠加 current_gps_,会导致 UAV 飞行时地面站目标跟着飘。
-        if (!is_home_locked_ || !is_uav_pose_received_) {
+        if (!clusterToGps(c, msg.latitude, msg.longitude, msg.altitude)) {
             publishEmptyGps();
             return;
         }
-        // 当前 UAV 姿态的 (lat, lon) 也只能用作 fallback;主参考必须是 locked home。
-        const double north_m = c.ned_x;     // NWU x = 北向 (相对 home)
-        const double east_m  = -c.ned_y;    // NWU y = 西 → 东 = -y
-        const double up_m    = c.ned_alt;   // NWU z = 上向 (相对 home altitude)
-        const double DEG_PER_M_LAT = 1.0 / 111320.0;
-        const double home_lat_rad = home_gps_.latitude * M_PI / 180.0;
-        const double DEG_PER_M_LON = 1.0 / (111320.0 * std::cos(home_lat_rad));
 
         msg.status.status  = sensor_msgs::NavSatStatus::STATUS_FIX;
         msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
-        msg.latitude  = home_gps_.latitude  + north_m * DEG_PER_M_LAT;
-        msg.longitude = home_gps_.longitude + east_m  * DEG_PER_M_LON;
-        msg.altitude  = home_gps_.altitude  + up_m;
         target_est_gps_pub_.publish(msg);
     }
 

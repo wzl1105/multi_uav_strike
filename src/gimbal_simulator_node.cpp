@@ -139,8 +139,8 @@ private:
     bool is_uav_pose_received_ = false;
 
     // === 每 loop tick 缓存的相机-目标投影(逐目标) ===
-    //   由 recomputeAllProjections() 在循环开头一次性算出所有目标的投影,
-    //   之后 FOV 判定 / 像素投影 / distance / camera pose / 逐目标 YoloDetection 都读缓存。
+    //   循环开头计算一次供云台控制决策，云台更新后再计算一次供本轮发布；
+    //   camera/pose 与逐目标 YoloDetection 都读取第二次计算的同一份缓存。
     struct TargetProj {
         uint32_t    id       = 0;
         std::string label;
@@ -374,7 +374,7 @@ public:
         // 数据没到齐:发"空帧"+保持当前云台角度
         if (!cached_proj_valid_) {
             ROS_WARN_THROTTLE(5.0, "[GimbalSim] waiting for targets/pose ...");
-            publishYoloDetections();
+            publishYoloDetections(ros::Time::now());
             return;
         }
 
@@ -407,11 +407,17 @@ public:
         // === 3. 云台比例控制 ===
         updateGimbalAngles(desired_pitch);
 
-        // === 4. 发布 ===
+        // === 4. 用更新后的云台姿态重新计算本轮实际发布的图像投影 ===
+        // 步骤1的投影只用于本轮控制决策。若直接发布它,检测框对应的是更新前姿态,
+        // 而 camera/pose 对应更新后姿态,即使时间戳一致也无法互逆。
+        recomputeAllProjections();
+        const ros::Time observation_stamp = ros::Time::now();
+
+        // === 5. 发布:检测与相机位姿共享同一个采样时间 ===
         publishLOSAngle(desired_pitch, desired_yaw);       // target_los_angle(指向主目标)
-        publishGimbalPose();                  // gimbal_pose (RViz)
-        publishCameraPose();                  // camera/pose (用缓存的 q_cam_world_)
-        publishYoloDetections();              // YoloDetections(全部可见目标) + 单条 YoloDetection(主目标)
+        publishGimbalPose(observation_stamp); // gimbal_pose (RViz)
+        publishCameraPose(observation_stamp); // camera/pose (与投影共用缓存姿态)
+        publishYoloDetections(observation_stamp); // YoloDetections + 单条 YoloDetection
     }
 
     double rayBuildingDistance(double ox, double oy, double oz,
@@ -610,7 +616,7 @@ public:
     // 单次投影: 对所有目标算出相机-目标几何, 缓存到 projections_, 并选主目标
     // ====================================================================
     //
-    // 每 tick 在 controlLoopCallback 开头调一次, 后续全部读缓存:
+    // 每 tick 在 controlLoopCallback 中控制前/发布前各调一次，后续读取最新缓存:
     //   - projections_[i].visible/u_px/v_px/distance
     //   - cached_q_cam_world_   (camera/pose 发布)
     //   - primary_idx_          (FOV 内距 UAV 最近的目标; -1=无)
@@ -746,9 +752,9 @@ public:
     }
 
     // gimbal_pose: 当前云台在 NWU 下的姿态 (RViz 用)
-    void publishGimbalPose() {
+    void publishGimbalPose(const ros::Time& observation_stamp) {
         geometry_msgs::PoseStamped msg;
-        msg.header.stamp = ros::Time::now();
+        msg.header.stamp = observation_stamp;
         msg.header.frame_id = viz_frame_;
         msg.pose.position = current_uav_pose_.pose.position;
 
@@ -763,15 +769,17 @@ public:
     }
 
     // camera/pose: 相机世界姿态 (稳像, 与 forward projection 共用 currentCameraWorldQuat)
-    void publishCameraPose() {
+    void publishCameraPose(const ros::Time& observation_stamp) {
         geometry_msgs::PoseStamped msg;
-        msg.header.stamp = ros::Time::now();
+        msg.header.stamp = observation_stamp;
         msg.header.frame_id = viz_frame_;
         msg.pose.position = current_uav_pose_.pose.position;
 
         // === 2026-07-16: 改为稳像世界姿态 ===
         // 与 forward projection 完全一致,UAV 一滚转 camera/pose 不抖。
-        Eigen::Quaterniond q = currentCameraWorldQuat();
+        Eigen::Quaterniond q = cached_q_cam_world_;
+        if (q.norm() < 1e-9) q = Eigen::Quaterniond::Identity();
+        q.normalize();
         msg.pose.orientation.x = q.x();
         msg.pose.orientation.y = q.y();
         msg.pose.orientation.z = q.z();
@@ -810,7 +818,7 @@ public:
     // 发布:YoloDetections(全部可见目标,供 target_estimator)
     //       + 单条 YoloDetection(主目标,兼容 comm_node)
     //       + Bool(是否有任一目标在 FOV)
-    void publishYoloDetections() {
+    void publishYoloDetections(const ros::Time& observation_stamp) {
         // === 2026-07-16: yolo_pub_freq 节流 (与云台 loop_freq 解耦) ===
         //   frame_seq_ 每 tick 自增,作为 loop tick 计数器。
         //   period = loop_freq / yolo_pub_freq:loop=100Hz / yolo=10Hz → 每 10 tick 发一次。
@@ -820,7 +828,7 @@ public:
             static_cast<uint32_t>(std::round(loop_freq_ / yolo_pub_freq_)));
         const bool emit_yolo = (frame_seq_ % period) == 0;
         uint32_t seq = ++frame_seq_;
-        uint64_t stamp_us = ros::Time::now().toNSec() / 1000;
+        uint64_t stamp_us = observation_stamp.toNSec() / 1000;
 
         bool any_visible = false;
         if (emit_yolo) {

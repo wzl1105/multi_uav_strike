@@ -228,7 +228,7 @@ private:
     uint32_t last_image_frame_seq_ = 0;
     uint64_t last_image_stamp_us_ = 0;
     int image_confirm_count_ = 0;
-    int image_confirm_frames_ = 3;
+    int image_confirm_frames_ = 1;
     double image_visible_timeout_sec_ = 0.4;
     double image_reacquire_blend_sec_ = 0.7;
     double image_max_speed_ = 5.0;
@@ -260,6 +260,10 @@ private:
     double strike_max_vertical_accel_ = 1.5;
     //===================制导修改====================
     double strike_max_yaw_accel_ = 1.0;
+    double attack_max_speed_ = 40.0;
+    // 本次 Attack 一旦得到有效世界坐标便锁存；图像或 cluster 后续消失时
+    // GEO 继续使用该坐标，直到 guidance 被明确关闭。
+    bool strike_target_latched_valid_ = false;
     ros::Time last_target_pose_receive_time_;
     ros::Time strike_guidance_enable_time_;
     ros::Time last_strike_cmd_time_;
@@ -454,7 +458,7 @@ public:
         }
         ROS_WARN("[Guidance] STRIKE guidance selected: %s", strike_guidance_logic_.c_str());
         //===================制导修改====================
-        nh_private_.param<int>("image_confirm_frames", image_confirm_frames_, 3);
+        nh_private_.param<int>("image_confirm_frames", image_confirm_frames_, 1);
         nh_private_.param<double>("image_visible_timeout_sec", image_visible_timeout_sec_, 0.4);
         nh_private_.param<double>("image_reacquire_blend_sec", image_reacquire_blend_sec_, 0.7);
         nh_private_.param<double>("image_max_speed", image_max_speed_, 5.0);
@@ -496,6 +500,8 @@ public:
                                   strike_max_vertical_accel_, 1.5);
         //===================制导修改====================
         nh_private_.param<double>("strike_max_yaw_accel", strike_max_yaw_accel_, 1.0);
+        nh_private_.param<double>("attack_max_speed", attack_max_speed_, 40.0);
+        attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
         strike_slowdown_radius_m_ = std::max(
             strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
         strike_terminal_world_direction_radius_m_ = std::max(
@@ -691,6 +697,9 @@ public:
         is_target_pose_received_ = true;
         //===================制导修改====================
         last_target_pose_receive_time_ = ros::Time::now();
+        if (is_enabled_ && current_mode_ == "strike") {
+            strike_target_latched_valid_ = true;
+        }
 
         // main分支PN Layer 5：10Hz目标阶跃先经独立1Hz OneEuro，再交给50Hz PN。
         // IMAGE/GEO继续使用上面的current_target_pose_原值，二者互不污染。
@@ -828,6 +837,13 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
+            const double target_age = last_target_pose_receive_time_.isZero()
+                ? std::numeric_limits<double>::infinity()
+                : (ros::Time::now() - last_target_pose_receive_time_).toSec();
+            // mission_manager 按 mode→target→speed→enable 发布，允许刚在 enable 前
+            // 到达的本次目标成为 GEO 锁存目标，同时拒绝上一任务遗留的旧坐标。
+            strike_target_latched_valid_ = is_target_pose_received_ &&
+                target_age >= 0.0 && target_age <= strike_target_pose_timeout_sec_;
             //========速度修改========
             // 原逻辑从零速度开始做 slew limit，会造成打击接管后速度先掉到零再爬升。
             // last_strike_cmd_valid_ = false;
@@ -917,6 +933,7 @@ public:
             strike_vision_switch_time_ = ros::Time();
             last_strike_cmd_valid_ = false;
             last_strike_cmd_time_ = ros::Time();
+            strike_target_latched_valid_ = false;
             //===================制导修改====================
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
@@ -957,13 +974,18 @@ public:
             ROS_WARN_THROTTLE(5.0, "[Guidance] Ignoring non-positive uav_speed: %.2f", speed);
             return;
         }
+        const double limited_speed = std::min(speed, attack_max_speed_);
+        if (speed > attack_max_speed_) {
+            ROS_WARN("[Guidance] requested attack speed %.2f exceeds %.2fm/s; clamped",
+                     speed, attack_max_speed_);
+        }
         // 更新本节点的速度上限(用于 applyInterUavAvoidance 和 vel cmd 限速)
-        track_max_speed_ = speed;
+        track_max_speed_ = limited_speed;
         // 下发到当前激活的策略(目前只有 Intercept 用到)
         if (guidance_strategy_) {
-            guidance_strategy_->setUavSpeed(speed);
+            guidance_strategy_->setUavSpeed(limited_speed);
         }
-        ROS_INFO("[Guidance] uav_speed updated to %.2f m/s", speed);
+        ROS_INFO("[Guidance] uav_speed updated to %.2f m/s", limited_speed);
     }
 
     // 邻居心跳回调（机间避障用）— 替代原 otherUavPosesCallback。
@@ -1166,8 +1188,7 @@ public:
         // if (!strike_guidance_enable_time_.isZero() &&
         //     last_target_pose_receive_time_ < strike_guidance_enable_time_) return false;
         //========速度修改========
-        const double age = (ros::Time::now() - last_target_pose_receive_time_).toSec();
-        return age >= 0.0 && age <= strike_target_pose_timeout_sec_;
+        return strike_target_latched_valid_;
     }
 
     double terminalHorizontalSpeed(double requested_speed, double horizontal_distance) const {
@@ -1406,16 +1427,18 @@ public:
     //===================制导修改====================
 
     void guidanceTimerCallback(const ros::TimerEvent&) {
-        // 真机只有在 FCU 已连接、已解锁且 mission_manager 确认实际高度达到
-        // 本次 takeoff_altitude（phase >= HOVERING）后，才允许任何 velocity setpoint。
-        // 未满足时连零速度也不发布，避免与起飞 position setpoint 混流。
-        if (!use_sim_ &&
-            (!mavros_state_received_ || !mavros_connected_ || !mavros_armed_ ||
-             !mission_state_received_ || current_mission_phase_ < 2)) {
+        //=========setpoint====//
+        // Guidance velocity 只允许在明确的跟踪/打击阶段发布。TAKING_OFF、
+        // HOVERING、GROUND_IDLE 等阶段连零速度也不发，避免与 position 混流。
+        if (!mission_state_received_ ||
+            (current_mission_phase_ != 4 && current_mission_phase_ != 5) ||
+            (!use_sim_ &&
+             (!mavros_state_received_ || !mavros_connected_ || !mavros_armed_))) {
             ROS_DEBUG_THROTTLE(2.0,
-                "[Guidance] Velocity publish blocked: waiting for armed FCU and takeoff altitude");
+                "[Guidance] Velocity publish blocked: FCU not armed or phase is not GUIDANCE");
             return;
         }
+        //=========setpoint====//
 
         // SEARCH_ONLY 模式下 guidance 不工作
         if (!is_enabled_) {

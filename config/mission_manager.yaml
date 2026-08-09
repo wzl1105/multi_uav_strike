@@ -12,6 +12,9 @@ spiral_approach_duration: 10.0
 spiral_approach_radius: 20.0
 # 拦截速度(下发到 InterceptGuidance 替代 guidance_control.yaml 里的 uav_speed)
 max_speed: 10.0
+# Attack(105) 的速度必须由 Skill.task_speed 显式传入；这里只定义硬上限，
+# 不作为缺失 task_speed 时的默认打击速度。代码不会允许上限超过 40m/s。
+attack_max_speed: 40.0
 # 起飞高度达标后的等待时间（缩短起飞流程用）
 takeoff_stable_time: 1.0     # 高度达标后稳定时间（秒）
 takeoff_hover_time: 0.5      # 悬停等待时间（秒）
@@ -88,10 +91,9 @@ attack_wp2_look_delay_sec: 2.0
 attack_gimbal_look_default_pitch_deg: 0.0
 
 # === CODEX DIRECT-LOOK START ===
-# Attack(105) 收到后先保持当前位置，机头偏航朝 WP2，云台只调整俯仰朝 WP2。
-# 连续 3 帧同一有效 cluster（已通过 WP2 距离、target_type 和新鲜度门控）后
-# 直接进入原有 strike guidance；超时没有确认则完整回退原 WP1→WP2 航点逻辑。
-attack_direct_look_enabled: true
+# 兼容参数保留。按当前任务约束，Attack 必须先到 WP1 才开启聚类，
+# 所以预 WP1 DIRECT_LOOK 在代码中强制禁用；WP1 后看到目标由标准主路径立即打击。
+attack_direct_look_enabled: false
 # 从开始转动机头/云台算起的总预检窗口（秒）。
 attack_direct_look_timeout_sec: 4.0
 # 前段只用于机头和云台稳定，不累计检测帧（秒）。

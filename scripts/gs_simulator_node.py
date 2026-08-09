@@ -39,11 +39,13 @@ from math import cos, pi
 
 DEMO_FLOWS = {
     # ---------- Demo 1: 地面起飞 + 搜索 + 打击 ----------
-    # 坐标系: NED (北=+x, 东=+y, 上=+z, 米)
-    # 目标位置 NED: (-30, 10, 0)  ← 由 target_motion_simulator.yaml (x_init=-30, y_init=10) 决定
+    # 航线坐标系: NED (北=+x, 东=+y, 高度=+z, 米)
+    # 当前 target_motion_simulator.yaml 的打击目标群中心是 NWU (-50, -150)，
+    # 换算到航线 NED 为 (-50, 150)。演示航线必须与该配置保持一致，否则
+    # WP2 目标区域门限会正确地拒绝远处目标，表现为到攻击点后一直悬停。
     # 相机方向: pitch=-90°(正下视), FOV 60°,
     #   在高度 z=30m 时地面可视半径 ≈ 30*tan(30°) ≈ 17m,正下视能看到目标
-    # 搜索策略: 在 x=-30 这条南北线上飞,从 y=-30 飞到 y=50,会掠过目标 y=10
+    # 搜索策略: 沿 x=-50 的搜索线飞向目标群，随后 Attack WP1→WP2 接近目标。
     "ground_search_strike": {
         "flow_id": "demo_ground_search_strike_001",
         "work_mode": 5,  # SEARCH_STRIKE — 识别即上报并自动打击
@@ -68,16 +70,16 @@ DEMO_FLOWS = {
                 "cruise_speed": 8.0,
                 "task_speed": 6.0,
                 "arrive_path": [
-                    (0.0, -30.0, 30.0),   # 原地起飞到 30m 后先飞往搜索线南端上方
+                    (0.0, 80.0, 30.0),    # 原地起飞到 30m 后先飞往搜索线入口
                 ],
                 "skill_area_path": [
-                    (-30.0, -30.0, 30.0),  # 搜索线南端 (目标在 y=10,这里在下边)
-                    (-30.0, 10.0, 30.0),   # 正对目标 (y=10 与目标 x/y 一致) — 应该在这里看到目标
-                    (-30.0, 20.0, 30.0),   # 越过目标继续搜索
+                    (-50.0, 80.0, 30.0),   # 搜索线入口
+                    (-50.0, 110.0, 30.0),  # 向目标群接近
+                    (-50.0, 120.0, 30.0),  # Attack 接管前的搜索终点
                 ],
             },
             # 3) Attack(WP1=发现点,WP2=瞄准点,task_speed 是打击速度)
-            # 目标点约在 (-30, 10, 0),瞄准点下降到 5m
+            # 目标群中心约在 NED (-50, 150, 0)，飞行高度由执行器钳到 20m AGL
             {
                 "skill_id": "attack_001",
                 "skill_type": 105,
@@ -87,8 +89,8 @@ DEMO_FLOWS = {
                 "task_speed": 12.0,
                 "arrive_path": [],
                 "skill_area_path": [
-                    (-30.0, 40.0, 30.0),  # WP1 = 发现点(目标上空)
-                    (-30.0, 60.0, 0.0),   # WP2 = 瞄准点(下降到低空)
+                    (-50.0, 130.0, 30.0), # WP1 = 目标群前方观察点
+                    (-50.0, 150.0, 0.0),  # WP2 = 目标群中心瞄准点
                 ],
             },
             # 4) Return(返航)
@@ -1094,6 +1096,10 @@ class GroundStationSimulator:
             s.cruise_speed = float(skill_cfg.get("cruise_speed", 8.0))
             s.task_speed = float(skill_cfg.get("task_speed", 8.0))
             s.formation = skill_cfg.get("formation", 0)
+            # Skill.msg 约定负值=下视。demo Search 未显式给角度时默认 45°下视，
+            # 避免字段保持 0 导致相机水平、地面目标只在视场边缘偶发命中。
+            s.gimbal_pitch = float(skill_cfg.get(
+                "gimbal_pitch", -45.0 if s.skill_type == 102 else 0.0))
 
             # === 注入 devices_sn 到 gather skill 的 params_json ===
             #   mission_manager 端 parseDevicesSnFromParamsJson() 解出来用作多机同步名单

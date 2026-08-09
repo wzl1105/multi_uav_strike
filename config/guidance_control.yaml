@@ -11,9 +11,12 @@ guidance_strategy: "intercept"   # intercept / minsnap / los
 # STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
 # pn=融合main分支增强后的比例导引；legacy_pn作为pn的兼容别名。
 strike_guidance_logic: "image_geo_fallback"
+# 实际速度仍完全来自 Attack Skill.task_speed；这里只做第二层硬上限保护。
+attack_max_speed: 40.0
 
-# 连续新图像帧达到此数量后才允许从坐标备份切入图像导引，避免单帧闪烁。
-image_confirm_frames: 3
+# cluster 已在 Attack 阶段通过 6-hit 晋升门槛；guidance 收到一帧新的可见主目标
+# 就切 IMAGE，满足“只要看得见就用图像导引”。
+image_confirm_frames: 1
 # 锁定目标图像观测超过此时间视为不可见，转世界坐标纯追踪；长时丢失仍由
 # mission_manager 的 target_lost_hold_sec 进入 TARGET_LOST_HOVER。
 image_visible_timeout_sec: 0.4

@@ -5,7 +5,7 @@
 # 工作流 (2026-07 多目标改造):
 #   1. gimbal_simulator_node 每帧发布 YoloDetections (batch) — 每条对应一个 FOV 内目标
 #   2. target_estimator_node 取每条 detection 的 bbox 中心,经 camera 几何反投影到
-#      地面 (z=target_z_prior) → (ned_x, ned_y)
+#      地面 (z=target_z_prior) → (nwu_x, nwu_y)
 #   3. 遍历 clusters_, 找 label 相同 + 2D 距离 ≤ merge_radius_m_ 的最近 cluster 合并;
 #      没命中 → 新建 cluster,并 publish 一次 cluster_event (mission_manager 据此上报 GS)
 #   4. 10Hz 周期 publish cluster_states (所有 alive cluster) + primary cluster GPS/pose
@@ -46,6 +46,14 @@ ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全�
                               # 0.3 + 10Hz → 时间常数 ≈ 0.23s,稳态世界噪声衰减 ~70%。
                               # 像素噪声大时降到 0.1~0.2;车辆/高速场景调到 0.4~0.5。
 target_z_prior: 0.0           # 反投影 z 假设(地面目标 = 0;空中目标可设 UAV 当前高度)
+
+# ---- 图像/位姿时间对齐 ----
+# camera/pose 按时间缓存；每条 YoloDetection 使用与 stamp_us 时间差最小的样本。
+# 时间差不作为拒绝条件，超过 warn 阈值仅打印诊断日志。
+pose_buffer_duration_sec: 5.0
+pose_sync_warn_threshold_sec: 0.1
+max_cluster_yaw_rate_rad_s: 0.2
+yaw_rate_sample_max_dt_sec: 0.5
 
 # ---- 相机几何 (必须与 gimbal_simulator.yaml 同步) ----
 image_width: 1920
