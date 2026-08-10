@@ -3241,20 +3241,51 @@ public:
                 continue;
             }
 
-            // 缓存为 locked_cluster_*,供 attackCmdCallback / triggerStrike 使用
-            locked_cluster_ned_x_         = cluster.ned_x;
-            locked_cluster_ned_y_         = cluster.ned_y;
-            locked_cluster_ned_alt_       = cluster.ned_alt;
-            locked_cluster_id_            = cluster.cluster_id;
-            locked_cluster_time_          = ros::Time::now();
-            locked_cluster_last_seen_us_  = cluster.last_seen_us;
+            //======不要打击错目标======//
+            // Attack 必须等 WP2 门控、类别、新鲜度和候选排序全部通过后，才由
+            // processSearchStrikeStrike() 写入临时图像路由 ID。不能在遍历候选时
+            // 提前缓存，否则一个门外 cluster 也会污染后续世界坐标/图像目标。
+            if (sr.msg.skill_type != 105) {
+                locked_cluster_ned_x_         = cluster.ned_x;
+                locked_cluster_ned_y_         = cluster.ned_y;
+                locked_cluster_ned_alt_       = cluster.ned_alt;
+                locked_cluster_id_            = cluster.cluster_id;
+                locked_cluster_time_          = ros::Time::now();
+                locked_cluster_last_seen_us_  = cluster.last_seen_us;
+            }
+            //======不要打击错目标======//
 
             //=============一定打击=========//
-            // Attack 的可见目标不再受 WP2 半径限制：收到指令时、飞向 WP1 时、
-            // WP1→WP2 时只要目标新鲜且类型匹配，都立即进入直接打击。
-            // d_wp2 仅用于多个候选同时可见时选择最接近任务目标点的一个。
             if (sr.msg.skill_type == 105) {
                 const double d_wp2 = clusterDistToWp2Meters(cluster, sr);
+
+                //======不要打击错目标======//
+                // WP2 是地面站选定目标的空间约束。无论是在收到 Attack 时、
+                // 飞向 WP1 时还是 WP1->WP2 段，只有 WP2 统一 30m 门内的目标
+                // 才能成为直接打击候选。门外目标仍上报，但不能抢占 primary。
+                // 不把任务永久绑定到 cluster_id：聚类 ID 变化后，只要新候选仍
+                // 满足 WP2 门控、类别和新鲜度，就可以重新成为图像候选。
+                if (!std::isfinite(d_wp2) || d_wp2 > wp2_strike_radius_m_) {
+                    multi_uav_strike::DetectTarget dt =
+                        buildDetectTarget(cluster, /*target_type=*/3);
+                    detect_target_pub_.publish(dt);
+                    {
+                        multi_uav_strike::DetectTargets batch;
+                        batch.targets.push_back(dt);
+                        detect_targets_pub_.publish(batch);
+                    }
+                    // 不写 reported_to_gs_：同一临时候选后续投影回到30m门内时，
+                    // 必须能够重新参加选择，不能被 cluster_id/位置去重永久挡住。
+                    ROS_WARN_THROTTLE(
+                        2.0,
+                        "[MissionManager] Cluster[%lu] label=%s rejected by WP2 gate: "
+                        "d_wp2=%.1fm > %.1fm -> publish type=3, no strike",
+                        cluster.cluster_id, cluster.label.c_str(), d_wp2,
+                        wp2_strike_radius_m_);
+                    continue;
+                }
+                //======不要打击错目标======//
+
                 // === 2026-07-31: 严格化 seen 判定 ===
                 //   旧版: WP2 距离门过就 attack_wp2_target_seen_ = true
                 //         → wrong-label / stale cluster 也把 300s 长超时降级到 30s 短超时
