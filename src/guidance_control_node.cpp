@@ -1478,14 +1478,25 @@ public:
         //=========setpoint====//
         // Guidance velocity 只允许在明确的跟踪/打击阶段发布。TAKING_OFF、
         // HOVERING、GROUND_IDLE 等阶段连零速度也不发，避免与 position 混流。
-        if (!mission_state_received_ ||
-            (current_mission_phase_ != 4 && current_mission_phase_ != 5) ||
+        //========不要fail safe============//
+        // mission_state 仅1Hz发布。Attack交接时 waypoint_executor 会立即停止，
+        // 但guidance可能仍缓存上一帧WAYPOINT_FOLLOW，导致整个COM_OF_LOSS_T窗口
+        // 没有任何速度setpoint，PX4随即从OFFBOARD进入AUTO.LAND。
+        // guidance/enable=true且mode已明确为track/strike，就是任务管理器完成控制权
+        // 交接的实时信号；允许它在mission_state下一帧到达前先接管保活。
+        const bool mission_phase_allows_velocity =
+            mission_state_received_ &&
+            (current_mission_phase_ == 4 || current_mission_phase_ == 5);
+        const bool guidance_handoff_allows_velocity =
+            is_enabled_ && (current_mode_ == "track" || current_mode_ == "strike");
+        if ((!mission_phase_allows_velocity && !guidance_handoff_allows_velocity) ||
             (!use_sim_ &&
              (!mavros_state_received_ || !mavros_connected_ || !mavros_armed_))) {
             ROS_DEBUG_THROTTLE(2.0,
                 "[Guidance] Velocity publish blocked: FCU not armed or phase is not GUIDANCE");
             return;
         }
+        //========不要fail safe============//
         //=========setpoint====//
 
         // SEARCH_ONLY 模式下 guidance 不工作
