@@ -282,6 +282,9 @@ private:
     // Attack(105) WP2 地板高度(NED 米,负值=地上方米)
     //   GS 发的目标 MSL=0(地面)时,不直接撞过去,而是保持至少此高度悬停/接近。
     double   attack_min_altitude_ned_ = -20.0;
+    //=======高度下降===========//
+    double   strike_descent_rate_ = 2.5;
+    //=======高度下降===========//
 
 public:
     WaypointExecutor() : nh_private_("~"),
@@ -461,6 +464,10 @@ public:
         // MSL=0 时飞机直接撞地。skillCallback 在 Attack skill 收到时把 WP2 的
         // ned_z 钳到此值上限。
         nh_private_.param<double>("attack_min_altitude_ned", attack_min_altitude_ned_, -20.0);
+        //=======高度下降===========//
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
+        //=======高度下降===========//
     }
 
     void initSubscribers() {
@@ -1189,6 +1196,14 @@ public:
         // applyBuildingAvoidance 拿钳制后的 target_z_for_flight,避免 HOLD_HIGH 状态
         //   以为目标是 WP2 真实高(可能是地面)而把飞机绕开到错误高度。
         applyBuildingAvoidance(vx, vy, vz, target_z_for_flight);
+
+        //=======高度下降===========//
+        // NED z 正方向为向下。Attack 飞向 WP1、WP1->WP2以及避障处理后的最终
+        // 下降指令统一受 common.yaml 的 strike_descent_rate 限制；向上避障不受影响。
+        if (active_skill_type_ == 105 && vz > strike_descent_rate_) {
+            vz = strike_descent_rate_;
+        }
+        //=======高度下降===========//
 
         // (2026-08-03 重构:段切换 fall-through 已移至函数顶端,不再在此处
         //  publishZeroVelocity()+return。avoidance 之后直接 publish velocity)

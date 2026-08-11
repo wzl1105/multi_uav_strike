@@ -235,6 +235,9 @@ private:
     //===================制导修改====================
     // 原值保留：double image_max_vertical_speed_ = 1.0;
     double image_max_vertical_speed_ = 2.5;
+    //=======高度下降===========//
+    double strike_descent_rate_ = 2.5;
+    //=======高度下降===========//
     bool strike_slant_descent_enabled_ = true;
     double strike_slant_descent_max_angle_deg_ = 25.0;
     double strike_slant_min_horizontal_distance_m_ = 1.0;
@@ -466,6 +469,9 @@ public:
         // 原参数默认值保留：
         // nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
         nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 2.5);
+        //=======高度下降===========//
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        //=======高度下降===========//
         nh_private_.param<bool>("strike_slant_descent_enabled",
                                 strike_slant_descent_enabled_, true);
         nh_private_.param<double>("strike_slant_descent_max_angle_deg",
@@ -508,6 +514,9 @@ public:
             strike_terminal_world_direction_radius_m_, strike_horizontal_stop_radius_m_);
         //===================制导修改====================
         image_max_vertical_speed_ = std::max(0.1, image_max_vertical_speed_);
+        //=======高度下降===========//
+        strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
+        //=======高度下降===========//
         strike_max_vertical_accel_ = std::max(0.1, strike_max_vertical_accel_);
         strike_slant_min_horizontal_distance_m_ = std::max(
             0.1, strike_slant_min_horizontal_distance_m_);
@@ -1211,6 +1220,39 @@ public:
         return yaw_rate;
     }
 
+    //=======高度下降===========//
+    // 保持水平/垂直到达时间一致。若按任务速度需要的下降率超过配置值，
+    // 降低水平速度，而不是只截断 vz 后从目标上空飞过。
+    double feasibleHorizontalSpeedForDescent(const StrikeTargetGeometry& g,
+                                             double requested_speed) const {
+        if (!strike_slant_descent_enabled_ || g.down <= 0.0 ||
+            g.horizontal <= strike_slant_min_horizontal_distance_m_) {
+            return requested_speed;
+        }
+        const double max_slope = std::tan(
+            strike_slant_descent_max_angle_deg_ * M_PI / 180.0);
+        if (g.down / g.horizontal > max_slope) {
+            ROS_WARN_THROTTLE(1.0,
+                "[Guidance] Pre-descent hold: height=%.1fm horizontal=%.1fm slope=%.3f "
+                "> max=%.3f, horizontal speed held at zero, descent=%.2fm/s",
+                g.down, g.horizontal, g.down / g.horizontal, max_slope,
+                strike_descent_rate_);
+            return 0.0;
+        }
+        const double feasible =
+            g.horizontal * strike_descent_rate_ / std::max(g.down, 1e-3);
+        const double limited = std::min(requested_speed, std::max(0.0, feasible));
+        if (limited + 1e-3 < requested_speed) {
+            ROS_WARN_THROTTLE(1.0,
+                "[Guidance] Descent-gradient speed limit: requested=%.2f horizontal=%.2f "
+                "height=%.1f distance=%.1f descent_rate=%.2f",
+                requested_speed, limited, g.down, g.horizontal,
+                strike_descent_rate_);
+        }
+        return limited;
+    }
+    //=======高度下降===========//
+
     //===================制导修改====================
     double computeSlantDescentSpeed(const StrikeTargetGeometry& g,
                                     double horizontal_speed) const {
@@ -1218,8 +1260,8 @@ public:
         // return clampValue(g.down, -image_max_vertical_speed_,
         //                            image_max_vertical_speed_);
         if (!strike_slant_descent_enabled_) {
-            return clampValue(g.down, -image_max_vertical_speed_,
-                                      image_max_vertical_speed_);
+            return clampValue(g.down, -strike_descent_rate_,
+                                      strike_descent_rate_);
         }
 
         // 水平与垂直预计到达时间同步：vz/vh = 高度差/水平距离。
@@ -1230,13 +1272,13 @@ public:
             const double max_angle_rad = strike_slant_descent_max_angle_deg_ * M_PI / 180.0;
             const double angle_limited_vz = horizontal_speed * std::tan(max_angle_rad);
             const double vertical_limit = std::min(
-                image_max_vertical_speed_, std::fabs(angle_limited_vz));
+                strike_descent_rate_, std::fabs(angle_limited_vz));
             return clampValue(geometric_vz, -vertical_limit, vertical_limit);
         }
 
         // 扰动导致水平已进入停止圈但高度仍未满足命中距离时，保留原垂直下降兜底。
-        return clampValue(g.down, -image_max_vertical_speed_,
-                                  image_max_vertical_speed_);
+        return clampValue(g.down, -strike_descent_rate_,
+                                  strike_descent_rate_);
     }
     //===================制导修改====================
 
@@ -1246,9 +1288,12 @@ public:
         // track_max_speed_ 由 guidance/guidance_speed 更新，来源是 Attack task_speed。
         // 默认不再受 image_max_speed、邻近目标减速和 1m 水平零速限制。
         const double requested_speed = track_max_speed_;
-        const double speed = strike_terminal_speed_schedule_enabled_
+        const double scheduled_speed = strike_terminal_speed_schedule_enabled_
             ? terminalHorizontalSpeed(requested_speed, g.horizontal)
             : requested_speed;
+        //=======高度下降===========//
+        const double speed = feasibleHorizontalSpeedForDescent(g, scheduled_speed);
+        //=======高度下降===========//
         //========速度修改========
         if (g.horizontal > 0.1 && speed > 0.0) {
             cmd.linear.x = speed * g.north / g.horizontal;
@@ -1287,9 +1332,12 @@ public:
         //     std::min(track_max_speed_, image_max_speed_) * alignment;
         // 图像偏差只决定方向，不再改变速度大小；水平速度直接接入 Attack task_speed。
         const double requested_speed = track_max_speed_;
-        const double speed = strike_terminal_speed_schedule_enabled_
+        const double scheduled_speed = strike_terminal_speed_schedule_enabled_
             ? terminalHorizontalSpeed(requested_speed, g.horizontal)
             : requested_speed;
+        //=======高度下降===========//
+        const double speed = feasibleHorizontalSpeedForDescent(g, scheduled_speed);
+        //=======高度下降===========//
         //========速度修改========
 
         // NWU ray → NED ray，一次转换；发布前仍统一走 convertVelNedToEnu。
