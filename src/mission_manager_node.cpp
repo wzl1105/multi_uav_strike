@@ -450,6 +450,10 @@ private:
     // task_speed 必须由任务显式传入，并统一限制到 attack_max_speed_。
     double min_guidance_speed_;
     double attack_max_speed_;
+    //=======高度下降===========//
+    // Attack 飞向 WP1 时的预下降规划速率，与 waypoint/guidance 共用 common.yaml 参数。
+    double strike_descent_rate_;
+    //=======高度下降===========//
     // strike 触发时的 cluster 新鲜度门槛(2026-07-26):locked_cluster_time_ 超过此值
     //   即视为 stale,triggerStrike() 入口放弃 strike 并清锁,让 waypoint 继续
     //   飞向 attack_point(目标位置),新 cluster 进得来时重新当 primary 锁上。
@@ -776,6 +780,9 @@ public:
         guidance_speed_(10.0),    // 默认 10 m/s,可在 mission_manager.yaml 的 ~max_speed 覆盖
         min_guidance_speed_(2.0), // 非 Attack 历史兼容值
         attack_max_speed_(40.0),  // Attack task_speed 硬上限
+        //=======高度下降===========//
+        strike_descent_rate_(2.5),
+        //=======高度下降===========//
         max_strike_cluster_age_sec_(0.5),   // strike cluster 新鲜度门槛(2026-07-26),见字段注释
         max_report_cluster_age_sec_(5.0),   // 上报 cluster 新鲜度门槛(2026-07-29),见字段注释
         report_dedup_radius_m_(25.0),       // GS 上报位置栅格去重半径(2026-07-29,2026-07-31 40→25),见字段注释
@@ -978,6 +985,10 @@ public:
         nh_private_.param<double>("min_guidance_speed", min_guidance_speed_, 2.0);
         nh_private_.param<double>("attack_max_speed", attack_max_speed_, 40.0);
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
+        //=======高度下降===========//
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
+        //=======高度下降===========//
         // strike cluster 新鲜度门槛(2026-07-26),见 max_strike_cluster_age_sec_ 字段注释
         nh_private_.param<double>("max_strike_cluster_age_sec", max_strike_cluster_age_sec_, 0.5);
         // 上报 cluster 新鲜度门槛(2026-07-29),见 max_report_cluster_age_sec_ 字段注释
@@ -2226,6 +2237,14 @@ public:
             }
         }
 
+        //=======高度下降===========//
+        // 在航点下发前降低 WP1 准备高度，使无人机飞向 WP1 的同时完成预下降。
+        // 该计算幂等，pushCurrentSkillToExecutor() 重试不会继续累积降低高度。
+        if (sr.msg.skill_type == 105) {
+            applyAttackPreDescentToWp1(sr);
+        }
+        //=======高度下降===========//
+
         //=============一定打击=========//
         // Attack 路径一经下发就进入 strike 语义，不能等到 WP1/IN_TASK 才切换。
         // 这样任务接收时已有目标或飞向 WP1 途中出现目标，cluster callback 都会
@@ -2429,6 +2448,65 @@ public:
         return (lon_to - lon_from) * M_PI / 180.0 * EARTH_R *
                std::cos(lat_ref * M_PI / 180.0);
     }
+
+    //=======高度下降===========//
+    /**
+     * 按 WP1->WP2 可用水平距离计算 WP1 准备高度：
+     *   height_above_target = distance * descent_rate / task_speed
+     * 若 GS 给的 WP1 更高，则只向下修正；若原路径已经更低/更缓则保持不动。
+     * 高度沿用 Attack Path 的 MSL 语义，不改变 WP1/WP2 经纬度。
+     */
+    void applyAttackPreDescentToWp1(SkillRuntime& sr) {
+        if (sr.msg.skill_area_path.poses.size() < 2) {
+            ROS_WARN_THROTTLE(2.0,
+                "[MissionManager] Attack pre-descent skipped: need WP1 and WP2");
+            return;
+        }
+
+        const double speed = std::min(
+            static_cast<double>(sr.msg.task_speed), attack_max_speed_);
+        if (!std::isfinite(speed) || speed <= 0.0 ||
+            !std::isfinite(strike_descent_rate_) || strike_descent_rate_ <= 0.0) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[MissionManager] Attack pre-descent skipped: invalid speed=%.2f "
+                "or descent_rate=%.2f",
+                speed, strike_descent_rate_);
+            return;
+        }
+
+        auto& wp1 = sr.msg.skill_area_path.poses.front().pose.position;
+        const auto& wp2 = sr.msg.skill_area_path.poses.back().pose.position;
+        if (!std::isfinite(wp1.x) || !std::isfinite(wp1.y) ||
+            !std::isfinite(wp1.z) || !std::isfinite(wp2.x) ||
+            !std::isfinite(wp2.y) || !std::isfinite(wp2.z)) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[MissionManager] Attack pre-descent skipped: non-finite WP1/WP2");
+            return;
+        }
+
+        const double north = gpsDeltaN(wp1.x, wp2.x);
+        const double east = gpsDeltaE(wp1.y, wp2.y, 0.5 * (wp1.x + wp2.x));
+        const double horizontal_distance = std::hypot(north, east);
+        const double allowed_height_above_target =
+            horizontal_distance * strike_descent_rate_ / speed;
+        const double planned_wp1_alt = wp2.z + allowed_height_above_target;
+        const double original_wp1_alt = wp1.z;
+
+        if (planned_wp1_alt < wp1.z) {
+            wp1.z = planned_wp1_alt;
+            ROS_WARN("[MissionManager] Attack pre-descent applied: WP1 alt %.2f -> %.2f "
+                     "MSL, WP2 alt=%.2f, horizontal=%.1fm, task_speed=%.1fm/s, "
+                     "descent_rate=%.2fm/s",
+                     original_wp1_alt, wp1.z, wp2.z, horizontal_distance,
+                     speed, strike_descent_rate_);
+        } else {
+            ROS_INFO("[MissionManager] Attack pre-descent not needed: WP1 alt=%.2f <= "
+                     "feasible %.2f MSL (horizontal=%.1fm, speed=%.1fm/s, descent=%.2fm/s)",
+                     wp1.z, planned_wp1_alt, horizontal_distance,
+                     speed, strike_descent_rate_);
+        }
+    }
+    //=======高度下降===========//
 
     /**
      * 给定 UAV 与目标 GPS(度/正高),返回云台俯仰角(度,正值=下视,GS 语义)。
