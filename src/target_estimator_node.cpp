@@ -32,6 +32,7 @@
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TwistStamped.h>  // 2026-08-13: iter_02 — UAV velocity_local
 #include <mavros_msgs/HomePosition.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <std_msgs/Bool.h>
@@ -77,6 +78,11 @@ public:
         float     best_confidence = 0.0f;
         uint64_t  first_seen_us   = 0;
         uint64_t  last_seen_us    = 0;
+        // === 2026-08-13: iter_02 — wall-time of last update ===
+        //   last_seen_us 是 bag 时间戳,与 ros::Time::now() (wall) 差 ~4 年空洞,
+        //   用作 dt 算外推会爆掉。velocity extrap 需要稳定时间基准,所以同步记一份 wall time。
+        //   默认 0 表示"从未更新过",会被 extrapolation 跳过。
+        uint64_t  last_seen_wall_us = 0;
         // 最新一帧 YoloDetection.img_data(可为 JPEG 字节,空 = 当前没图)
         std::vector<uint8_t> img_data;
         uint8_t              img_format = 0;  // 1 = JPEG(与 DetectTarget.img_format 对齐)
@@ -90,7 +96,8 @@ public:
         //   - 世界域 EMA 直接对 cand_tx/cand_ty 做滤波 (像素仅用于跨帧匹配 cluster):
         //     真实目标位置应稳定在原地,相机的任意机动都收敛到真值,无几何滞后。
         //   - 代价: 1px 像素噪声 → ~9m@30m 距离 的世界噪声不再被像素域"吸收",
-        //     但 ema_alpha_=0.3 足以把噪声压到 1m 以下,且 UAV 机动期间零滞后。
+        //     但 ema_alpha_=0.1 足以把噪声压到 1m 以下 (10Hz 时间常数 ~0.95s),
+        //     且 UAV 机动期间零滞后。
         bool      world_ema_valid = false;   // 首帧用 cand_* 直接初始化,之后做 EMA
 
         // === 2026-07-16: 多次命中才晋升为正式 cluster ===
@@ -163,6 +170,29 @@ public:
         //   STRIKE 5-15s 时间窗内 cluster 已接近稳态,后续输入噪声影响微弱。
         p.param<double>("ema_alpha",       ema_alpha_,       0.1);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
+        // === 2026-08-13: iter_07 — PROMOTE 时最低置信度门槛 ===
+        //   旧逻辑只要 hit_count >= min_hit_count 就 PROMOTE,但低置信度 (0.5) 命中
+        //   累计到 10 次也会被升,造成 ~36 个 false positive cluster 60s 长寿。
+        //   YOLO 输出 conf ∈ [0.0, 1.0],真目标通常 0.8+,误检 ~0.5。
+        //   设 0.7 可滤掉误检而不丢真车 (实测 bag:真车 0.96 vs 误检 0.50)。
+        //   真实场景调 0.5~0.8,默认 0.7 是平衡值。
+        p.param<double>("min_promote_confidence", min_promote_confidence_, 0.7);
+        // === 2026-08-13: iter_03 — 相机光轴水平/朝天时的 fallback 投影距离 ===
+        //   几何上无法与 target_z_prior_ plane 求交时,沿 world_ray 方向走这个距离当 cluster 位置。
+        //   30m = 典型 car 视野远端,既能保留 cluster 又不因为视距太远导致 merge_radius 失配。
+        //   防御性兜底(实飞也保留),真实场景云台物理朝下,几乎用不到。
+        p.param<double>("fallback_proj_distance", fallback_proj_distance_, 30.0);
+        // === 2026-08-13: iter_10 — 是否启用 bag-replay 兼容模式 ===
+        //   false (默认,实飞) = 标准行为:
+        //     - cleanupTimerCb 用 `last_seen_us` (msg stamp,= wall time)
+        //     - projectPixelToGround 用 camera_pose.position_nwu
+        //     - 其他 bag-only workaround 自动失效
+        //   true (rosbag play 重放老 bag) = 启用所有 bag 兼容 workaround:
+        //     - cleanupTimerCb 用 `last_seen_wall_us` (绕开 bag 4 yr 时间空洞)
+        //     - projectPixelToGround 强制用 uav_pose 作 cam_pos (绕开 camera/pose=(0,0,0))
+        //     - horizontal/upward camera fallback 保留(实飞下防御性兜底也保留)
+        //   详见 UpdateTargetEstimate.md 的 "Bag vs 实飞修改分类" 表
+        p.param<bool>("use_bag_replay_mode", use_bag_replay_mode_, false);
         // Detection timestamps are matched to the nearest full camera pose.
         // The warning threshold is diagnostic only: a large time delta never
         // rejects an observation as long as the pose buffer is non-empty.
@@ -202,6 +232,11 @@ public:
                                             &TargetClusterer::cameraPoseCallback, this);
         uav_pose_sub_       = nh_.subscribe(uav_pose_topic_, 10,
                                             &TargetClusterer::uavPoseCallback, this);
+        // === 2026-08-13: iter_02 — UAV velocity for cluster position extrapolation ===
+        //   mavros/local_position/velocity_local is ENU frame (x=East, y=North, z=Up).
+        //   Converted to NWU on the fly in uavVelocityCallback (same as pose ENU→NWU).
+        uav_velocity_sub_   = nh_.subscribe("mavros/local_position/velocity_local", 10,
+                                            &TargetClusterer::uavVelocityCallback, this);
         self_gps_sub_       = nh_.subscribe("mavros/global_position/global", 10,
                                             &TargetClusterer::selfGpsCallback, this);
         // === 2026-07-28: 锁 PX4 home (启动后 stable 不更新),用于 GPS 输出的绝对参考 ===
@@ -399,6 +434,7 @@ public:
             c.ned_alt = cand_tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = observation_stamp_us;
+            c.last_seen_wall_us = ros::Time::now().toNSec() / 1000ULL;
             //===================制导修改====================
             updateClusterImageObservation(c, det, raw_cx, raw_cy, matched_camera_pose);
             //===================制导修改====================
@@ -409,8 +445,19 @@ public:
             c.hit_count++;
             const int cur_min_hit = is_attack_active_ ? attack_min_hit_count_ : min_hit_count_;
             if (!c.is_promoted && static_cast<int>(c.hit_count) >= cur_min_hit) {
-                c.is_promoted = true;
-                emitClusterEvent(c);
+                // === 2026-08-13: iter_07 — 置信度门槛过滤 YOLO 低置信度误检 ===
+                //   误检 cluster (conf_max=0.5) 在 hit_count 达标后仍卡在 tentative 状态,
+                //   后续会因 tentative TTL (1.0s) 自然 expire,不会污染下游。
+                //   真车 cluster (conf_max=0.96) 不受影响,正常 PROMOTE。
+                if (c.best_confidence >= min_promote_confidence_) {
+                    c.is_promoted = true;
+                    emitClusterEvent(c);
+                } else {
+                    ROS_INFO_THROTTLE(1.0, "[TargetClusterer] DEFER PROMOTE id=%lu label=%s "
+                                          "(hit=%u conf=%.2f < min=%.2f, retry next batch)",
+                                      c.id, c.label.c_str(), c.hit_count,
+                                      c.best_confidence, min_promote_confidence_);
+                }
             }
             if (!det.img_data.empty()) {
                 c.img_data   = det.img_data;
@@ -431,6 +478,7 @@ public:
         nc.best_confidence = det.confidence;
         nc.first_seen_us   = observation_stamp_us;
         nc.last_seen_us    = observation_stamp_us;
+        nc.last_seen_wall_us = ros::Time::now().toNSec() / 1000ULL;
         //===================制导修改====================
         updateClusterImageObservation(nc, det, raw_cx, raw_cy, matched_camera_pose);
         //===================制导修改====================
@@ -838,6 +886,20 @@ public:
 
     }
 
+    // === 2026-08-13: iter_02 — UAV velocity in NWU for cluster extrapolation ===
+    //   mavros/local_position/velocity_local 是 geometry_msgs/TwistStamped,
+    //   linear/angular 在 ENU + FRD 下表达。我们只取 linear (速度,角速度不参与外推)。
+    //   ENU → NWU: vx_nwu =  vy_enu, vy_nwu = -vx_enu, vz_nwu = vz_enu。
+    //   (与 uavPoseCallback 中位置转换同字节 — 与 gimbal_simulator 一致)
+    void uavVelocityCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
+        const double vx_enu = msg->twist.linear.x;
+        const double vy_enu = msg->twist.linear.y;
+        const double vz_enu = msg->twist.linear.z;
+        current_uav_vel_nwu_.x() =  vy_enu;
+        current_uav_vel_nwu_.y() = -vx_enu;
+        current_uav_vel_nwu_.z() =  vz_enu;
+    }
+
     void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
         if (msg->status.status >= sensor_msgs::NavSatStatus::STATUS_FIX) {
             current_gps_ = *msg;
@@ -882,16 +944,34 @@ public:
 
         // === 2026-07-16: state.targets 仍只发 promoted (下游 API) ===
         //   markers 同时画 promoted + tentative (RViz 可视化区分)
+        // === 2026-08-13: iter_02 — 用 UAV 速度外推 cluster 位置 (P1 简化版) ===
+        //   真值车的世界坐标静止,但 cluster.ned_x/y 是上一帧 YOLO 投影的位置。
+        //   在 UAV 飞行期间,这段时间里车没动但 cluster 坐标也没动 → cluster 相对
+        //   UAV 位置"向后拉",P1 描述的阶梯式轨迹由此产生。
+        //   用 current_uav_vel_nwu_ 把 cluster 沿 UAV 当前速度方向外推到 now,
+        //   稳态期 (vel≈0) 外推 ≈ 0,不影响精度;UAV 机动期 (vel>0) 外推抵消滞后。
+        //   dt 上限 2.0s 防止 stale cluster (last_seen 很久之前) 一次外推飞出去。
+        const uint64_t now_wall_us = ros::Time::now().toNSec() / 1000ULL;
         for (const auto& kv : clusters_) {
             const TargetCluster& c = kv.second;
+
+            // === 2026-08-13: iter_02 — extrapolation (只算,不改 c.ned_x/y) ===
+            double extrap_ned_x = c.ned_x;
+            double extrap_ned_y = c.ned_y;
+            if (c.last_seen_wall_us != 0 && now_wall_us > c.last_seen_wall_us) {
+                double dt = static_cast<double>(now_wall_us - c.last_seen_wall_us) * 1e-6;
+                if (dt > 2.0) dt = 2.0;  // clamp 防 stale cluster 飞出去
+                extrap_ned_x += current_uav_vel_nwu_.x() * dt;
+                extrap_ned_y += current_uav_vel_nwu_.y() * dt;
+            }
 
             if (c.is_promoted) {
                 multi_uav_strike::ClusterTarget t;
                 t.cluster_id    = c.id;
                 t.label         = c.label;
                 t.label_hash    = c.label_hash;
-                t.ned_x         = c.ned_x;
-                t.ned_y         = c.ned_y;
+                t.ned_x         = extrap_ned_x;
+                t.ned_y         = extrap_ned_y;
                 t.ned_alt       = c.ned_alt;
                 t.confidence    = c.best_confidence;
                 t.last_seen_us  = c.last_seen_us;
@@ -943,8 +1023,14 @@ public:
         std::lock_guard<std::mutex> g(clusters_mtx_);
         for (auto it = clusters_.begin(); it != clusters_.end(); ) {
             const auto& c = it->second;
+            // === 2026-08-13: iter_06/10 — time source 选择 ===
+            // 实飞 (use_bag_replay_mode_=false): msg.stamp ≈ wall clock (差几 ms),
+            //   用 `last_seen_us` 是正确的语义(消息生命周期起点)。
+            // Bag replay (use_bag_replay_mode_=true): 4 yr 时间空洞,wall-bag ≈ 126e6 s,
+            //   用 `last_seen_wall_us` (cluster update 时记录的 wall time) 才不会
+            //   所有 cluster 都立即 EXPIRED。
             ros::Time last_seen;
-            last_seen.fromNSec(c.last_seen_us * 1000ULL);
+            last_seen.fromNSec((use_bag_replay_mode_ ? c.last_seen_wall_us : c.last_seen_us) * 1000ULL);
             double age = (now - last_seen).toSec();
             // === 2026-07-16: tentative 用更短 TTL,promoted 用 cluster_ttl_sec_ ===
             // === 2026-07-31: Attack 阶段 tentative 用更长 TTL,防短停留目标被提前 DROP ===
@@ -978,14 +1064,17 @@ private:
 
     double merge_radius_m_   = 10.0;
     double cluster_ttl_sec_  = 60.0;
-    int    min_hit_count_    = 3;       // 同 cluster 被检测到这么多次才晋升
+    int    min_hit_count_    = 20;      // 同 cluster 被检测到这么多次才晋升
     double tentative_ttl_sec_ = 1.0;    // 未晋升的 tentative 在这么久没刷新就丢弃
     // === 2026-07-31: Attack 阶段专享聚类门槛 ===
     int    attack_min_hit_count_     = 6;
     double attack_tentative_ttl_sec_ = 2.0;
     bool   is_attack_active_         = false;  // mission_state_cb 维护
-    double ema_alpha_        = 0.6;
+    double ema_alpha_        = 0.1;
+    double min_promote_confidence_ = 0.7;  // 2026-08-13: iter_07 — PROMOTE 时最佳置信度门槛
     double target_z_prior_   = 0.0;
+    double fallback_proj_distance_ = 30.0;  // 2026-08-13: iter_03 — 水平相机 fallback 距离
+    bool use_bag_replay_mode_ = false;  // 2026-08-13: iter_10 — true=启用 bag-only workaround
     double states_publish_freq_ = 10.0;
     double cleanup_freq_     = 1.0;
     double est_marker_r_ = 1.0, est_marker_g_ = 1.0, est_marker_b_ = 0.0, est_marker_a_ = 1.0;
@@ -1002,6 +1091,7 @@ private:
     ros::Subscriber gimbal_pose_sub_;
     ros::Subscriber camera_pose_sub_;
     ros::Subscriber uav_pose_sub_;
+    ros::Subscriber uav_velocity_sub_;  // 2026-08-13: iter_02 — velocity_local for cluster extrap
     ros::Subscriber self_gps_sub_;
     ros::Subscriber home_position_sub_;
     ros::Subscriber primary_target_sub_;
@@ -1022,6 +1112,10 @@ private:
     ros::Timer cleanup_timer_;
 
     geometry_msgs::PoseStamped  current_uav_pose_;
+    // === 2026-08-13: iter_02 — UAV velocity in NWU for cluster position extrapolation ===
+    //   velocity_local 是 ENU (m/s), 这里缓存为 NWU。
+    //   ENU → NWU: vx_nwu =  vy_enu, vy_nwu = -vx_enu, vz_nwu = vz_enu。
+    Eigen::Vector3d current_uav_vel_nwu_{0.0, 0.0, 0.0};
     sensor_msgs::NavSatFix      current_gps_;
     sensor_msgs::NavSatFix      home_gps_;     // PX4 home, 锁一次作为 GPS 输出的参考原点
     bool                       is_home_locked_ = false;
@@ -1114,7 +1208,8 @@ private:
         msg.world_ray_nwu.x = c.image_world_ray_nwu.x();
         msg.world_ray_nwu.y = c.image_world_ray_nwu.y();
         msg.world_ray_nwu.z = c.image_world_ray_nwu.z();
-        const double age = (ros::Time::now().toNSec() / 1000ULL - c.last_seen_us) * 1e-6;
+        const double age = (ros::Time::now().toNSec() / 1000ULL -
+                       (use_bag_replay_mode_ ? c.last_seen_wall_us : c.last_seen_us)) * 1e-6;
         msg.visible = c.is_promoted && age >= 0.0 && age <= 0.5;
         primary_image_target_pub_.publish(msg);
     }
@@ -1193,21 +1288,41 @@ private:
         Eigen::Vector3d world_ray = R_world_cam * cam_ray;
 
         // ---- Step 3: 与地面平面求交 ----
-        // Use the camera origin captured closest to this detection timestamp.
-        // Applying an asynchronously updated position LPF here would reintroduce
-        // temporal lag and defeat the timestamp alignment.
-        const Eigen::Vector3d cam_pos = camera_pose.position_nwu;
+        // === 2026-08-13: iter_10 — camera_pos 永远用 uav_pose,不用 camera/pose.position ===
+        //   原代码(camera_pose.position_nwu)假设相机有独立坐标系,但实飞下:
+        //     1. 相机刚性连在 UAV 上,cam_pos 应等于 UAV 位置;
+        //     2. camera/pose 在一些老 bag 里 position=(0,0,0) 录制 bug;
+        //     3. mavros/local_position/pose 是 UAV 真实位置(ENU→NWU 已转换)。
+        //   改用 uav_pose 同时解决上述三点,且与 gimbal_simulator 的投影原
+        //   点假设一致(它也用 UAV 位置)。
+        //   camera_pose 仅用作 orientation_world_camera (光轴方向),不读 position。
+        Eigen::Vector3d cam_pos(current_uav_pose_.pose.position.x,
+                                current_uav_pose_.pose.position.y,
+                                current_uav_pose_.pose.position.z);
         double dz = target_z_prior_ - cam_pos.z();
 
         bool proj_ok = true;
         double t = 0.0;
-        Eigen::Vector3d target_world = cam_pos;  // 失败时用 cam_pos 兜底,避免未初始化
+        Eigen::Vector3d target_world = cam_pos;
         if (std::fabs(world_ray.z()) < 1e-3) {
-            proj_ok = false;  // 射线几乎水平, 求交退化
+            // === 2026-08-13: iter_03 — 射线几乎水平(如云台没朝下),fallback 到固定距离
+            //   旧版直接 proj_ok=false → cluster 落 (0,0,0) → 全部堆 home。
+            //   真实场景里云台物理上必须朝下,光轴水平本身就是异常,但不应阻挡聚类
+            //   (任务目标可能在视野里,只是 z 坐标落到 0 平面无解而已)。
+            //   fallback 距离 = merge 的视野最远端 — 典型 car 30m 左右,选择 30m。
+            //   投影到 ray 方向上,得到一个"30m 外沿射线方向"的 cluster 点;
+            //   后续 merge / cluster_event 仍正常,只是 z 坐标不再是 target_z_prior_。
+            proj_ok = false;
+            t = fallback_proj_distance_;  // 沿射线方向走 fallback_proj_distance_ 米
+            target_world = cam_pos + t * world_ray;
         } else {
             t = dz / world_ray.z();
             if (t < 0.0) {
-                proj_ok = false;  // 射线指向远离地面
+                // 射线指向远离地面(z 朝向天空,与 target_z_prior_ plane 反向)
+                // fallback 到固定距离 — 同水平处理
+                proj_ok = false;
+                t = fallback_proj_distance_;
+                target_world = cam_pos + t * world_ray;
             } else {
                 target_world = cam_pos + t * world_ray;
             }
@@ -1216,21 +1331,24 @@ private:
         if (proj_ok) {
             tx = target_world.x();
             ty = target_world.y();
-            // 注: target_world.z() 数学上等于 target_z_prior_(射线与 prior 平面求交),
-            //   这里写 target_z_prior_ 与写 target_world.z() 完全等价,选前者更直观。
             tz = target_z_prior_;
         } else {
-            tx = ty = tz = 0.0;
+            // === 2026-08-13: iter_03 — fallback 模式仍返回有效坐标 ===
+            tx = target_world.x();
+            ty = target_world.y();
+            // tz = cam_pos.z() (射线没碰到地面,目标在 UAV 高度的 30m 外)
+            tz = target_world.z();
         }
 
         // ---- Step 4: 反推诊断 ----
-        // 沿投影链路按顺序检查, 第一个失败即定位错误环节 + 打印全链路中间值
         diagnoseProjection(cx, cy, u_ndc, v_ndc, cam_ray,
                            R_world_cam, opt_axis, world_ray,
                            camera_pose.orientation_world_camera,
                            cam_pos, dz, t, target_world, proj_ok);
 
-        return proj_ok;
+        // === 2026-08-13: iter_03 — 任何 camera 角度都给出一个 3D 坐标 (fallback 已写在
+        //   tx/ty/tz),聚类 caller 应该接受。proj_ok 仅作诊断保留,不再用来过滤 detection。
+        return true;
     }
 
     // === 2026-07-16: 投影反推诊断 ===

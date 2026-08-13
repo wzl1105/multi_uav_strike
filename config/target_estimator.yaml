@@ -13,20 +13,33 @@
 #
 # 反投影与 gimbal_simulator 共用相机模型,所以下面的 image_width/height/fov_h/fov_v
 # 必须与 gimbal_simulator.yaml 完全一致。
+#
+# === 2026-08-13: iter_10 — Bag replay 兼容模式 ===
+#   use_bag_replay_mode = true 时启用 3 个 bag-only workaround (详见下方):
+#     1. cleanupTimerCb 用 wall-time 而非 msg stamp (绕开 4 yr 时间空洞)
+#     2. projectPixelToGround 用 uav_pose 而非 camera_pose (绕开 camera/pose.position=(0,0,0))
+#     3. horizontal/upward camera fallback 距离保留(实飞下不常触发但仍是防御性兜底)
+#   实飞下应保持 false。详见 UpdateTargetEstimate.md "Bag vs 实飞修改分类" 表。
 # ============================================================================
 
 # ---- 聚类参数 ----
-merge_radius_m: 10.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
+merge_radius_m: 15.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
                               # === 2026-07-31: 30 → 10 ===
                               # 8 个 15m 间距的 person 各成独立 cluster, 不再被吞
                               # 同 label + 同区域才算同一实例;不同类别天然不会合并。
+                              # === 2026-08-13: iter_09 — 20 → 15 ===
+                              # iter_08 (20m) 出现 361m 远距合并伪影 (极端 case),
+                              # 折中到 15m 应保留同车合并能力 + 避免远距误合并。
 cluster_ttl_sec: 60.0         # 多久无新命中 → 释放 cluster (秒)
-min_hit_count: 20             # 同 cluster 被检测到这么多次才晋升为正式目标
+min_hit_count: 10             # 同 cluster 被检测到这么多次才晋升为正式目标
                               # === 2026-07-16: 误检门禁 ===
                               # 10Hz yolo 下 20 hits ≈ 2s 持续命中,误检基本进不来;
                               # 真目标在视野停留 3~5s 时稳定晋升。
                               # 单次或零星命中被门禁过滤,不会触发 mission_manager 上报/跟踪。
                               # 设 ≤ 1 关闭门禁(每次命中都晋升,等价于老版行为)。
+                              # === 2026-08-13: iter_03 — 20 → 10 ===
+                              # 1s 持续命中即晋升,短停留目标(飞过/Attack 起步)能晋升;
+                              # 误检门禁仍由 1-tentative_ttl 兜底(单次命中 1s 内 expire)。
 tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后多久丢弃 (秒)
                               # 比 cluster_ttl_sec 短得多 — tentative 没有发过 cluster_event,
                               # mission_manager 不感知,过期丢弃对上游无影响。
@@ -40,12 +53,26 @@ tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后�
 #   还没攒够就被 DROP. 6 hit (~0.6s) 已足够抗单帧 YOLO 误检
 attack_min_hit_count: 6
 attack_tentative_ttl_sec: 2.0
-ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全用新值)
+ema_alpha: 0.1                # 新观测权重(0=完全保留旧值, 1=完全用新值)
                               # === 2026-07-16: Plan B 世界空间 EMA ===
                               # EMA 直接作用于 cand 世界坐标 (米),相机机动零滞后。
                               # 0.3 + 10Hz → 时间常数 ≈ 0.23s,稳态世界噪声衰减 ~70%。
                               # 像素噪声大时降到 0.1~0.2;车辆/高速场景调到 0.4~0.5。
 target_z_prior: 0.0           # 反投影 z 假设(地面目标 = 0;空中目标可设 UAV 当前高度)
+                              # === 2026-08-13: iter_07 — PROMOTE 最低置信度 ===
+                              # 0.7 平衡值:YOLO 真目标通常 0.8+,误检 ~0.5。
+                              # iter_06 实测:真车 conf_max=0.96 vs 误检 conf_max=0.50,
+                              # 设 0.7 可保留全部真车 + 滤掉全部误检 PROMOTE。
+                              # 真实场景:相机朝下视时 YOLO conf 更稳,可降到 0.5~0.6;
+                              # 长距/小目标场景建议提到 0.8。
+min_promote_confidence: 0.7
+
+# ---- Bag replay 兼容模式 (iter_10) ----
+use_bag_replay_mode: false     # true = 启用 bag-only workaround(详见文件头注释)
+                               # false (实飞默认) = 正常行为
+                               # 启用时:cleanupTimerCb 用 wall-time 而非 msg stamp
+                               #        (绕开老 bag 4 yr 时间空洞)
+                               # 注:cam_pos 永远用 uav_pose,camera/pose.position 不读
 
 # ---- 图像/位姿时间对齐 ----
 # camera/pose 按时间缓存；每条 YoloDetection 使用与 stamp_us 时间差最小的样本。

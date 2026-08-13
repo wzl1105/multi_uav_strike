@@ -1,0 +1,123 @@
+<launch>
+  <!--
+    iterate_target_estimator.launch
+    离线重放 153_manual_test_gimbal_0.bag,只跑 target_estimator_node,
+    自动注入 waypoint 开门消息,录制输出到指定 bag
+
+    关键约束(bag 拼接自 2022 到 2026):
+      - bag 时间戳跨 4 年空洞,必须用 [rosbag play start=...] 跳到 flight 段
+      - 不用 [rosbag play clock](否则 ROS Time 跳 4 年,cluster TTL/cleanup 全炸)
+      - bag 的 mission_state 全空(skill_id='', type=-1, state=0),
+        必须由 gate_keeper 注入真实 mission_state 才能开门
+
+    用法:
+      roslaunch multi_uav_strike iterate_target_estimator.launch output_bag:=/tmp/iter00.bag
+
+    可选 args:
+      bag         input bag 路径
+      output_bag  output 录制路径
+      play_bag    是否 rosbag play (false 时只跑节点)
+      record_out  是否 rosbag record
+      publish_gate  是否启动 gate_keeper
+  -->
+
+  <arg name="bag"          default="/home/jack/LOG/153_manual_test_gimbal_0.bag"/>
+  <arg name="output_bag"   default="/tmp/iter_out.bag"/>
+  <arg name="play_bag"     default="true"/>
+  <arg name="record_out"   default="true"/>
+  <arg name="publish_gate" default="true"/>
+  <arg name="use_synthetic_camera" default="false"
+       doc="是否用 synthetic_camera_pose 替代 bag 的 camera/pose。默认 false = 用 bag 真实 camera/pose"/>
+  <arg name="synthetic_pitch_deg" default="45.0"
+       doc="仅 use_synthetic_camera=true 时生效。合成 camera/pose 的云台俯角(度,90=垂直下视,45=前下 45°)"/>
+
+  <!-- bag 时长约 123796497s。flight 段从 offset 123796045s 开始,
+       持续 452s 至 bag 末尾。
+       关键:start 必须 ≥ 123796045 否则落在 4 年空洞里,
+       rosbag play 会报 "No messages to play on specified topics"
+       cluster_states 4313 msgs 乘以 10Hz 约等于 431s。
+       cluster_event 40 个约等于飞行实际段 423s。-->
+  <arg name="bag_start"    default="123796040"/>
+  <arg name="bag_duration" default="500"/>
+
+  <!-- target_estimator 主体 -->
+  <group ns="uav0">
+    <node name="target_estimator_node" pkg="multi_uav_strike"
+          type="target_estimator_node" output="screen" respawn="false">
+      <!-- 关键:实物飞行 use_sim 必须 false (默认 true 会用错的 ENU→NWU 转换) -->
+      <param name="use_sim" value="false"/>
+      <!-- === 2026-08-13: iter_10 — 启用 bag replay 兼容模式 ===
+           老 bag 有 4 yr 时间空洞,启用后 cleanupTimerCb 用 wall-time 而非 msg stamp
+           (绕开 wall-bag ≈ 4 yr 的 age 计算 bug,否则所有 cluster 立即 EXPIRED)。
+           cam_pos 永远用 uav_pose (NWU),不读 camera/pose.position。
+           实飞 launch 不要加这个 param。 -->
+      <param name="use_bag_replay_mode" value="true"/>
+      <!-- bag 的 uav_pose 是 1Hz,默认 yaw_rate_sample_max_dt_sec=0.5s
+           会被反复 reset,YOLO batch 全被跳过。放宽到 2.0s 适配 bag -->
+      <param name="yaw_rate_sample_max_dt_sec" value="2.0"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/common.yaml"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/target_estimator.yaml"/>
+    </node>
+
+    <!--
+      开门节点:让 isFirstWaypointGateOpen() 返回 true
+      target_estimator 要求同时:
+        mission_state: skill_type=102, state=1 (EXECUTING)
+        waypoint_status: skill_id 一致, skill_total 大于 0, skill_idx 大于等于 1
+      bag 的 mission_state 全空,waypoint_status 根本没录;
+      此节点持续 latch 假消息绕过
+    -->
+    <node name="waypoint_gate_keeper" pkg="multi_uav_strike"
+          type="waypoint_gate_keeper.py" output="screen"
+          if="$(arg publish_gate)"/>
+
+    <!--
+      合成 camera/pose (仅 use_synthetic_camera=true 时启动):
+      bag 153_manual_test_gimbal_0.bag 里 /uav0/camera/pose 全部 opt.z≈0
+      (光轴水平,不朝下),默认走 estimator 内部 fallback 投影到固定距离。
+      本节点仅作调试选项 — 真实场景的相机本就朝下,合成反而掩盖 bug。
+      使用本节点时必须从 rosbag play 的 topics 中移除 /uav0/camera/pose 避免冲突。
+    -->
+    <node name="synthetic_camera_pose" pkg="multi_uav_strike"
+          type="synthetic_camera_pose.py" output="screen"
+          if="$(arg use_synthetic_camera)">
+      <param name="gimbal_pitch_deg" value="$(arg synthetic_pitch_deg)"/>
+      <param name="aim_at_ned_x"    value="30.75"/>
+      <param name="aim_at_ned_y"    value="1.0"/>
+      <param name="aim_at_ned_z"    value="-0.75"/>
+      <param name="use_uav_yaw"     value="true"/>
+      <param name="publish_hz"      value="50.0"/>
+    </node>
+  </group>
+
+  <!-- rosbag play:过滤掉干扰 topic
+       bag 包含 416MB 数据,实际 flight 段 423s,只播需要的:
+         ✓ yolo_results / camera_pose / uav_pose / gps / home
+         ✗ mission_state / cluster_* / target_estimated_*  (我们用新输出)
+         ✗ raw_detection_marker  (太大,22k msgs,分析不需要)
+         ✗ /gimbal_pose (无 /uav0/ 前缀,target_estimator 用 camera/pose 即可)
+         ✗ mavlink/from (无关)
+         ✗ /RuiyanControl /state_info (云台控制)
+         ✗ /diagnostics (无关)
+         ✗ /sim_targets /target_marker /target_position (陈旧残留)
+         ✗ work_mode / quad/pose_nwu / etc (无关)
+  -->
+  <node pkg="rosbag" type="play" name="iter_bag_play"
+        args="-q --start=$(arg bag_start) --duration=$(arg bag_duration) --rate=1.0 --topics /uav0/detection/yolo_results /uav0/camera/pose /uav0/mavros/local_position/pose /uav0/mavros/global_position/global /uav0/mavros/home_position/home /uav0/mavros/state /uav0/mavros/imu/data /uav0/mavros/local_position/velocity_local /uav0/guidance/primary_image_target --bags=$(arg bag)"
+        if="$(arg play_bag)"/>
+
+  <!-- 录制 target_estimator 输出 + 部分输入,便于离线分析
+       排除图片类(marker 不需要落盘) -->
+  <node pkg="rosbag" type="record" name="iter_bag_record"
+        args="-O $(arg output_bag)
+              -q
+              /uav0/cluster_event
+              /uav0/cluster_states
+              /uav0/target_estimated_pose
+              /uav0/target_estimated_gps
+              /uav0/target_estimated_marker
+              /uav0/guidance/primary_image_target
+              /uav0/mavros/local_position/pose
+              /uav0/detection/yolo_results"
+        if="$(arg record_out)"/>
+</launch>
