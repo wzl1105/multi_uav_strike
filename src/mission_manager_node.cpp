@@ -3266,6 +3266,17 @@ public:
                 // 不把任务永久绑定到 cluster_id：聚类 ID 变化后，只要新候选仍
                 // 满足 WP2 门控、类别和新鲜度，就可以重新成为图像候选。
                 if (!std::isfinite(d_wp2) || d_wp2 > wp2_strike_radius_m_) {
+                    // === 2026-08-13: iter_11 — 改写 reported_to_gs_ on first publish ===
+                    //   旧版故意不写 dedup 注释(同一临时候选后续投影回到30m门内时,
+                    //   必须能够重新参加选择)。但这导致打击阶段 6 stale cluster
+                    //   × 10Hz cluster_states = 60Hz 风暴(实测 uav0_strike_2026-08-13
+                    //   bag 在 t=158-171s 持续 11s 报 685 个 type=3)。
+                    //   iter_11 L1 已删 target_estimator 速度外推 → stale cluster 冻结
+                    //   在 last_seen 位置 → cluster_id 维度 dedup 现在能可靠 catch 重复帧。
+                    //   故此处可以"第一次 publish 写 reported_to_gs_,后续 publish 被
+                    //   L3185 dedup 拦截",既保留"新 cluster_id 第一次进 WP2 门可重新
+                    //   参加选择"(它从未被写过 reported_to_gs_),又消除 stale cluster
+                    //   风暴。
                     multi_uav_strike::DetectTarget dt =
                         buildDetectTarget(cluster, /*target_type=*/3);
                     detect_target_pub_.publish(dt);
@@ -3274,12 +3285,13 @@ public:
                         batch.targets.push_back(dt);
                         detect_targets_pub_.publish(batch);
                     }
-                    // 不写 reported_to_gs_：同一临时候选后续投影回到30m门内时，
-                    // 必须能够重新参加选择，不能被 cluster_id/位置去重永久挡住。
+                    reported_to_gs_[cluster.cluster_id] =
+                        {cluster.label, cluster.ned_x, cluster.ned_y};
                     ROS_WARN_THROTTLE(
                         2.0,
                         "[MissionManager] Cluster[%lu] label=%s rejected by WP2 gate: "
-                        "d_wp2=%.1fm > %.1fm -> publish type=3, no strike",
+                        "d_wp2=%.1fm > %.1fm -> publish type=3, no strike "
+                        "(iter_11: dedup written to suppress stale republish storm)",
                         cluster.cluster_id, cluster.label.c_str(), d_wp2,
                         wp2_strike_radius_m_);
                     continue;
@@ -3321,6 +3333,15 @@ public:
                         // 降级 type=3 上报(语义:看到过但已 stale),不进 strike_dispatched_
                         //   让下一帧 cluster 重新进 candidate 列表,完成"stale 后等新检测"语义
                         //   (Bug B:旧版在 SEARCH_STRIKE case 写 reported_to_gs_ 把重试堵死)
+                        // === 2026-08-13: iter_11 — 改写 reported_to_gs_ on first publish ===
+                        //   旧版注释说"不写避免重试堵死",但实际只挡 stale 这条路径。
+                        //   旧版实际效果:打击阶段 stale cluster × 10Hz = 每秒多次重复上报
+                        //   (同 cluster_id 永远不被 dedup,因为 reported_to_gs_ 没写)。
+                        //   iter_11 L1 已删 target_estimator 速度外推 → cluster 位置冻结
+                        //   → cluster_id dedup 在 L3185 可可靠 catch 重复帧。
+                        //   "重新进 candidate 列表"的语义由"同一 cluster_id 上一次不
+                        //   写 reported_to_gs_,所以下一次还能通过 L3185 dedup"完成
+                        //   → 实际只需第一次 publish 写,后续由 L3185 拦截。
                         multi_uav_strike::DetectTarget dt_s = buildDetectTarget(cluster, /*target_type=*/3);
                         detect_target_pub_.publish(dt_s);
                         {
@@ -3328,9 +3349,12 @@ public:
                             batch.targets.push_back(dt_s);
                             detect_targets_pub_.publish(batch);
                         }
+                        reported_to_gs_[cluster.cluster_id] =
+                            {cluster.label, cluster.ned_x, cluster.ned_y};
                         ROS_WARN_THROTTLE(2.0,
                             "[MissionManager] Cluster[%lu] label=%s SEARCH_STRIKE stale → "
-                            "publish type=3 (no lock, no strike, re-try next frame)",
+                            "publish type=3 (no lock, no strike, re-try next frame, "
+                            "iter_11: dedup written to suppress stale republish storm)",
                             cluster.cluster_id, cluster.label.c_str());
                         continue;
                     }

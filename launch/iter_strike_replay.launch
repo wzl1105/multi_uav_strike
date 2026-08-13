@@ -1,0 +1,58 @@
+<launch>
+  <!--
+    iter_strike_replay.launch
+    重放 uav0_strike_2026-08-13-22-14-53_0.bag 的输入,
+    跑 target_estimator_node + mission_manager_node,
+    录制 /uav0/mission/detect_targets 到 output_bag。
+  -->
+
+  <arg name="bag"          default="/home/jack/LOG/uav0_strike_2026-08-13-22-14-53_0.bag"/>
+  <arg name="output_bag"   default="/tmp/iter_strike_out.bag"/>
+  <arg name="use_bag_replay_mode" default="true"/>
+
+  <group ns="uav0">
+    <node name="target_estimator_node" pkg="multi_uav_strike"
+          type="target_estimator_node" output="screen" respawn="false">
+      <param name="use_sim" value="false"/>
+      <param name="use_bag_replay_mode" value="$(arg use_bag_replay_mode)"/>
+      <param name="yaw_rate_sample_max_dt_sec" value="2.0"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/common.yaml"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/target_estimator.yaml"/>
+    </node>
+
+    <node name="waypoint_gate_keeper" pkg="multi_uav_strike"
+          type="waypoint_gate_keeper.py" output="screen"/>
+
+    <!--
+      mission_manager_node — without PX4 dependencies it would crash.
+      But mission_manager doesn't depend on PX4, it just needs:
+        - /uav0/cluster_states (from target_estimator)
+        - /uav0/guidance/primary_image_target (or /uav0/mavros/state for mode)
+        - skill_state input
+      The bag provides most of these.
+    -->
+    <node name="mission_manager_node" pkg="multi_uav_strike"
+          type="mission_manager_node" output="screen" respawn="false">
+      <param name="uav_device_sn" value="1-1"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/common.yaml"/>
+      <rosparam command="load" file="$(find multi_uav_strike)/config/mission_manager.yaml"/>
+    </node>
+  </group>
+
+  <!--
+    Play bag topics — feed target_estimator inputs AND skill_state to mission_manager.
+    Need to be careful: bag has /uav0/cluster_states from old mission_manager; we need to NOT play it
+    so the new target_estimator's cluster_states are used.
+  -->
+  <node pkg="rosbag" type="play" name="iter_strike_bag_play"
+        args="-q --rate=1.0
+              --topics /uav0/detection/yolo_results /uav0/camera/pose /uav0/mavros/local_position/pose /uav0/mavros/global_position/global /uav0/mavros/home_position/home /uav0/mavros/state /uav0/mavros/imu/data /uav0/mavros/local_position/velocity_local /uav0/guidance/primary_image_target /uav0/mission/skill_state /uav0/mavros/flight_mode
+              --bags=$(arg bag)"/>
+
+  <node pkg="rosbag" type="record" name="iter_strike_bag_record"
+        args="-O $(arg output_bag) -q
+              /uav0/mission/detect_targets
+              /uav0/cluster_event
+              /uav0/cluster_states
+              /uav0/guidance/primary_image_target"/>
+</launch>

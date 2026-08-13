@@ -944,34 +944,43 @@ public:
 
         // === 2026-07-16: state.targets 仍只发 promoted (下游 API) ===
         //   markers 同时画 promoted + tentative (RViz 可视化区分)
-        // === 2026-08-13: iter_02 — 用 UAV 速度外推 cluster 位置 (P1 简化版) ===
-        //   真值车的世界坐标静止,但 cluster.ned_x/y 是上一帧 YOLO 投影的位置。
-        //   在 UAV 飞行期间,这段时间里车没动但 cluster 坐标也没动 → cluster 相对
-        //   UAV 位置"向后拉",P1 描述的阶梯式轨迹由此产生。
-        //   用 current_uav_vel_nwu_ 把 cluster 沿 UAV 当前速度方向外推到 now,
-        //   稳态期 (vel≈0) 外推 ≈ 0,不影响精度;UAV 机动期 (vel>0) 外推抵消滞后。
-        //   dt 上限 2.0s 防止 stale cluster (last_seen 很久之前) 一次外推飞出去。
+        // === 2026-08-13: iter_11 — 删除 iter_02 速度外推项 ===
+        //   iter_02(L958-966)曾用 current_uav_vel_nwu_ × min(age, 2.0) 把 cluster
+        //   位置沿 UAV 速度方向外推,意图"补偿 detection-to-publish 100ms 滞后"。
+        //   实测这个修法是**物理错的**:
+        //     1. cluster 是 STATIC 地面目标的反投影 — 静止的车不会因为无人机
+        //        在动就跟着动,加 ownship velocity 是凭空注入 18m 的常值偏移
+        //        (strike dive v≈9.4 m/s × clamp 2.0s = 18m)。
+        //     2. iter_02 引入的"阶梯式轨迹"问题其实是 P1 描述的反投影伪影,不是
+        //        cluster 滞后;外推没有在治对应的病,反而在制造新的几何噪声。
+        //     3. 搜索阶段看着正常是因为 cluster 频繁 re-detect(age<0.5s),
+        //        项 ≈ 0.5m;打击阶段 secondary cluster 不再被检测,age 涨到 2.0s
+        //        被 clamp 饱和,所有 stale cluster 共享同一个 v*2.0s 偏移
+        //        → "6 cluster 同步漂移 27.9m"的 fingerprint 就是它的副作用。
+        //     4. 控制样本:cid=1 在打击中持续被检测(age≈0.07s),其 extrapolation
+        //        项仅 (0.18, -0.65)m,无漂移;同几何同相机同样 EMA,
+        //        唯一变量是 age → 100% 锁定 iter_02 项为漂移源。
+        //   删除后 cluster_states 直接发 c.ned_x/y(EMA 平滑过的实测值),
+        //   stale cluster 冻结在最后一次检测的位置 — 这才是物理上正确的行为。
+        //   后续如需补偿真实 100ms detection→publish 滞后,应改 KF 预测
+        //   (基于 cluster 自身历史轨迹),而不是注入 ownship velocity。
+        //
+        //   影响范围:L958-966 修改后,/uav0/cluster_states 内 stale cluster 的
+        //     世界坐标冻结,而 target_estimated_pose/gps/Marker 早已读 raw c.ned_x
+        //     (L1467/L1499/L1554/L1600),本来就没有这一项 — 改完两边一致,
+        //     GS 端看到的位置不再与 RViz marker / GPS 偏差 18m。
         const uint64_t now_wall_us = ros::Time::now().toNSec() / 1000ULL;
+        (void)now_wall_us;  // 保留用于未来 KF 预测/超时判定,目前不再用于 extrapolation
         for (const auto& kv : clusters_) {
             const TargetCluster& c = kv.second;
-
-            // === 2026-08-13: iter_02 — extrapolation (只算,不改 c.ned_x/y) ===
-            double extrap_ned_x = c.ned_x;
-            double extrap_ned_y = c.ned_y;
-            if (c.last_seen_wall_us != 0 && now_wall_us > c.last_seen_wall_us) {
-                double dt = static_cast<double>(now_wall_us - c.last_seen_wall_us) * 1e-6;
-                if (dt > 2.0) dt = 2.0;  // clamp 防 stale cluster 飞出去
-                extrap_ned_x += current_uav_vel_nwu_.x() * dt;
-                extrap_ned_y += current_uav_vel_nwu_.y() * dt;
-            }
 
             if (c.is_promoted) {
                 multi_uav_strike::ClusterTarget t;
                 t.cluster_id    = c.id;
                 t.label         = c.label;
                 t.label_hash    = c.label_hash;
-                t.ned_x         = extrap_ned_x;
-                t.ned_y         = extrap_ned_y;
+                t.ned_x         = c.ned_x;
+                t.ned_y         = c.ned_y;
                 t.ned_alt       = c.ned_alt;
                 t.confidence    = c.best_confidence;
                 t.last_seen_us  = c.last_seen_us;
