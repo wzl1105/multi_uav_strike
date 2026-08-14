@@ -320,6 +320,7 @@ private:
     // cluster_states_sub_ 在上方已声明
     ros::Subscriber waypoint_status_sub_;  // 航段状态(Phase 4 启用)
     ros::Subscriber waypoint_velocity_active_sub_; // 当前 skill 已实际发出速度的接管确认
+    ros::Subscriber guidance_velocity_active_sub_; // guidance 已实际发出速度的接管确认
     ros::Subscriber inter_uav_status_sub_; // 多机心跳(/inter_uav/uav_status) — 多机 gather 同步用
 
     // ============== Service Client ==============
@@ -330,6 +331,7 @@ private:
     // ============== PX4 起飞 ==============
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
     bool waiting_for_waypoint_velocity_handoff_ = false;
+    bool waiting_for_guidance_velocity_handoff_ = false;
 
     // ==============
 
@@ -781,7 +783,7 @@ public:
         min_guidance_speed_(2.0), // 非 Attack 历史兼容值
         attack_max_speed_(40.0),  // Attack task_speed 硬上限
         //=======高度下降===========//
-        strike_descent_rate_(2.5),
+        strike_descent_rate_(2.0),
         //=======高度下降===========//
         max_strike_cluster_age_sec_(0.5),   // strike cluster 新鲜度门槛(2026-07-26),见字段注释
         max_report_cluster_age_sec_(5.0),   // 上报 cluster 新鲜度门槛(2026-07-29),见字段注释
@@ -986,7 +988,7 @@ public:
         nh_private_.param<double>("attack_max_speed", attack_max_speed_, 40.0);
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
         //=======高度下降===========//
-        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.0);
         strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
         //=======高度下降===========//
         // strike cluster 新鲜度门槛(2026-07-26),见 max_strike_cluster_age_sec_ 字段注释
@@ -1120,6 +1122,9 @@ public:
         waypoint_velocity_active_sub_ = nh_.subscribe(
             "waypoint_executor/velocity_active_skill", 10,
             &MissionManager::waypointVelocityActiveCallback, this);
+        guidance_velocity_active_sub_ = nh_.subscribe(
+            "guidance/velocity_active", 10,
+            &MissionManager::guidanceVelocityActiveCallback, this);
 
         // 多机心跳(由 comm_node 发布到 /inter_uav/uav_status) — 多机 gather 同步
         // 50Hz 上限避免高频回调拖累,实际 comm_node 自适应 1/5/20Hz
@@ -1458,6 +1463,9 @@ public:
     }
 
     void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        // 必须在覆盖缓存前保存上一帧；旧代码先赋值再读取，导致 true->false
+        // disarm 永远检测不到，落地后旧 Attack 仍可能被目标回调重新启用。
+        const bool was_armed = current_mavros_state_.armed;
         current_mavros_state_ = *msg;
 
         // 检测 FCU 断连 (上次的 connected=true, 这次变 false) — 清掉 LOCAL_POSITION_NED
@@ -1544,22 +1552,19 @@ public:
         //     - runPx4TakeoffSequence 在 2964 行门控早 return,起飞卡死;用户看到的现象:
         //         "triggerOffboardAndArm SUCCESS 之后立刻 UAV disarmed on landing → AUTO.LAND"
         //   只有 armed 从 1→0 的真 disarm 才需要 reset (PX4 真的飞不起来),初始 0 不是 disarm 事件。
-        const bool was_armed = current_mavros_state_.armed;  // 在 line 1248 赋值之前的快照
         if (!msg->armed && was_armed) {
-            const bool was_in_flight =
-                is_landing_in_progress_ ||
-                current_phase_ == MissionPhase::PHASE_OVERRIDDEN ||
-                current_phase_ == MissionPhase::PHASE_RETURNING ||
-                current_phase_ == MissionPhase::PHASE_TAKING_OFF;
-            if (was_in_flight) {
-                ROS_WARN("[MissionManager] UAV disarmed on landing (mode=%s prev_phase=%s) — "
-                         "resetting to PHASE_GROUND_IDLE for fresh takeoff",
-                         msg->mode.c_str(), missionPhaseToString().c_str());
-                is_landing_in_progress_  = false;
-                is_fcu_overridden_       = false;
-                current_phase_           = MissionPhase::PHASE_GROUND_IDLE;
-                // 注意:不动 has_task_flow_,等 GCS 显式发新 flow
-            }
+            ROS_WARN("[MissionManager] UAV disarmed (mode=%s prev_phase=%s) — "
+                     "cancelling guidance and stale TaskFlow",
+                     msg->mode.c_str(), missionPhaseToString().c_str());
+            disableGuidance();
+            is_landing_in_progress_ = false;
+            is_fcu_overridden_ = false;
+            waiting_for_waypoint_velocity_handoff_ = false;
+            waiting_for_guidance_velocity_handoff_ = false;
+            current_phase_ = MissionPhase::PHASE_GROUND_IDLE;
+            has_task_flow_ = false;
+            skill_queue_.clear();
+            current_skill_index_ = 0;
         }
     }
 
@@ -1937,20 +1942,11 @@ public:
         attack_wp1_reached_time_     = ros::Time();
         attack_strike_phase_active_  = false;
 
-        // === 2026-08-05: 新 TaskFlow 到达 → 立即 stop waypoint_executor ===
-        //   背景:之前在 SEARCH_TRACK (skill 102, phase=4) 时 waypoint_executor 还在发
-        //   setpoint_velocity,如果此时收到 attack-targets (skill 105),skill_queue 被清空后
-        //   waypoint_executor 还在过渡态 (旧 SKILL_AREA → PENDING) 会继续以旧路径发速度。
-        //   guidance_control 同时也发(STRIKE 模式接管后),两者交替穿插 → PX4 收到混乱指令。
-        //   修复:taskFlowCallback 一进来,无论新 flow 是什么 skill,先 stop waypoint_executor
-        //   让它立刻 is_executing_=false,然后再清空 skill_queue 推新 skill,避免 1s 重叠窗口。
-        //   waypoint_executor.controlCallback 收到 "stop" 后调 stop() → publishZeroVelocity,
-        //   再下次 50Hz tick 起不再发 setpoint,只保留 status/current_target 上报。
-        {
-            std_msgs::String stop_cmd;
-            stop_cmd.data = "stop";
-            waypoint_control_pub_.publish(stop_cmd);
-        }
+        //========不要fail safe============//
+        // 旧逻辑在新 TaskFlow 到达时立即 stop，会先切断旧 velocity，再等待新 skill
+        // 异步到达，形成 OFFBOARD setpoint 空窗。这里保留旧发布者，直到新 waypoint
+        // 实际发布并通过 velocity_active_skill 确认后再退出。
+        //========不要fail safe============//
 
         // 把 skill 流拷进运行时队列
         waiting_for_waypoint_velocity_handoff_ = false;
@@ -2037,13 +2033,18 @@ public:
         }
         current_skill_index_ = 0;
         //=========setpoint====//
-        // 搜索/打击任务开始前即释放 position；不再等待 velocity ack 后才停止，
-        // 从源头消除两个 MAVROS setpoint topic 的重叠发布窗口。
-        waiting_for_waypoint_velocity_handoff_ = false;
+        // position 保持到新 skill 已实际写入第一帧 velocity；短暂重叠只存在于明确
+        // 的接管窗口，不会出现两边都停掉的 OFFBOARD 断流。
+        waiting_for_waypoint_velocity_handoff_ =
+            !skill_queue_.empty() &&
+            skill_queue_[0].msg.skill_type != 100 &&
+            skill_queue_[0].msg.skill_type != 106 &&
+            setpoint_running_;
         if (!skill_queue_.empty() &&
             skill_queue_[0].msg.skill_type != 100 &&
             skill_queue_[0].msg.skill_type != 106 && setpoint_running_) {
-            stopSetpointPublisher();
+            ROS_WARN("[MissionManager] Holding position setpoint until velocity ack for skill=%s",
+                     skill_queue_[0].msg.skill_id.c_str());
         }
         //=========setpoint====//
 
@@ -2321,13 +2322,18 @@ public:
         // 建好速度 setpoint 源,再停 mission_manager 的 position-hold,避免 OFFBOARD 真空。
         const bool handoff_from_holding =
             current_phase_ == MissionPhase::PHASE_HOLDING;
+        if (handoff_from_holding && setpoint_running_) {
+            //========不要fail safe============//
+            // 在 publish 前锁存等待状态，避免 mission timer 看到 phase 改变后抢先停止
+            // position setpoint。真正停止由 velocity_active_skill 回调完成。
+            waiting_for_waypoint_velocity_handoff_ = true;
+            //========不要fail safe============//
+        }
         waypoint_skill_pub_.publish(sr.msg);
         if (handoff_from_holding) {
             current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
-            if (setpoint_running_) {
-                stopSetpointPublisher();
-            }
-            ROS_WARN("[MissionManager] HOLDING to WAYPOINT_FOLLOW: next skill handed to executor");
+            ROS_WARN("[MissionManager] HOLDING to WAYPOINT_FOLLOW: skill published; "
+                     "position setpoint retained until velocity ack");
         }
 
         // 状态推进 PENDING → TRANSIT
@@ -3277,7 +3283,26 @@ public:
             //   这条放在 cluster_id dedup 之后:同一 cluster_id 永远不会双发。
             //   放在 dispatch 之前:还没准备 publish 时就拦截,避免 buildDetectTarget 浪费 +
             //   ROS_WARN 噪音。
-            {
+            //=============一定打击=========//
+            // 新 bag 复现：Attack 刚开始时，同位置的 stale Cluster[2] 被普通上报并
+            // 写入 reported_to_gs_；稍后真正新鲜的 Cluster[12] 与它相距约3m，
+            // 被25m位置去重提前 continue，永远进不了 attack_candidates。
+            // 对已经满足 WP2、目标类型和新鲜度的 Attack 候选，reported_to_gs_
+            // 只能做“上报去重”，不能做“打击候选去重”。同 cluster_id 的重复仍由
+            // 上面的 C1 拦截，同一快照的多个新鲜候选仍会在 loop 外选离WP2最近者。
+            const double attack_candidate_d_wp2 =
+                (sr.msg.skill_type == 105)
+                    ? clusterDistToWp2Meters(cluster, sr)
+                    : std::numeric_limits<double>::infinity();
+            const bool fresh_attack_candidate =
+                sr.msg.skill_type == 105 &&
+                current_work_mode_ == WorkMode::SEARCH_STRIKE &&
+                !is_strike_stale &&
+                labelMatchesTargetType(cluster.label, sr.msg.target_type) &&
+                std::isfinite(attack_candidate_d_wp2) &&
+                attack_candidate_d_wp2 <= wp2_strike_radius_m_;
+            //=============一定打击=========//
+            if (!fresh_attack_candidate) {
                 bool dedup_hit = false;
                 const double r2 = report_dedup_radius_m_ * report_dedup_radius_m_;
                 for (const auto& kv : reported_to_gs_) {
@@ -3296,6 +3321,11 @@ public:
                                       report_dedup_radius_m_);
                     continue;
                 }
+            } else {
+                ROS_INFO_THROTTLE(1.0,
+                    "[MissionManager] Fresh Attack candidate Cluster[%lu] bypasses report-position "
+                    "dedup (d_wp2=%.1fm)",
+                    cluster.cluster_id, attack_candidate_d_wp2);
             }
 
             // === 多目标: SEARCH_TRACK/STRIKE 模式若已锁定(主目标已就位),
@@ -4031,6 +4061,29 @@ public:
                  "position setpoint publisher stopped after acknowledged handoff",
                  expected_skill_id.c_str());
     }
+
+    //========不要fail safe============//
+    void guidanceVelocityActiveCallback(const std_msgs::Bool::ConstPtr& msg) {
+        if (!msg->data || !waiting_for_guidance_velocity_handoff_ ||
+            !is_guidance_active_) {
+            return;
+        }
+
+        waiting_for_guidance_velocity_handoff_ = false;
+
+        // 新 guidance 已真实写入第一帧速度，此时旧 velocity/position 源才退出。
+        std_msgs::String yield_cmd;
+        yield_cmd.data = "yield_to_guidance";
+        waypoint_control_pub_.publish(yield_cmd);
+
+        attack_hover_setpoint_latched_ = false;
+        if (setpoint_running_) {
+            stopSetpointPublisher();
+        }
+        ROS_WARN("[MissionManager] Guidance velocity ACTIVE; previous setpoint owner yielded "
+                 "after acknowledged handoff");
+    }
+    //========不要fail safe============//
 
     /**
      * 多机心跳回调 — 多机 gather 同步用
@@ -5345,24 +5398,11 @@ public:
         completeAttackStrikeIfReached();
         // === CODEX DIRECT-LOOK END ===
 
-        // === CODEX DIRECT-LOOK START ===
-        // Skill 与 control 是两个 ROS topic，跨 topic 不保证首次 publish 的到达顺序。
-        // 直视打击期间每个 10Hz tick 重发 stop，确保刚装载的 Attack 队列不会与
-        // guidance 同时输出速度；队列仍完整保留，真丢失时才允许 resume。
-        if (current_skill_index_ < skill_queue_.size()) {
-            const SkillRuntime& active = skill_queue_[current_skill_index_];
-            if (active.direct_strike_committed_ && is_guidance_active_) {
-                std_msgs::String stop_cmd;
-                //===================制导修改====================
-                // 原命令保留：stop()会发布零速度，10Hz重发导致制导话题周期性插零。
-                // stop_cmd.data = "stop";
-                // 改为静默交权；仍保持10Hz重发以抵御Skill/control跨topic乱序。
-                stop_cmd.data = "yield_to_guidance";
-                //===================制导修改====================
-                waypoint_control_pub_.publish(stop_cmd);
-            }
-        }
-        // === CODEX DIRECT-LOOK END ===
+        //========不要fail safe============//
+        // 不再以10Hz重复发送 yield_to_guidance。唯一交权点是
+        // guidanceVelocityActiveCallback() 收到首帧速度确认之后；既避免刷命令，
+        // 也不会在 guidance 真正输出速度前提前停掉 waypoint setpoint。
+        //========不要fail safe============//
         advanceSkillStateMachine();
         // Attack(105) 专用 tick:门控重试 + 同步时间重算 + 挂起超时放弃
         advanceAttackPhaseMachine();
@@ -6306,38 +6346,11 @@ public:
         ROS_WARN("[MissionManager] >>>>> phase -> %s on guidance start",
                  missionPhaseToString().c_str());
 
-        // 停止航点执行，避免和 guidance 冲突
-        //===================制导修改====================
-        // 原日志保留：
-        // ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
-        ROS_WARN("[MissionManager] >>>>> yield_to_guidance about to be published to waypoint_executor");
-        //===================制导修改====================
-        std_msgs::String cmd;
-        //===================制导修改====================
-        // 原命令会让WaypointExecutor发布一次零速度：
-        // cmd.data = "stop";
-        cmd.data = "yield_to_guidance";
-        //===================制导修改====================
-        waypoint_control_pub_.publish(cmd);
-        //===================制导修改====================
-        // ROS_WARN("[MissionManager] >>>>> stop command published");
-        ROS_WARN("[MissionManager] >>>>> yield_to_guidance published");
-        //===================制导修改====================
-
-        // === 2026-07-30: 关 attack_hover 留下的 setpoint publisher,避免和 guidance 冲突 ===
-        //   根因:UAV 到 attack_point (20m AGL) 时 mission_manager 会启动位置 setpoint publisher
-        //     锁在 attack_point,防止 OFFBOARD 失流。strike 触发后 startGuidanceApproach() 只停了
-        //     waypoint_executor,没停这个 publisher — PX4 OFFBOARD 收到持续的位置 setpoint
-        //     会盖过 guidance 的 velocity 命令,UAV 仍悬停在 attack_point 上方,guidance 看似无效。
-        //   修复:guidance 真启动时必须停掉 attack_hover setpoint,让 velocity 接管。
-        //   注意:不调 disableGuidance()(它本来就只发 enable=false,不碰 setpoint)。
-        if (attack_hover_setpoint_latched_ || setpoint_running_) {
-            attack_hover_setpoint_latched_ = false;
-            if (setpoint_running_) {
-                stopSetpointPublisher();
-            }
-            ROS_WARN("[MissionManager] Stopped attack_hover setpoint publisher for guidance handoff");
-        }
+        //========不要fail safe============//
+        // 不在 enable 前停止 waypoint/position。guidance 实际发布首帧后会通过
+        // guidance/velocity_active 回调让旧源静默退出，避免 OFFBOARD 空窗。
+        waiting_for_guidance_velocity_handoff_ = true;
+        //========不要fail safe============//
 
         // 确定模式：SEARCH_STRIKE -> "strike", SEARCH_TRACK -> "track"
         std::string guidance_mode = (current_work_mode_ == WorkMode::SEARCH_STRIKE) ? "strike" : "track";
@@ -6370,6 +6383,7 @@ public:
 
     void disableGuidance() {
         is_guidance_active_ = false;
+        waiting_for_guidance_velocity_handoff_ = false;
 
         // 禁用制导
         std_msgs::Bool enable;

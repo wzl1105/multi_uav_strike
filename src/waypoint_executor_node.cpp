@@ -283,7 +283,9 @@ private:
     //   GS 发的目标 MSL=0(地面)时,不直接撞过去,而是保持至少此高度悬停/接近。
     double   attack_min_altitude_ned_ = -20.0;
     //=======高度下降===========//
-    double   strike_descent_rate_ = 2.5;
+    double   strike_descent_rate_ = 2.0;
+    double   strike_commit_radius_ = 3.0;
+    double   strike_min_commit_altitude_ = 2.0;
     //=======高度下降===========//
 
 public:
@@ -465,8 +467,13 @@ public:
         // ned_z 钳到此值上限。
         nh_private_.param<double>("attack_min_altitude_ned", attack_min_altitude_ned_, -20.0);
         //=======高度下降===========//
-        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.0);
+        nh_private_.param<double>("strike_commit_radius", strike_commit_radius_, 3.0);
+        nh_private_.param<double>("strike_min_commit_altitude",
+                                  strike_min_commit_altitude_, 2.0);
         strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
+        strike_commit_radius_ = std::max(0.1, strike_commit_radius_);
+        strike_min_commit_altitude_ = std::max(0.1, strike_min_commit_altitude_);
         //=======高度下降===========//
     }
 
@@ -953,13 +960,30 @@ public:
 
         double dx_to_target = target_wp.ned_x - current_ned_x_;
         double dy_to_target = target_wp.ned_y - current_ned_y_;
+        const double horizontal_to_target = std::hypot(dx_to_target, dy_to_target);
         // === Attack(105) SKILL_AREA 飞行轨迹高度 ===
         // 2026-08-03:去掉 20m AGL 高度钳,直接用 target_wp.ned_z。
         //   原 20m 钳导致:YOLO 命中前 attack_speed 高速冲到 20m 然后停,看不到目标
         //   之后再也不打。新策略:跟着 WP2 实际高度飞,YOLO 命中就走 guidance strike,
         //   看不到就一直按 waypoint_exec 沿 WP1→WP2 飞。
         double target_z_for_flight = target_wp.ned_z;
-        // (attack_min_altitude_ned_ 参数仍保留读取兼容,但不再做钳)
+        //=======高度下降===========//
+        // Attack 航点阶段不能先飞到地面目标高度。最终接触只允许由 guidance 在
+        // 水平进入提交范围后执行；waypoint 阶段至少保留目标上方提交高度。
+        if (active_skill_type_ == 105 && *cur_idx + 1 == cur_queue->size() &&
+            horizontal_to_target > strike_commit_radius_) {
+            target_z_for_flight = std::min(
+                target_z_for_flight,
+                target_wp.ned_z - strike_min_commit_altitude_);
+        } else if (active_skill_type_ == 105 && *cur_idx + 1 == cur_queue->size()) {
+            ROS_WARN_THROTTLE(1.0,
+                "[WaypointExecutor] Attack final commit: horizontal=%.2fm <= %.2fm; "
+                "releasing %.2fm altitude guard and descending to WP2",
+                horizontal_to_target, strike_commit_radius_,
+                strike_min_commit_altitude_);
+        }
+        //=======高度下降===========//
+        // (attack_min_altitude_ned_ 参数仍保留读取兼容,但不再做固定20m钳)
         (void)attack_min_altitude_ned_;
         const double effective_target_z = target_z_for_flight + lidar_altitude_offset_;
         double dz_to_target = effective_target_z - current_ned_z_;
@@ -1666,6 +1690,7 @@ public:
         //===================制导修改====================
         } else if (cmd == "yield_to_guidance") {
             // 静默交出控制权：保留队列，不向MAVROS插入零速度。
+            guidance_has_control_ = true;
             is_executing_ = false;
             ROS_INFO_THROTTLE(1.0,
                 "[WaypointExecutor] Yielded velocity control to guidance");
@@ -1701,12 +1726,15 @@ public:
 
     //===================制导修改====================
     void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
-        guidance_has_control_ = msg->data;
-        if (guidance_has_control_) {
-            // 只暂停执行，不发布零速度；disable也不自动resume，由mission_manager决定后续。
-            is_executing_ = false;
-            ROS_WARN("[WaypointExecutor] Guidance control ownership ENABLED");
+        if (msg->data) {
+            //========不要fail safe============//
+            // enable 只表示 guidance 开始准备，不能据此提前停止旧速度源。
+            // 等 MissionManager 收到 guidance/velocity_active 后再发 yield_to_guidance。
+            ROS_WARN("[WaypointExecutor] Guidance enable received; keeping old setpoint "
+                     "until velocity-active acknowledgement");
+            //========不要fail safe============//
         } else {
+            guidance_has_control_ = false;
             ROS_INFO("[WaypointExecutor] Guidance control ownership RELEASED");
         }
     }

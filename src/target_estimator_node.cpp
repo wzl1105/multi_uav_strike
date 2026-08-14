@@ -216,8 +216,8 @@ public:
         // 相机几何参数(必须与 gimbal_simulator 同步)
         p.param<int>("image_width",  image_width_,  1920);
         p.param<int>("image_height", image_height_, 1080);
-        p.param<double>("fov_h_deg", fov_h_deg_, 66.0);
-        p.param<double>("fov_v_deg", fov_v_deg_, 52.0);
+        p.param<double>("fov_h_deg", fov_h_deg_, 68.0);
+        p.param<double>("fov_v_deg", fov_v_deg_, 45.6);
         computeFocalLengths();
 
         // 订阅
@@ -1091,8 +1091,8 @@ private:
     // 相机几何
     int    image_width_  = 1920;
     int    image_height_ = 1080;
-    double fov_h_deg_    = 66.0;
-    double fov_v_deg_    = 52.0;
+    double fov_h_deg_    = 68.0;
+    double fov_v_deg_    = 45.6;
     double fov_h_rad_ = 0.0, fov_v_rad_ = 0.0;
     double focal_x_ = 0.0, focal_y_ = 0.0;
 

@@ -63,6 +63,7 @@ private:
     ros::Publisher debug_pub_;           // 调试信息
     ros::Publisher target_filter_debug_pub_;  // 2026-07-16: 速度滤波前后对比 debug topic
     ros::Publisher pn_debug_pub_;             // PN 输入/LOS/三阶段速度，供 rosbag 离线复盘
+    ros::Publisher velocity_active_pub_;      // 实际发出首帧速度后确认无缝接管
     std::string viz_frame_;              // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
 
     // Timer for guidance computation
@@ -71,6 +72,12 @@ private:
     // Current state
     geometry_msgs::PoseStamped current_uav_pose_;
     geometry_msgs::PoseStamped current_target_pose_;
+    //=======高度下降===========//
+    // 与 MissionManager 命中判定同源的实时原始目标坐标。current_target_pose_
+    // 仍保留给原有平滑水平制导；下降时序不能使用滞后的滤波坐标提前释放高度。
+    geometry_msgs::PoseStamped raw_target_pose_;
+    bool raw_target_pose_valid_ = false;
+    //=======高度下降===========//
     geometry_msgs::TwistStamped current_target_twist_;
     geometry_msgs::Point current_los_angle_;
     geometry_msgs::Point real_target_pos_;  // 真实目标位置
@@ -234,9 +241,12 @@ private:
     double image_max_speed_ = 5.0;
     //===================制导修改====================
     // 原值保留：double image_max_vertical_speed_ = 1.0;
-    double image_max_vertical_speed_ = 2.5;
+    double image_max_vertical_speed_ = 2.0;
     //=======高度下降===========//
-    double strike_descent_rate_ = 2.5;
+    double strike_descent_rate_ = 2.0;
+    double strike_vertical_lag_ = 2.0;
+    double strike_commit_radius_ = 3.0;
+    double strike_min_commit_altitude_ = 2.0;
     //=======高度下降===========//
     bool strike_slant_descent_enabled_ = true;
     double strike_slant_descent_max_angle_deg_ = 25.0;
@@ -360,7 +370,7 @@ public:
 
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_attitude", flight_mode_attitude_, 1);
-        nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);  // 2米内视为击中
+        nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);
         nh_private_.param<bool>("enable_strike_evaluation",  enable_strike_evaluation_,  false);  // strike_eval 总开关(默认关闭,见字段注释)
 
         // TRACK模式专用参数
@@ -468,9 +478,13 @@ public:
         //===================制导修改====================
         // 原参数默认值保留：
         // nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 1.0);
-        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 2.5);
+        nh_private_.param<double>("image_max_vertical_speed", image_max_vertical_speed_, 2.0);
         //=======高度下降===========//
-        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.5);
+        nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.0);
+        nh_private_.param<double>("strike_vertical_lag", strike_vertical_lag_, 2.0);
+        nh_private_.param<double>("strike_commit_radius", strike_commit_radius_, 3.0);
+        nh_private_.param<double>("strike_min_commit_altitude",
+                                  strike_min_commit_altitude_, 2.0);
         //=======高度下降===========//
         nh_private_.param<bool>("strike_slant_descent_enabled",
                                 strike_slant_descent_enabled_, true);
@@ -516,6 +530,9 @@ public:
         image_max_vertical_speed_ = std::max(0.1, image_max_vertical_speed_);
         //=======高度下降===========//
         strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
+        strike_vertical_lag_ = std::max(0.1, strike_vertical_lag_);
+        strike_commit_radius_ = std::max(0.1, strike_commit_radius_);
+        strike_min_commit_altitude_ = std::max(0.1, strike_min_commit_altitude_);
         //=======高度下降===========//
         strike_max_vertical_accel_ = std::max(0.1, strike_max_vertical_accel_);
         strike_slant_min_horizontal_distance_m_ = std::max(
@@ -603,6 +620,8 @@ public:
 
         vel_cmd_pub_ = nh_.advertise<geometry_msgs::Twist>(
             vel_cmd_topic_, 10);
+        velocity_active_pub_ = nh_.advertise<std_msgs::Bool>(
+            "guidance/velocity_active", 10);
 
         attitude_cmd_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             attitude_cmd_topic_, 10);
@@ -645,6 +664,11 @@ public:
         const double nx = msg->pose.position.x;
         const double ny = msg->pose.position.y;
         const double nz = msg->pose.position.z;
+
+        //=======高度下降===========//
+        raw_target_pose_ = *msg;
+        raw_target_pose_valid_ = true;
+        //=======高度下降===========//
 
         // === 2026-08-04: STRIKE 反馈环解耦 (Layer 5) — PN 输入 OneEuro LPF ===
         //   target_estimator EMA α=0.1 后残余噪声 ~0.05m,10Hz 发布在 50Hz PN 调用
@@ -1040,6 +1064,17 @@ public:
         current_mission_phase_ = msg->phase;
     }
 
+    //========不要fail safe============//
+    // 只有真正写入 MAVROS velocity topic 后才确认接管。MissionManager 收到该确认
+    // 才让 waypoint/position 发布者退出，保证交接过程中至少有一个 setpoint 源存活。
+    void publishGuidanceVelocity(const geometry_msgs::Twist& cmd) {
+        vel_cmd_pub_.publish(cmd);
+        std_msgs::Bool active;
+        active.data = true;
+        velocity_active_pub_.publish(active);
+    }
+    //========不要fail safe============//
+
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
         if (ref_initialized_) return;  // 锁一次
         if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
@@ -1188,6 +1223,14 @@ public:
         return strikeTargetGeometry(current_target_pose_);
     }
 
+    //=======高度下降===========//
+    StrikeTargetGeometry strikeDescentGeometry() const {
+        return raw_target_pose_valid_
+            ? strikeTargetGeometry(raw_target_pose_)
+            : strikeTargetGeometry(current_target_pose_);
+    }
+    //=======高度下降===========//
+
     bool targetPoseFreshForThisStrike() const {
         if (!is_target_pose_received_ || last_target_pose_receive_time_.isZero()) return false;
         //========速度修改========
@@ -1221,35 +1264,12 @@ public:
     }
 
     //=======高度下降===========//
-    // 保持水平/垂直到达时间一致。若按任务速度需要的下降率超过配置值，
-    // 降低水平速度，而不是只截断 vz 后从目标上空飞过。
+    // 水平速度始终采用地面站 Attack task_speed，不再为了追赶高度而减慢水平速度。
+    // 垂直通道在 computeSlantDescentSpeed() 内主动滞后，确保不会高度先到地面。
     double feasibleHorizontalSpeedForDescent(const StrikeTargetGeometry& g,
                                              double requested_speed) const {
-        if (!strike_slant_descent_enabled_ || g.down <= 0.0 ||
-            g.horizontal <= strike_slant_min_horizontal_distance_m_) {
-            return requested_speed;
-        }
-        const double max_slope = std::tan(
-            strike_slant_descent_max_angle_deg_ * M_PI / 180.0);
-        if (g.down / g.horizontal > max_slope) {
-            ROS_WARN_THROTTLE(1.0,
-                "[Guidance] Pre-descent hold: height=%.1fm horizontal=%.1fm slope=%.3f "
-                "> max=%.3f, horizontal speed held at zero, descent=%.2fm/s",
-                g.down, g.horizontal, g.down / g.horizontal, max_slope,
-                strike_descent_rate_);
-            return 0.0;
-        }
-        const double feasible =
-            g.horizontal * strike_descent_rate_ / std::max(g.down, 1e-3);
-        const double limited = std::min(requested_speed, std::max(0.0, feasible));
-        if (limited + 1e-3 < requested_speed) {
-            ROS_WARN_THROTTLE(1.0,
-                "[Guidance] Descent-gradient speed limit: requested=%.2f horizontal=%.2f "
-                "height=%.1f distance=%.1f descent_rate=%.2f",
-                requested_speed, limited, g.down, g.horizontal,
-                strike_descent_rate_);
-        }
-        return limited;
+        (void)g;
+        return requested_speed;
     }
     //=======高度下降===========//
 
@@ -1264,26 +1284,70 @@ public:
                                       strike_descent_rate_);
         }
 
-        // 水平与垂直预计到达时间同步：vz/vh = 高度差/水平距离。
-        // 再由最大下降角和垂直速度双重限幅，避免异常目标坐标导致陡俯冲。
-        if (g.horizontal > strike_slant_min_horizontal_distance_m_ &&
-            horizontal_speed > 1e-3) {
-            const double geometric_vz = horizontal_speed * g.down / g.horizontal;
-            const double max_angle_rad = strike_slant_descent_max_angle_deg_ * M_PI / 180.0;
-            const double angle_limited_vz = horizontal_speed * std::tan(max_angle_rad);
-            const double vertical_limit = std::min(
-                strike_descent_rate_, std::fabs(angle_limited_vz));
-            return clampValue(geometric_vz, -vertical_limit, vertical_limit);
+        // 目标在上方时仍保留原来的爬升能力；下面的保护只约束向下打击。
+        if (g.down <= 0.0) {
+            return clampValue(g.down, -strike_descent_rate_, 0.0);
         }
 
-        // 扰动导致水平已进入停止圈但高度仍未满足命中距离时，保留原垂直下降兜底。
-        return clampValue(g.down, -strike_descent_rate_,
-                                  strike_descent_rate_);
+        // 尚未进入二维命中圈：按“到达2m命中圈边界”的剩余时间安排下降，
+        // 并额外保留 strike_vertical_lag_ 秒。末端水平减速时，下降也会同步减小，
+        // 不再因为固定3m提交区而提前耗尽最后高度。
+        if (g.horizontal > strike_distance_threshold_) {
+            const double closing_speed = std::max(horizontal_speed, 0.1);
+            const double horizontal_to_hit =
+                g.horizontal - strike_distance_threshold_;
+            const double time_to_hit = horizontal_to_hit / closing_speed;
+            const double desired_vz = g.down /
+                (time_to_hit + strike_vertical_lag_);
+            return clampValue(desired_vz, 0.0, strike_descent_rate_);
+        }
+
+        // 水平已进入2m命中圈，才允许完成剩余下降；MissionManager 仍按原三维2m
+        // 条件结束 guidance，不改变既有命中定义。
+        const double terminal_limit = 0.6 * strike_descent_rate_;
+        return clampValue(g.down, 0.0, terminal_limit);
     }
+
+    //=======高度下降===========//
+    // IMAGE/GEO 源切换混合和指令斜率限制可能保留上一阶段的下降速度，因此仅在
+    // computeSlantDescentSpeed() 内返回 0 还不足以守住提交高度。此保护必须放在
+    // 所有混合/斜率限制之后：提交区外按剩余高度逐渐刹停，到保护高度后立即禁止
+    // 继续向下。它只覆盖下降分量，不阻止为修正扰动而爬升。
+    void enforcePreCommitAltitudeGuard(geometry_msgs::Twist& cmd,
+                                       const StrikeTargetGeometry& g) const {
+        if (!strike_slant_descent_enabled_ ||
+            g.horizontal <= strike_distance_threshold_ || cmd.linear.z <= 0.0) {
+            return;
+        }
+
+        // source blend、OneEuro 或 slew limit 都可能遗留更大的下降量。最终硬限制
+        // 使用实时原始目标几何和当前水平闭合速度，再次保证高度晚于命中圈到达。
+        const double closing_speed = std::max(
+            std::hypot(cmd.linear.x, cmd.linear.y), 0.1);
+        const double time_to_hit =
+            (g.horizontal - strike_distance_threshold_) / closing_speed;
+        const double max_guarded_descent = std::min(
+            strike_descent_rate_,
+            std::max(0.0, g.down) / (time_to_hit + strike_vertical_lag_));
+        if (cmd.linear.z > max_guarded_descent) {
+            ROS_WARN_THROTTLE(1.0,
+                "[Guidance] Hit-circle descent brake: horizontal=%.2fm > hit=%.2fm, "
+                "height=%.2fm t_hit=%.2fs, descent %.2f->%.2fm/s",
+                g.horizontal, strike_distance_threshold_, g.down, time_to_hit,
+                cmd.linear.z,
+                max_guarded_descent);
+            cmd.linear.z = max_guarded_descent;
+        }
+    }
+    //=======高度下降===========//
     //===================制导修改====================
 
     void computeGeoFallbackVelocity(geometry_msgs::Twist& cmd) {
-        const StrikeTargetGeometry g = strikeTargetGeometry();
+        //=======高度下降===========//
+        // 水平末端减速、方向和下降必须使用同一实时目标几何，避免滤波滞后让
+        // 水平提前停住、垂直却继续下降。
+        const StrikeTargetGeometry g = strikeDescentGeometry();
+        //=======高度下降===========//
         //========速度修改========
         // track_max_speed_ 由 guidance/guidance_speed 更新，来源是 Attack task_speed。
         // 默认不再受 image_max_speed、邻近目标减速和 1m 水平零速限制。
@@ -1311,7 +1375,10 @@ public:
     }
 
     void computeImageVelocity(geometry_msgs::Twist& cmd) {
-        const StrikeTargetGeometry g = strikeTargetGeometry();
+        //=======高度下降===========//
+        // 图像负责中远距视线方向；末端距离调度和世界坐标方向与命中判定统一。
+        const StrikeTargetGeometry g = strikeDescentGeometry();
+        //=======高度下降===========//
         Eigen::Vector3d ray = filtered_image_ray_nwu_;
         if (ray.norm() < 1e-6) {
             computeGeoFallbackVelocity(cmd);
@@ -1460,6 +1527,10 @@ public:
         cmd.linear.z = (1.0 - alpha) * strike_blend_from_ned_.linear.z + alpha * desired.linear.z;
         cmd.angular.z = (1.0 - alpha) * strike_blend_from_ned_.angular.z + alpha * desired.angular.z;
         applyStrikeCommandSlewLimit(cmd);
+        //=======高度下降===========//
+        // 必须在 source blend 和 slew limit 之后执行，防止旧下降速度穿透保护高度。
+        enforcePreCommitAltitudeGuard(cmd, strikeDescentGeometry());
+        //=======高度下降===========//
         last_strike_cmd_ned_ = cmd;
         last_strike_cmd_valid_ = true;
 
@@ -1522,7 +1593,7 @@ public:
                     // NED -> ENU 转换（0 还是 0，不影响）
                     convertVelNedToEnu(hover_cmd);
                 }
-                vel_cmd_pub_.publish(hover_cmd);
+                publishGuidanceVelocity(hover_cmd);
             }
             return;
         }
@@ -1553,7 +1624,7 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
-                    vel_cmd_pub_.publish(vel_cmd);
+                    publishGuidanceVelocity(vel_cmd);
                 } else {
                     // STRIKE模式
                     //===================制导修改====================
@@ -1565,7 +1636,7 @@ public:
                         if (!use_sim_) {
                             convertVelNedToEnu(vel_cmd);
                         }
-                        vel_cmd_pub_.publish(vel_cmd);
+                        publishGuidanceVelocity(vel_cmd);
                     } else if (strike_guidance_logic_ == "pn") {
                     // 原 PN STRIKE 分支完整保留，并融合main的目标LPF、stale软降速和handover。
                     //===================制导修改====================
@@ -1578,7 +1649,7 @@ public:
                             "[Guidance] PN waiting fresh filtered target; publishing zero setpoint");
                         geometry_msgs::Twist hover_cmd;
                         if (!use_sim_) convertVelNedToEnu(hover_cmd);
-                        vel_cmd_pub_.publish(hover_cmd);
+                        publishGuidanceVelocity(hover_cmd);
                         break;
                     }
 
@@ -1625,10 +1696,12 @@ public:
                     // 融合后两种导引共用斜线下降；PN仅保留自己的水平比例导引和偏航。
                     const StrikeTargetGeometry pn_geometry =
                         strikeTargetGeometry(pn_filtered_target_pose_);
+                    const StrikeTargetGeometry pn_descent_geometry =
+                        strikeDescentGeometry();
                     const double pn_horizontal_speed = std::hypot(
                         vel_cmd.linear.x, vel_cmd.linear.y);
                     vel_cmd.linear.z = computeSlantDescentSpeed(
-                        pn_geometry, pn_horizontal_speed);
+                        pn_descent_geometry, pn_horizontal_speed);
                     //===================制导修改====================
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
@@ -1691,6 +1764,10 @@ public:
                     const geometry_msgs::Vector3 gated_velocity_ned = vel_cmd.linear;
                     evaluateStrike();
                     filterVelocityCmd(vel_cmd);
+                    //=======高度下降===========//
+                    // PN 滤波器也可能残留旧下降量，使用同一提交高度硬保护。
+                    enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry);
+                    //=======高度下降===========//
 
                     multi_uav_strike::GuidancePnDebug pn_dbg;
                     pn_dbg.header.stamp = ros::Time::now();
@@ -1725,7 +1802,7 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
-                    vel_cmd_pub_.publish(vel_cmd);
+                    publishGuidanceVelocity(vel_cmd);
                     pn_debug_pub_.publish(pn_dbg);
                     publishInterceptPointMarker(cmd.intercept_point_nwu);
                     //===================制导修改====================

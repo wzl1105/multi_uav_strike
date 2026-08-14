@@ -50,12 +50,18 @@ avoidance_safe_distance: 10.0  # 机间安全距离（米）
 # ----------------------------------------------------------------------------
 # 打击参数 (Strike parameters)
 # ----------------------------------------------------------------------------
-strike_distance_threshold: 2.0  # 打击距离阈值（米）
-strike_min_altitude: 20.0       # 最小打击高度（米）
+strike_distance_threshold: 2.0  # 打击三维命中阈值（米）
+strike_min_altitude: 20.0       # 旧参数保留兼容；末端下降不再用固定20米截停
 # Attack 提前下降与制导斜线下降共用的最大下降速率（m/s）。
 # mission_manager 用它计算 WP1 准备高度，waypoint_executor 和 guidance_control
 # 分别在航点段和图像/世界坐标制导段执行同一垂直限幅。
-strike_descent_rate: 2.5
+strike_descent_rate: 2.0
+# 自动打击只接收地面站 task_speed 作为水平速度；垂直到达时间以
+# strike_distance_threshold 的2米命中圈边界为基准，并额外滞后以下秒数。
+strike_vertical_lag: 2.0
+# 以下两项继续用于 WP1->WP2 无视觉兜底路径；guidance 使用命中圈时序。
+strike_commit_radius: 3.0
+strike_min_commit_altitude: 2.0
 
 # ----------------------------------------------------------------------------
 # 起飞参数 (Takeoff parameters, PX4 SITL only)

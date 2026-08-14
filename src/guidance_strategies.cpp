@@ -35,7 +35,7 @@ InterceptGuidance::InterceptGuidance(ros::NodeHandle& nh)
     nh.param<double>("strike_max_speed", max_horizontal_speed_, 20.0);
     //=======高度下降===========//
     // 与航点预下降、IMAGE/GEO共用同一个可配置下降速率。
-    nh.param<double>("strike_descent_rate", max_vertical_speed_, 2.5);
+    nh.param<double>("strike_descent_rate", max_vertical_speed_, 2.0);
     //=======高度下降===========//
     nh.param<double>("max_lead_angle_deg", max_lead_angle_rad_, 30.0);
     max_lead_angle_rad_ = max_lead_angle_rad_ * M_PI / 180.0;  // deg → rad

@@ -85,8 +85,8 @@ yaw_rate_sample_max_dt_sec: 0.5
 # ---- 相机几何 (必须与 gimbal_simulator.yaml 同步) ----
 image_width: 1920
 image_height: 1080
-fov_h_deg: 66.0               # 水平 FOV(度)
-fov_v_deg: 52.0               # 垂直 FOV(度);0 = 按方形像素从 fov_h 推导
+fov_h_deg: 68.0               # 水平 FOV(度)
+fov_v_deg: 45.6               # 垂直 FOV(度);0 = 按方形像素从 fov_h 推导
 
 # ---- 发布频率 ----
 states_publish_freq: 10.0     # cluster_states / target_estimated_marker / target_estimated_gps/pose 发布频率 (Hz)
