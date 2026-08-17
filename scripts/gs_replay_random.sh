@@ -83,10 +83,19 @@ usage() {
   --auto-land-stop / --no-auto-land-stop
                             默认 AUTO.LAND 出现即停 (default: ON)
   --report-file PATH        FAIL 报告输出路径 (default: /tmp/gs_replay_report.txt)
+  --analyze-mode {full,inline}
+                            full = analyze_setpoint_quality.py (AUTOLAND + STREAMGAP + SIMULT,default)
+                            inline = 内联只查 AUTO.LAND (legacy, 快速 CI 用)
+  --analyze-script PATH     full 模式下调用脚本路径 (default: 与本脚本同目录/analyze_setpoint_quality.py)
   --dry-run                 仅列候选 bag
   -h|--help                 this help
 USAGE
 }
+
+# analyze_mode 默认 full (用新 analyzer 三项检查)
+ANALYZE_MODE="full"
+# analyze_script 默认与 gs_replay_random.sh 同目录
+ANALYZE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/analyze_setpoint_quality.py"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -108,6 +117,8 @@ while [[ $# -gt 0 ]]; do
         --auto-land-stop)       AUTO_LAND_STOP=1; shift ;;
         --no-auto-land-stop)    AUTO_LAND_STOP=0; shift ;;
         --report-file)          REPORT_FILE="$2"; shift 2 ;;
+        --analyze-mode)         ANALYZE_MODE="$2"; shift 2 ;;
+        --analyze-script)       ANALYZE_SCRIPT="$2"; shift 2 ;;
         --dry-run)              DRY_RUN=1; shift ;;
         -h|--help)              usage; exit 0 ;;
         *) echo "[gs_replay_random] unknown opt: $1" >&2; usage; exit 2 ;;
@@ -167,6 +178,20 @@ if len(land_events) > 30:
     print(f"  ... ({len(land_events) - 30} more)")
 sys.exit(1)
 PYEOF
+}
+
+# 分析播放 bag (full mode): 调外置 analyze_setpoint_quality.py,做三项检查
+#   AUTOLAND / STREAMGAP / SIMULT。stdout: 报告; stderr: 错误; exit: 0 OK / 1 FAIL / 2 错误
+# 路径由 --analyze-script 指定,默认与本脚本同目录
+analyze_setpoint_quality_full() {
+    local bag="$1"
+    [[ ! -f "$bag" ]] && { echo "ERROR: bag not found: $bag" >&2; return 2; }
+    [[ ! -f "$ANALYZE_SCRIPT" ]] && {
+        echo "ERROR: analyze script not found: $ANALYZE_SCRIPT" >&2
+        echo "  use --analyze-script=PATH or place analyze_setpoint_quality.py next to gs_replay_random.sh" >&2
+        return 2
+    }
+    python3 "$ANALYZE_SCRIPT" --ns "$UAV_NAME" "$bag"
 }
 
 # ----------------------------- SITL 生命周期 -----------------------------
@@ -309,8 +334,12 @@ for i in $(seq 1 "$LOOP"); do
     echo "    ----- tail $ROSLAUNCH_LOG -----"
     tail -8 "$ROSLAUNCH_LOG" | sed 's/^/    /'
 
-    echo "    ----- analyze $PLAYBACK_BAG_PATH -----"
-    ANALYZE_OUT=$(analyze_playback_bag "$PLAYBACK_BAG_PATH" 2>&1)
+    echo "    ----- analyze $PLAYBACK_BAG_PATH (mode=$ANALYZE_MODE) -----"
+    if [[ "$ANALYZE_MODE" == "full" ]]; then
+        ANALYZE_OUT=$(analyze_setpoint_quality_full "$PLAYBACK_BAG_PATH" 2>&1)
+    else
+        ANALYZE_OUT=$(analyze_playback_bag "$PLAYBACK_BAG_PATH" 2>&1)
+    fi
     ANALYZE_RC=$?
     echo "$ANALYZE_OUT" | sed 's/^/    /'
     echo "    [analyze rc=$ANALYZE_RC]"
@@ -322,6 +351,7 @@ for i in $(seq 1 "$LOOP"); do
         echo "input_bag:    $BAG"
         echo "playback_bag: $PLAYBACK_BAG_PATH"
         echo "state_topic:  $STATE_TOPIC"
+        echo "analyze_mode: $ANALYZE_MODE"
         echo "rc: $ANALYZE_RC (0=ok, 1=FAIL, 2=error)"
         echo "$ANALYZE_OUT"
     } >> "$REPORT_FILE"
@@ -329,9 +359,9 @@ for i in $(seq 1 "$LOOP"); do
     if [[ "$ANALYZE_RC" -eq 1 && "$AUTO_LAND_STOP" -eq 1 ]]; then
         echo ""
         echo "===================================================================="
-        echo "[gs_replay_random] ABORT: AUTO.LAND detected → stop further loops."
+        echo "[gs_replay_random] ABORT: analyzer reported FAIL ($ANALYZE_MODE mode) → stop further loops."
         echo "  failed_input_bag:    $BAG"
-        echo "  playback_bag:        $PLAYBACK_BAG_PATH  (mavros/state 含 AUTO.LAND)"
+        echo "  playback_bag:        $PLAYBACK_BAG_PATH"
         echo "  report:              $REPORT_FILE"
         echo "===================================================================="
         STOPPED=1

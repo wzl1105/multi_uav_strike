@@ -2362,6 +2362,13 @@ public:
         waypoint_skill_pub_.publish(sr.msg);
         if (handoff_from_holding) {
             current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+            // === 2026-08-17 修:立即发布 phase=3 ===
+            //   bug:taskFlowCallback 改完 phase 但没调 publishMissionState(),waypoint_executor
+            //   要等 1Hz 定时器下次 tick 才能看到 phase=3,中间 ~1s 拒发 velocity,即使 setpoint_thread
+            //   已经修过保持 position,waypoint_executor 这边仍晚 ~1s 接管,接近 PX4 timeout。
+            //   修法:对齐 L2139 takeoff 路径做法,phase 一改立即 publishMissionState()
+            //   让 waypoint_executor 在下一帧 mission_state_callback 就启动 velocity publish。
+            publishMissionState();
             ROS_WARN("[MissionManager] HOLDING to WAYPOINT_FOLLOW: skill published; "
                      "position setpoint retained until velocity ack");
         }
@@ -5025,10 +5032,18 @@ public:
                 // 航向已在 startSetpointPublisher() 里按当前机头朝向算好，
                 // 这里不要每帧覆盖成 w=1，否则 PX4 接管瞬间仍会 yaw 回零转圈
                 //=========setpoint====//
+                // === 2026-08-17 修:HOLDING→WAYPOINT_FOLLOW 衔接断流 ===
+                //   bug:phase 切到 WAYPOINT_FOLLOW 后 position_phase=false,setpoint_thread
+                //   立即停发,但 waypoint_executor 还在用 mission_state 1Hz tick 缓存的旧
+                //   phase=9,canPublishVelocitySetpoint() 拒发,中间真空 ~1s → PX4 failsafe。
+                //   修法:把 taskFlowCallback 在 handoff 路径 latch 的 waiting_for_waypoint_velocity_handoff_
+                //   加进来,phase 改完到 waypoint_executor ack 之间继续发 position setpoint,
+                //   由 waypointVelocityActiveCallback (L4082) 收到 ack 后 stopSetpointPublisher 收尾。
                 const bool position_phase =
                     current_phase_ == MissionPhase::PHASE_TAKING_OFF ||
                     current_phase_ == MissionPhase::PHASE_HOVERING ||
-                    current_phase_ == MissionPhase::PHASE_HOLDING;
+                    current_phase_ == MissionPhase::PHASE_HOLDING ||
+                    waiting_for_waypoint_velocity_handoff_;
                 const bool armed = use_sim_ || current_mavros_state_.armed;
                 if (armed && position_phase) {
                     takeoff_setpoint_pub_.publish(takeoff_setpoint_);
@@ -5224,6 +5239,16 @@ public:
 
         if (arming_client_.call(arm_cmd) && arm_cmd.response.success) {
             ROS_INFO("[MissionManager] Vehicle %s", arm ? "ARMED" : "DISARMED");
+            // === 2026-08-17 修:同步刷新 current_mavros_state_.armed ===
+            //   bug:armVehicle() 拿到 ARM ACK 后,mavrosStateCallback 还要等下一次 1Hz tick
+            //   才更新 current_mavros_state_.armed (gs_test_play_1.bag: ARM ACK 26.156s →
+            //   mavros/state armed=true 27.152s,空窗 1.0s)。
+            //   在这个空窗里 runPx4TakeoffSequence (TAKEOFF_SETTING_OFFBOARD) 拿
+            //   current_mavros_state_.armed 判门,继续判 false → 不调 startSetpointPublisher
+            //   → PX4 ARM 在 LOITER 模式空转 ~1s → failsafe RTL / land detector 报 landed。
+            //   修法:这里直接同步写 current_mavros_state_.armed,下一拍 state machine
+            //   立刻看见 armed=true → 启动 setpoint_thread,衔接零延迟。
+            current_mavros_state_.armed = arm;
             return true;
         }
 
