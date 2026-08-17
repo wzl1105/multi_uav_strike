@@ -127,6 +127,12 @@ roslaunch multi_uav_strike gs_play.launch \
 
 产物:`~/LOG/gs_playback_recorded.bag`(playback bag,含全部话题)。
 
+> **注意 bag 名确定性**:`gs_play.launch` 用 `rosbag record -O $(bag_dir)/$(playback_bag_name).bag`
+> 而不是 `-o`,所以产物文件名不带日期后缀(`-o` 会强制追加 `_YYYY-MM-DD-HH-MM-SS`)。
+> 这保证 `gs_replay_random.sh` 的 `PLAYBACK_BAG_PATH="${BAG_DIR}/${PLAYBACK_BAG_NAME}.bag"`
+> 能精确命中,analyze 不会 rc=2 "bag not found"。
+> 脚本侧每轮开头也会 `rm -f` 残留的 `.bag`/`.bag.active`,兜底任何半截写盘。
+
 > **注意时序**:bag 从 roslaunch 那一刻(t=0)就开始回放了,但 SITL+Mavros 真正握手完成大概要 8~12s,
 > 前 ~10s 的 GS 命令很可能落在 Mavros 还没订阅完的窗口里被吞。**解决方法**:录制时也别从 t=0 开始录,
 > 等到 SITL 起来、`gs_simulator_node.py` 已经推完首条 typed TaskFlow 之后 Ctrl+R(先停再录)再启动

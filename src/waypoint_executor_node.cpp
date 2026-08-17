@@ -1549,11 +1549,21 @@ public:
         //===================制导修改====================
         // 制导接管时连零速度也不能发布，否则会在50Hz制导流中周期性插入0。
         if (guidance_has_control_) return;
-        if (!canPublishVelocitySetpoint()) {
+        // === 2026-08-17 修:零速度是 OFFBOARD 心跳,不能被 phase 闸卡住 ===
+        // 原 canPublishVelocitySetpoint() 要求 phase==3||6,否则 return。
+        // 隐患: phase 刚改、但 1Hz MissionState 还没到 waypoint_executor 的窗口(~1 秒),
+        //       这时 guidance 已经放弃控制, 但 zero velocity 也不发 → PX4 失流 → AUTO.LAND。
+        // 零速度不应当做"真实航点指令"来闸,只看 FCU 是否准备好接 setpoint:
+        //   sim 下不依赖 mavros_state (use_sim=true), 仅 armed/connected 都 false 才视为失联。
+        if (!use_sim_ &&
+            (!mavros_state_received_ || !current_mavros_state_.connected ||
+             !current_mavros_state_.armed)) {
             ROS_WARN_THROTTLE(2.0,
-                "[WaypointExecutor] Zero velocity publish blocked: mission_state_received=%d phase=%u",
-                mission_state_received_ ? 1 : 0,
-                static_cast<unsigned>(current_mission_phase_));
+                "[WaypointExecutor] Zero velocity publish blocked: mavros_state_received=%d "
+                "connected=%d armed=%d",
+                mavros_state_received_ ? 1 : 0,
+                current_mavros_state_.connected ? 1 : 0,
+                current_mavros_state_.armed ? 1 : 0);
             return;
         }
         //===================制导修改====================

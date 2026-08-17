@@ -166,6 +166,19 @@ enum class SkillState {
     FAILED           // 超时或不容许状态转换
 };
 
+// === 云台控制状态(2026-08-17) ===
+// 决定 gimbal_command 下发的语义:
+//   LOCKED_AT_ZERO: 起飞前 / 降落中,send 360 sentinel,框架锁死 0 度(用户协议)
+//   FREE_FOLLOW_USER: 起飞后无 skill 驱动,base=0,用户角速度叠加
+//   SKILL_FOLLOW_USER: 102 Search IN_TASK 或 105 Attack IN_TASK,
+//                       base=skill.gimbal_pitch,用户角速度叠加
+// user_offset 在 LOCKED_AT_ZERO 进入时清零,其他状态保持
+enum class GimbalControlState {
+    LOCKED_AT_ZERO,
+    FREE_FOLLOW_USER,
+    SKILL_FOLLOW_USER
+};
+
 // === Phase 2: 当前 Skill 的运行时容器 ===
 struct SkillRuntime {
     multi_uav_strike::Skill  msg;            // 输入 Skill 完整拷贝
@@ -366,6 +379,16 @@ private:
     double         gimbal_pitch_default_     = 0.0;   // 非搜索期间下发的"归位"俯仰角
     double         gimbal_command_rate_hz_   = 5.0;   // 下发频率(Hz),5Hz 够云台伺服响应
     double         current_gimbal_pitch_     = 0.0;   // 当前正下发到 gimbal_command 的值
+    // === 云台用户角速度积分(2026-08-17) ===
+    // GS 通过 MAVLINK_MSG_ID_GIMBAL_MANAGER_SET_ATTITUDE(#282) 持续下发云台角速度,
+    //   starling_bridge 解析为 Twist 发布到 /tzs/cmd/gimbal_angular_velocity,
+    //   mission_manager 订阅并积分到 gimbal_user_offset_deg_。
+    // 内部约定:current_gimbal_pitch_ 正值=下视(度);starling_bridge 注释 angular.y 正=向上,
+    //   所以积分时取负号使向上 = 内部 pitch 减小。
+    GimbalControlState current_gimbal_state_ = GimbalControlState::LOCKED_AT_ZERO;
+    double         gimbal_user_offset_deg_   = 0.0;   // 用户角速度积分累积偏移,LOCKED 进入时清零
+    ros::Time      last_gimbal_vel_time_;              // 上一次收到 angular velocity 的时间(用于 dt 积分)
+    ros::Subscriber gimbal_ang_vel_sub_;
 
     // ============== 定时器 ==============
     ros::Timer mission_timer_;
@@ -1135,6 +1158,13 @@ public:
         // === PX4 home 自动加载(ref_lat/lon/alt 的唯一权威来源)===
         home_position_sub_ = nh_.subscribe("mavros/home_position/home", 10,
                                             &MissionManager::homePositionCallback, this);
+
+        // === 云台用户角速度输入(2026-08-17) ===
+        // starling_bridge 把 GS 的 MAVLINK_MSG_ID_GIMBAL_MANAGER_SET_ATTITUDE(#282) 解出
+        //   angular_velocity_x/y/z 发到这里。本节点订阅后积分 angular.y 成 gimbal_user_offset_deg_,
+        //   在 gimbalCommandTimerCallback 里叠加到 base pitch。
+        gimbal_ang_vel_sub_ = nh_.subscribe("tzs/cmd/gimbal_angular_velocity", 10,
+                                            &MissionManager::gimbalAngularVelocityCallback, this);
 
         // ===== 弹射起飞流程(协议 TODO: skill_type=100 = 弹射, 106 = 地面) =====
         // 弹射指令触发(由外部弹射控制节点发,本节点不实现发端)
@@ -2855,6 +2885,13 @@ public:
                 // phase 回 WAYPOINT_FOLLOW(原本被 startGuidanceApproach 改成 GUIDANCE_TRACK,
                 //   MissionState 上报里 GS 看到的应是航点跟踪阶段,而非 guidance)
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                // === 2026-08-17 修:phase 改了立刻 publishMissionState() ===
+                // waypoint_executor 的 canPublishVelocitySetpoint() 只在 phase==3||6 放行,
+                // 但 MissionState 1Hz 定时器要再等 ~1 秒。如果这里不立即推一帧,
+                // 这 1 秒里 guidance_has_control_ 已经是 false(从 /guidance/enable 回调),
+                // phase 还是旧 GUIDANCE_TRACK → velocity 不发 → PX4 COM_OFFBOARD_LOSS_TIMEOUT
+                // 1s 超时 → AUTO.LAND。忽略/stash/cluster 失效三处都补上。
+                publishMissionState();
                 tracked_target_.is_valid = false;
                 setLockState(TrackLockState::NOT_LOCKED);
                 // 多目标: 忽略主目标后,清掉 primary;estimator 在下一帧重新锚定下一个
@@ -2899,6 +2936,9 @@ public:
                     waypoint_control_pub_.publish(wp_cmd);
                 }
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                // === 2026-08-17 修:phase 改了立刻 publishMissionState() 释放 phase 闸 ===
+                // 同 action=1 注释:waypoint_executor 闸开前不发 velocity → OFFBOARD 失流。
+                publishMissionState();
                 tracked_target_.is_valid = false;
                 setLockState(TrackLockState::NOT_LOCKED);
                 // 多目标: 暂存后清 primary,estimator 在下一帧重新锚定下一个
@@ -4617,9 +4657,17 @@ public:
         // 1. 恢复用户起飞前的工作模式,而不是硬切 SEARCH_ONLY
         //    场景:用户在地面站提前发过 SET_WORKMODE=SEARCH_TRACK,起飞 skill 不应覆盖用户意图
         //    兼容:如果起飞前是 IDLE(典型场景),回落到 ~post_takeoff_work_mode(默认 SEARCH_ONLY)
-        WorkMode restore_mode = work_mode_before_takeoff_;
+        // === 2026-08-17 fix: handoff 应当尊重用户最新的 typed WorkMode 意图,
+        //     而不是 task_flow 第一次到达时的快照.
+        //     背景:GS 在 takeoff 爬升期间可能改主意 (e.g. SEARCH_STRIKE→SEARCH_ONLY),
+        //     typedWorkModeCallback 已经实时同步到 current_work_mode_,但 handoff 用
+        //     stale 缓存覆盖 → 用户意图丢失 → 进入错误的 work_mode 分支 →误触发 strike.
+        WorkMode restore_mode = current_work_mode_;
+        if (restore_mode == WorkMode::IDLE && work_mode_before_takeoff_ != WorkMode::IDLE) {
+            restore_mode = work_mode_before_takeoff_;  // 仅当 GS 从未下发过 typed WorkMode 时回退
+        }
         if (restore_mode == WorkMode::IDLE) {
-            restore_mode = post_takeoff_work_mode_;
+            restore_mode = post_takeoff_work_mode_;    // 兜底
         }
         // === 2026-07-26 fix: 不覆盖新 TaskFlow 首发 Attack(105) 已经 promote 的 SEARCH_STRIKE ===
         //   时序:advanceSkillStateMachine 先跑 (ENTRY_PENDING→IN_TASK → Attack(105) 路径在 4197 行
@@ -6235,6 +6283,10 @@ public:
                     wp_cmd.data = "resume";
                     waypoint_control_pub_.publish(wp_cmd);
                     current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                    // === 2026-08-17 修:phase 改了立刻 publishMissionState() 释放 phase 闸 ===
+                    // handleSearchTrack 内 target_lost 时 disableGuidance + resume,
+                    // 但若等下帧 1Hz 定时器, waypoint_executor 的 phase 闸要再卡 ~1 秒 → OFFBOARD 失流。
+                    publishMissionState();
                     current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
                     publishPrimaryTarget(0);
                     return;
@@ -6282,6 +6334,10 @@ public:
                     wp_cmd.data = "resume";
                     waypoint_control_pub_.publish(wp_cmd);
                     current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
+                    // === 2026-08-17 修:phase 改了立刻 publishMissionState() 释放 phase 闸 ===
+                    // handleSearchTrack 内 target_lost 时 disableGuidance + resume,
+                    // 但若等下帧 1Hz 定时器, waypoint_executor 的 phase 闸要再卡 ~1 秒 → OFFBOARD 失流。
+                    publishMissionState();
                     current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
                     publishPrimaryTarget(0);
                     return;
@@ -6564,13 +6620,13 @@ public:
     }
 
     /**
-     * 云台俯仰角下发(2026-07-29, 2026-07-30 扩 Attack(105))
+     * 云台俯仰角下发(2026-07-29, 2026-07-30 扩 Attack(105), 2026-08-17 加用户角速度叠加)
      *   - 频率:~gimbal_command_rate_hz (默认 5Hz)
-     *   - 内容:current_gimbal_pitch_(度,GS 语义:正值=下视)
-     *     * 102 Search IN_TASK → sr.msg.gimbal_pitch(在 advanceSkillStateMachine IN_TASK
-     *       入口改写,本 callback 只读)
-     *     * 105 IN_TASK → 按子阶段(见下)
-     *     * 其它 skill_type / 非 IN_TASK → gimbal_pitch_default_(默认 0,水平)
+     *   - 状态机:
+     *     LOCKED_AT_ZERO  : 起飞前 / 降落中,send 360 sentinel,框架锁死 0 度
+     *     FREE_FOLLOW_USER: 起飞后无 skill 驱动,base=0 + user_offset
+     *     SKILL_FOLLOW_USER: 102/105 IN_TASK,base=skill.gimbal_pitch + user_offset
+     *   - LOCKED_AT_ZERO 进入时清零 gimbal_user_offset_deg_(避免预起飞 user 操作污染)
      *   - 兜底:有订阅者才 publish,避免空订阅时刷日志
      *
      *   Attack(105) 子阶段(2026-07-30):
@@ -6606,10 +6662,107 @@ public:
             }
         }
 
+        // === 2026-08-17:决定云台控制状态机 ===
+        //   LOCKED:    起飞前(GROUND_IDLE) / 降落中(RETURNING) / TAKING_OFF 但未 COMPLETE
+        //   SKILL:     102 Search IN_TASK 或 105 Attack IN_TASK
+        //   FREE:      起飞后非 SKILL 段(TRANSIT/ENTRY_PENDING/HOVERING/HOLDING/Gather IN 等)
+        GimbalControlState new_state = GimbalControlState::FREE_FOLLOW_USER;
+        if (current_phase_ == MissionPhase::PHASE_GROUND_IDLE ||
+            current_phase_ == MissionPhase::PHASE_RETURNING) {
+            new_state = GimbalControlState::LOCKED_AT_ZERO;
+        } else if (current_phase_ == MissionPhase::PHASE_TAKING_OFF &&
+                   takeoff_state_ != TakeoffState::TAKEOFF_COMPLETE) {
+            new_state = GimbalControlState::LOCKED_AT_ZERO;
+        } else if (current_skill_index_ < skill_queue_.size()) {
+            const auto& sr = skill_queue_[current_skill_index_];
+            if (sr.state == SkillState::IN_TASK &&
+                (sr.msg.skill_type == 102 || sr.msg.skill_type == 105)) {
+                new_state = GimbalControlState::SKILL_FOLLOW_USER;
+            }
+        }
+
+        // === 状态切换副作用:LOCKED 进入时清零 user_offset ===
+        if (new_state != current_gimbal_state_) {
+            if (new_state == GimbalControlState::LOCKED_AT_ZERO) {
+                gimbal_user_offset_deg_ = 0.0;
+                ROS_WARN("[MissionManager] Gimbal state: %s -> LOCKED_AT_ZERO "
+                         "(user_offset reset, will publish 360 sentinel)",
+                         gimbalStateToString(current_gimbal_state_));
+            } else {
+                ROS_WARN("[MissionManager] Gimbal state: %s -> %s "
+                         "(start integrating user angular velocity)",
+                         gimbalStateToString(current_gimbal_state_),
+                         gimbalStateToString(new_state));
+            }
+            current_gimbal_state_ = new_state;
+        }
+
         std_msgs::Float32 msg;
-        // 地面站发送45度，云台需要-45完成下偏
-        msg.data = -static_cast<float>(current_gimbal_pitch_);
+        if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
+            // 起飞前 / 降落中:360 度 sentinel,框架锁死 0 度(用户协议)。
+            // gimbal_simulator 看到 360 → desired_pitch=0;
+            // 真机 gimbal_control_node 收到 360 → 锁死框架角为 0。
+            msg.data = 360.0f;
+        } else {
+            // FREE 或 SKILL:base + user_offset,clamp 到 [-90, 90] 度
+            double base_deg = 0.0;
+            if (current_gimbal_state_ == GimbalControlState::SKILL_FOLLOW_USER) {
+                base_deg = current_gimbal_pitch_;  // 正值=下视,度,advanceSkillStateMachine 已夹 [0,90]
+            }
+            double final_deg = base_deg + gimbal_user_offset_deg_;
+            // 防止 base + offset 越界(物理云台行程)
+            final_deg = std::max(-90.0, std::min(90.0, final_deg));
+            // 地面站发送45度，云台需要-45完成下偏
+            msg.data = -static_cast<float>(final_deg);
+        }
         gimbal_command_pub_.publish(msg);
+    }
+
+    /**
+     * 云台控制状态 → 字符串(用于日志)
+     */
+    const char* gimbalStateToString(GimbalControlState s) const {
+        switch (s) {
+            case GimbalControlState::LOCKED_AT_ZERO:     return "LOCKED_AT_ZERO";
+            case GimbalControlState::FREE_FOLLOW_USER:   return "FREE_FOLLOW_USER";
+            case GimbalControlState::SKILL_FOLLOW_USER:  return "SKILL_FOLLOW_USER";
+            default:                                       return "UNKNOWN";
+        }
+    }
+
+    /**
+     * 云台用户角速度回调(2026-08-17)
+     *   starling_bridge 把 MAVLINK_MSG_ID_GIMBAL_MANAGER_SET_ATTITUDE(#282) 解出
+     *   geometry_msgs::Twist 发到这里。本 callback 把 angular.y 积分成角度偏移:
+     *     - dt 用 ros::Time 计算;首条消息仅初始化时间戳不积分
+     *     - LOCKED_AT_ZERO 期间不积分(但仍更新时间戳避免 exit LOCKED 时 dt 爆炸)
+     *     - dt > 1s 视为异常(长 gap)跳过此次积分
+     *     - 内部约定 current_gimbal_pitch_ 正值=下视;starling_bridge 注释
+     *       angular.y 正=向上,所以积分时取负号使"上推杆"→ gimbal 上仰
+     *     - 积分结果钳到 [-90, 90] 度
+     */
+    void gimbalAngularVelocityCallback(const geometry_msgs::Twist::ConstPtr& msg) {
+        const ros::Time now = ros::Time::now();
+        if (last_gimbal_vel_time_.isZero()) {
+            last_gimbal_vel_time_ = now;
+            return;
+        }
+        const double dt = (now - last_gimbal_vel_time_).toSec();
+        last_gimbal_vel_time_ = now;
+
+        // 锁死期间不积分(但时间戳继续更新)
+        if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
+            return;
+        }
+        if (dt <= 0.0 || dt > 1.0) {
+            // 异常 dt(首条 / 长时间无消息 / 时间倒回)
+            return;
+        }
+        // angular.y: positive = up (per starling_bridge comment)
+        // internal convention: positive = down, so positive angular.y → decrease in positive-down
+        gimbal_user_offset_deg_ += (-msg->angular.y) * dt * 180.0 / M_PI;
+        // 钳位到云台物理行程
+        gimbal_user_offset_deg_ = std::max(-90.0, std::min(90.0, gimbal_user_offset_deg_));
     }
 
     std::string taskStatusToString() {
