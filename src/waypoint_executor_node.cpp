@@ -1549,12 +1549,20 @@ public:
         //===================制导修改====================
         // 制导接管时连零速度也不能发布，否则会在50Hz制导流中周期性插入0。
         if (guidance_has_control_) return;
-        // === 2026-08-17 修:零速度是 OFFBOARD 心跳,不能被 phase 闸卡住 ===
-        // 原 canPublishVelocitySetpoint() 要求 phase==3||6,否则 return。
-        // 隐患: phase 刚改、但 1Hz MissionState 还没到 waypoint_executor 的窗口(~1 秒),
-        //       这时 guidance 已经放弃控制, 但 zero velocity 也不发 → PX4 失流 → AUTO.LAND。
-        // 零速度不应当做"真实航点指令"来闸,只看 FCU 是否准备好接 setpoint:
-        //   sim 下不依赖 mavros_state (use_sim=true), 仅 armed/connected 都 false 才视为失联。
+        // === 2026-08-17 回滚: 恢复 phase 闸 ===
+        // 背景:今日(08-17)曾删 phase 闸想修 HOLDING→WAYPOINT_FOLLOW 衔接 race,
+        //   实测起飞 10s 后 AUTO.LAND (gs_test_play_1.bag, position+velocity 同发冲突)。
+        //   衔接 race 已被 mission_manager 的 waiting_for_waypoint_velocity_handoff_
+        //   latch (A1 fix, src/mission_manager_node.cpp:5028) 治本覆盖,
+        //   这里无需要再发 zero velocity 兜底 — 反而会和 mission_manager 的 position
+        //   setpoint 在 TAKING_OFF/HOVERING/HOLDING 三个阶段撞车,导致 PX4 OFFBOARD
+        //   收到 type_mask 冲突的 setpoint → 输出 NaN+thrust=0 → 不爬升 → 10s disarm。
+        if (current_mission_phase_ == 1 ||  // PHASE_TAKING_OFF
+            current_mission_phase_ == 2 ||    // PHASE_HOVERING
+            current_mission_phase_ == 9) {    // PHASE_HOLDING
+            return;
+        }
+        // 真机安全门: FCU 准备好才发,断链时绝不能写。
         if (!use_sim_ &&
             (!mavros_state_received_ || !current_mavros_state_.connected ||
              !current_mavros_state_.armed)) {
