@@ -84,7 +84,7 @@ usage() {
                             默认 AUTO.LAND 出现即停 (default: ON)
   --report-file PATH        FAIL 报告输出路径 (default: /tmp/gs_replay_report.txt)
   --analyze-mode {full,inline}
-                            full = analyze_setpoint_quality.py (AUTOLAND + STREAMGAP + SIMULT,default)
+                            full = analyze_setpoint_quality.py (AUTOLAND + STREAMGAP + SIMULT + SIMULT-CROSS,default)
                             inline = 内联只查 AUTO.LAND (legacy, 快速 CI 用)
   --analyze-script PATH     full 模式下调用脚本路径 (default: 与本脚本同目录/analyze_setpoint_quality.py)
   --dry-run                 仅列候选 bag
@@ -92,7 +92,7 @@ usage() {
 USAGE
 }
 
-# analyze_mode 默认 full (用新 analyzer 三项检查)
+# analyze_mode 默认 full (用新 analyzer 四项检查)
 ANALYZE_MODE="full"
 # analyze_script 默认与 gs_replay_random.sh 同目录
 ANALYZE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/analyze_setpoint_quality.py"
@@ -180,8 +180,8 @@ sys.exit(1)
 PYEOF
 }
 
-# 分析播放 bag (full mode): 调外置 analyze_setpoint_quality.py,做三项检查
-#   AUTOLAND / STREAMGAP / SIMULT。stdout: 报告; stderr: 错误; exit: 0 OK / 1 FAIL / 2 错误
+# 分析播放 bag (full mode): 调外置 analyze_setpoint_quality.py,做四项检查
+#   AUTOLAND / STREAMGAP / SIMULT / SIMULT-CROSS。stdout: 报告; stderr: 错误; exit: 0 OK / 1 FAIL / 2 错误
 # 路径由 --analyze-script 指定,默认与本脚本同目录
 analyze_setpoint_quality_full() {
     local bag="$1"
