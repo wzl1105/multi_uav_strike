@@ -1,0 +1,208 @@
+<?xml version="1.0"?>
+<!--
+  gs_play.launch
+  与 gs_record.launch 节点清单完全一致,但用 rosbag play 把录制好的 bag 重新喂给系统,
+  模拟"地面站已接入并发出过这些命令"的场景,用于自动化测试/回归。
+
+  使用方法:
+    0) SITL:   jack@jack-y9000k:~/src/PX4_Firmware/Tools$ ./sitl_single_run.sh
+    1) roslaunch multi_uav_strike gs_play.launch \
+            bag_path:=$HOME/LOG/gs_test_play_1.bag play_rate:=1.0
+
+  推荐配合 scripts/gs_replay_random.sh 使用,自动从 ${bag_dir} 随机挑一个
+  gs_test_play_*.bag 喂进来,等 bag 走完自动退出。
+
+  参数:
+    bag_path   : 必填,待播放的 .bag 绝对路径
+    play_rate  : 可选,默认 1.0 (原速)。>1 加速,<1 慢放,负数倒放
+    bag_dir    : 仅供 gs_replay_random.sh 参考用的检索根,默认 ~/LOG
+    uav_name   : 与录制时的 namespace 保持一致(默认 uav0)
+-->
+<launch>
+  <!-- 命令行可覆盖参数 -->
+  <arg name="uav_name" default="uav0" />
+  <arg name="flow" default="ground_search_track" />
+  <arg name="enable_rviz" default="true" />
+
+  <arg name="bag_dir" default="$(env HOME)/LOG" />
+  <arg name="bag_path" default="$(arg bag_dir)/gs_test_play_recorded.bag" />
+  <arg name="play_rate" default="1.0" />
+
+  <!-- 回放同步录制:把系统对输入 bag 的全部反应录成另一只 bag,便于 evaluate 分析。
+       默认 -a (全录) 以保住 mavros/state 等所有状态信息;
+       若录制体积太大可加 -x 排除特定话题。 -->
+  <arg name="record_playback_bag" default="true" />
+  <arg name="playback_bag_name" default="gs_playback_recorded" />
+
+  <!-- ====================================================================== -->
+  <!-- 1. MAVROS + PX4 SITL                                                  -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <include file="$(find mavros)/launch/px4.launch">
+      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
+      <arg name="gcs_url" value="udp://:14561@192.168.0.112:14560"/>
+    </include>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 2. 目标运动模拟                                                          -->
+  <!-- ====================================================================== -->
+  <node name="target_motion_simulator_node"
+        pkg="multi_uav_strike"
+        type="target_motion_simulator_node"
+        output="screen"
+        respawn="true">
+    <rosparam command="load"
+              file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
+  </node>
+
+  <!-- ====================================================================== -->
+  <!-- 3. 云台模拟 (同 gs_record)                                              -->
+  <!-- ====================================================================== -->
+  <include file="$(find multi_uav_strike)/launch/gimbal_simulator.launch">
+    <arg name="uav_name" value="$(arg uav_name)" />
+  </include>
+
+  <!-- ====================================================================== -->
+  <!-- 4. 目标估计                                                              -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="target_estimator_node"
+          pkg="multi_uav_strike"
+          type="target_estimator_node"
+          output="screen"
+          respawn="true">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/target_estimator.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 5. 制导控制                                                              -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="guidance_control_node"
+          pkg="multi_uav_strike"
+          type="guidance_control_node"
+          output="screen"
+          respawn="true">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/guidance_control.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 6. 航点执行器                                                            -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="waypoint_executor_node"
+          pkg="multi_uav_strike"
+          type="waypoint_executor_node"
+          output="screen"
+          respawn="true">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/waypoint_executor.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 8. 任务管理器                                                            -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="mission_manager_node"
+          pkg="multi_uav_strike"
+          type="mission_manager_node"
+          output="screen"
+          respawn="true">
+      <param name="device_id" value="0" />
+      <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/mission_manager.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 8b. 机间避障                                                              -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="uav_avoidance_node"
+          pkg="multi_uav_strike"
+          type="uav_avoidance_node"
+          output="screen"
+          respawn="true">
+      <param name="uav_device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
+      <param name="uav_id" value="$(optenv TZS_DEVICE_SN 1-1)" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/uav_avoidance.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 9. starling_bridge (此刻无真 GS,KCP 静默;由 rosbag play 注入"历史 GS 命令") -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge"
+          respawn="true" output="screen">
+      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.240.112)" />
+      <param name="gcs_udp_port" value="14550" />
+      <param name="gcs_kcp_port" value="18990" />
+      <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />
+      <param name="device_sn" value="$(optenv TZS_DEVICE_SN 1-1)" />
+      <param name="system_id" value="$(optenv TZS_FCU_ID 1)" />
+      <param name="inter_uav_broadcast_ip" value="" />
+      <param name="inter_uav_broadcast_port" value="19590" />
+      <param name="heartbeat_base_rate"   value="1.0" />
+      <param name="heartbeat_near_rate"   value="5.0" />
+      <param name="heartbeat_close_rate"  value="20.0" />
+      <param name="heartbeat_near_thresh" value="40.0" />
+      <param name="heartbeat_close_thresh" value="20.0" />
+      <param name="neighbor_timeout"      value="5.0" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 10. RViz                                                                -->
+  <!-- ====================================================================== -->
+  <node if="$(arg enable_rviz)" name="rviz" pkg="rviz" type="rviz" respawn="false"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+
+  <!-- ====================================================================== -->
+  <!-- 11. ROSBag play:回放 starling_bridge 的历史 GS 命令 → 驱动 UAV 系统反应    -->
+  <!--   -r $(arg play_rate):速度倍率                                                -->
+  <!--   配套:scripts/gs_replay_random.sh 在 bag 走完后 SIGINT 此 launch          -->
+  <!-- ====================================================================== -->
+  <!-- 启动延迟由 scripts/gs_replay_random.sh 控制,不在 launch 里叠 sleep,
+       以免下层节点还没起来时 GS 命令就被扔进 ROS 队列。等 SITL/Mavros 完成 8~12 s
+       启动期后再让 rosbag play 开始投放,系统反应才贴合真实节奏。-->
+  <node pkg="rosbag"
+        type="play"
+        name="starling_pub_rosbag_play"
+        output="screen"
+        required="false"
+        args="'$(arg bag_path)' -r $(arg play_rate) -q" />
+
+  <!-- ====================================================================== -->
+  <!-- 12. ROSBag 全录(同步):产物 ~/LOG/&lt;playback_bag_name&gt;.bag                      -->
+  <!--   配套:scripts/gs_replay_random.sh 跑完一轮后会分析此 bag 中的 mavros/state   -->
+  <!-- ====================================================================== -->
+  <group if="$(arg record_playback_bag)">
+    <node pkg="rosbag"
+          type="record"
+          name="playback_full_bag_record"
+          output="screen"
+          required="false"
+          args="-a -o $(arg bag_dir)/$(arg playback_bag_name)" />
+  </group>
+
+</launch>
