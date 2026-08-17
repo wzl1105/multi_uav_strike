@@ -202,7 +202,7 @@
           name="playback_full_bag_record"
           output="screen"
           required="false"
-          args="-a -o $(arg bag_dir)/$(arg playback_bag_name)" />
+          args="-a -O $(arg bag_dir)/$(arg playback_bag_name).bag" />
   </group>
 
 </launch>

@@ -388,10 +388,18 @@ public:
             ((ros::Time::now() - last_external_pitch_time_).toSec() < 0.5);
         bool has_primary = (primary_idx_ >= 0);
         if (external_valid) {
-            // msg.data 是度,负值=下视(ROS 约定);内部 current_gimbal_pitch_ 是弧度,
-            //   范围 [0, π/2],正值=下视 — 需要取反 + 度→弧度。
-            double pitch_rad = -external_pitch_deg_ * M_PI / 180.0;
-            desired_pitch = clampv(pitch_rad, 0.0, M_PI/2.0);
+            // === 2026-08-17:360 sentinel = 框架锁死 0 度 ===
+            //   协议:mission_manager 在 LOCKED_AT_ZERO 状态(起飞前/降落中)发 360,
+            //   真机 gimbal_control_node 收到 360 也锁死框架角为 0;
+            //   simulator 看到 360 → desired_pitch=0(水平),直至下次非 360 msg 到达。
+            if (std::fabs(external_pitch_deg_ - 360.0) < 0.5) {
+                desired_pitch = 0.0;
+            } else {
+                // msg.data 是度,负值=下视(ROS 约定);内部 current_gimbal_pitch_ 是弧度,
+                //   范围 [0, π/2],正值=下视 — 需要取反 + 度→弧度。
+                double pitch_rad = -external_pitch_deg_ * M_PI / 180.0;
+                desired_pitch = clampv(pitch_rad, 0.0, M_PI/2.0);
+            }
         } else if (has_primary) {
             const TargetProj& p = projections_[primary_idx_];
             desired_pitch = computePitchAndYawToTarget(p.pos.x, p.pos.y);

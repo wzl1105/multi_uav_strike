@@ -259,6 +259,13 @@ for i in $(seq 1 "$LOOP"); do
     echo "===================================================================="
     echo "[gs_replay_random] [$i/$LOOP] $(date +%T) pick=$BAG_NAME"
 
+    # ---- 0) 清掉上一轮残留的 playback bag,避免 .bag.active / 冲突文件名 ----
+    shopt -s nullglob
+    for stale in "${BAG_DIR}/${PLAYBACK_BAG_NAME}".bag \
+                 "${BAG_DIR}/${PLAYBACK_BAG_NAME}".bag.active; do
+        [[ -f "$stale" ]] && rm -f "$stale"
+    done
+
     # ---- 1) 启 SITL (fresh,每个 bag 之前一次) ----
     start_sitl
 
