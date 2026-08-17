@@ -2,7 +2,7 @@
 """
 Analyze a gs_replay playback bag for OFFBOARD setpoint issues.
 
-Three failure modes are detected (each can be enabled/disabled via flags):
+Four failure modes are detected (each can be enabled/disabled via flags):
 
   1. --check-autoland   : PX4 ever transitions to AUTO.LAND mode
                           (existing behavior of gs_replay_random.sh inline analyzer)
@@ -21,13 +21,22 @@ Three failure modes are detected (each can be enabled/disabled via flags):
                               - waypoint_executor → /mavros/setpoint_velocity/cmd_vel_unstamped
                           Simultaneous publishing from different nodes to
                           the same topic is treated as a configuration bug.
-                          (Position + velocity at the same time is OK because
-                          mavros aggregates both into setpoint_raw/target_local
-                          via type_mask.)
 
-Default invocation checks all three; rc=0 if none of the enabled checks fail.
+  4. --check-cross-channel : During mission phases where one channel is
+                          authoritative (mission_manager owns position in
+                          phases 1/2/9 = TAKING_OFF/HOVERING/HOLDING;
+                          waypoint_executor owns velocity in phases 3/6 =
+                          WAYPOINT_FOLLOW/RETURNING), detect concurrent
+                          publishing to *both* position and velocity topics.
+                          This catches the 2026-08-17 bug where
+                          publishZeroVelocity() was emitting zero velocity
+                          during TAKING_OFF, colliding with mission_manager's
+                          position setpoint → PX4 OFFBOARD type_mask 冲突
+                          → thrust=0 → 10s 后 AUTO.LAND.
+
+Default invocation checks all four; rc=0 if none of the enabled checks fail.
 Output is human-readable and machine-parseable (each finding starts with a
-prefixed tag: AUTOLAND / STREAMGAP / SIMULT).
+prefixed tag: AUTOLAND / STREAMGAP / SIMULT / SIMULT-CROSS).
 
 Usage:
     python3 analyze_setpoint_quality.py <bag> [opts]
@@ -230,6 +239,181 @@ def analyze_simultaneous_publishers(
     return findings
 
 
+# ----------------------------- cross-channel overlap -----------------------------
+
+# Mission phase constants — keep in sync with src/mission_manager_node.cpp
+PHASE_GROUND_IDLE     = 0
+PHASE_TAKING_OFF      = 1
+PHASE_HOVERING        = 2
+PHASE_WAYPOINT_FOLLOW = 3
+PHASE_RETURNING       = 6
+PHASE_HOLDING         = 9
+
+# Phases where mission_manager owns position setpoint as authoritative.
+# During these phases, waypoint_executor MUST NOT publish any velocity setpoint
+# (real or zero), otherwise PX4 OFFBOARD receives type_mask 冲突 → NaN → thrust=0.
+POSITION_AUTHORITATIVE_PHASES = {PHASE_TAKING_OFF, PHASE_HOVERING, PHASE_HOLDING}
+# Phases where waypoint_executor owns velocity as authoritative.
+VELOCITY_AUTHORITATIVE_PHASES = {PHASE_WAYPOINT_FOLLOW, PHASE_RETURNING}
+
+
+def _index_phase_segments(bag, mission_state_topic):
+    """
+    Return list of (start_ts, end_ts, phase) for stable-phase periods.
+
+    mission_state is published at 1Hz, so phase transitions are coarse.
+    A 'segment' starts at the timestamp when a new phase value is first seen
+    and lasts until the next phase change (or end-of-bag).
+    """
+    if mission_state_topic is None:
+        return []
+    samples = []
+    try:
+        for topic, msg, t in bag.read_messages(mission_state_topic):
+            samples.append((t.to_sec(), int(getattr(msg, "phase", -1))))
+    except Exception:
+        return []
+    samples.sort()
+    segments = []
+    for i, (ts, ph) in enumerate(samples):
+        end_ts = samples[i + 1][0] if i + 1 < len(samples) else float("inf")
+        segments.append((ts, end_ts, ph))
+    return samples, segments
+
+
+def _topic_timestamps(bag, candidates):
+    """
+    Read all candidate topics; return merged sorted timestamp list, ignoring
+    topics with zero messages.
+    """
+    series = []
+    for cand in candidates:
+        try:
+            if bag.get_message_count(cand) == 0:
+                continue
+        except Exception:
+            continue
+        for topic, msg, t in bag.read_messages(cand):
+            series.append(t.to_sec())
+    series.sort()
+    return series
+
+
+def _intersection_duration(pos_ts, vel_ts, win_start, win_end):
+    """
+    Walk two sorted timestamp lists and return the total duration within
+    [win_start, win_end] where *both* lists have at least one timestamp
+    within a `window_sec` of each other (sliding-window style).
+
+    Returns total_overlap_seconds.
+    """
+    window_sec = 0.1  # hard-coded; matches --simul-window default
+    if not pos_ts or not vel_ts:
+        return 0.0, None, None
+
+    # Clip both lists to [win_start, win_end]
+    import bisect
+    i_lo = bisect.bisect_left(pos_ts, win_start)
+    j_lo = bisect.bisect_left(vel_ts, win_start)
+    pos_clip = [ts for ts in pos_ts[i_lo:] if ts <= win_end]
+    vel_clip = [ts for ts in vel_ts[j_lo:] if ts <= win_end]
+    if not pos_clip or not vel_clip:
+        return 0.0, None, None
+
+    # For each pos timestamp, find any vel timestamp within window_sec.
+    # Note: when inner loop breaks on vt > pt+window, vt might still fall
+    # inside the window of the *next* pt (pt' > pt), so don't skip ahead —
+    # just let the next iteration re-evaluate from current j.
+    j = 0
+    overlap = []  # list of (t_pos, t_vel) when both have data within window
+    for pt in pos_clip:
+        # advance j to first vel_ts >= pt - window_sec
+        while j < len(vel_clip) and vel_clip[j] < pt - window_sec:
+            j += 1
+        if j >= len(vel_clip):
+            # all remaining vel entries are in the past; subsequent pt's won't match either
+            break
+        # check vel_ts[k] within [pt - window_sec, pt + window_sec]
+        for k in range(j, len(vel_clip)):
+            vt = vel_clip[k]
+            if vt > pt + window_sec:
+                break
+            overlap.append((pt, vt))
+
+    if not overlap:
+        return 0.0, None, None
+
+    # Total time span from earliest to latest pair
+    first = overlap[0]
+    last = overlap[-1]
+    return max(last[0], last[1]) - min(first[0], first[1]), min(first[0], first[1]), max(last[0], last[1])
+
+
+def analyze_cross_channel_setpoint(
+    bag,
+    candidate_topics_for_position,
+    candidate_topics_for_velocity,
+    mission_state_topic,
+    min_overlap_sec,
+):
+    """
+    Detect cross-channel overlap (position + velocity topics both receiving
+    messages) during phases where one channel should be authoritative.
+
+    Each finding covers one phase segment where the violation occurs.
+    Phase 1/2/9 (POSITION_AUTHORITATIVE): position OK, velocity must NOT publish.
+    Phase 3/6 (VELOCITY_AUTHORITATIVE): velocity OK, position must NOT publish.
+
+    Returns list of findings:
+        {phase, phase_name, authoritative, offending_channel, window_start,
+         window_end, overlap_sec}
+    """
+    samples, segments = _index_phase_segments(bag, mission_state_topic)
+    if not segments:
+        return []
+
+    pos_ts = _topic_timestamps(bag, candidate_topics_for_position)
+    vel_ts = _topic_timestamps(bag, candidate_topics_for_velocity)
+
+    phase_name = {
+        PHASE_GROUND_IDLE:     "GROUND_IDLE",
+        PHASE_TAKING_OFF:      "TAKING_OFF",
+        PHASE_HOVERING:        "HOVERING",
+        PHASE_WAYPOINT_FOLLOW: "WAYPOINT_FOLLOW",
+        PHASE_RETURNING:       "RETURNING",
+        PHASE_HOLDING:         "HOLDING",
+    }
+
+    findings = []
+    for seg_start, seg_end, ph in segments:
+        if ph in POSITION_AUTHORITATIVE_PHASES:
+            authoritative = "position"
+            offending = "velocity"
+        elif ph in VELOCITY_AUTHORITATIVE_PHASES:
+            authoritative = "velocity"
+            offending = "position"
+        else:
+            # GROUND_IDLE etc — neither channel should publish
+            authoritative = "none"
+            offending = "both"
+
+        overlap, ovl_start, ovl_end = _intersection_duration(
+            pos_ts, vel_ts, seg_start, seg_end)
+        if overlap >= min_overlap_sec:
+            findings.append({
+                "phase": ph,
+                "phase_name": phase_name.get(ph, f"PHASE_{ph}"),
+                "authoritative": authoritative,
+                "offending_channel": offending,
+                "segment_start": seg_start,
+                "segment_end": seg_end,
+                "window_start": ovl_start,
+                "window_end": ovl_end,
+                "overlap_sec": overlap,
+            })
+    return findings
+
+
 # ----------------------------- CLI -----------------------------
 
 def main():
@@ -243,6 +427,8 @@ def main():
                     help="Disable setpoint stream gap check")
     ap.add_argument("--no-simultaneous", action="store_true",
                     help="Disable simultaneous-publishers check")
+    ap.add_argument("--no-cross-channel", action="store_true",
+                    help="Disable cross-channel (position vs velocity) overlap check")
     ap.add_argument("--stream-gap-threshold", type=float, default=1.0,
                     help="Stream gap threshold in seconds (default 1.0 = PX4 "
                          "COM_OFFBOARD_LOSS_TIMEOUT default)")
@@ -299,6 +485,22 @@ def main():
                                  "{} channel(s) with concurrent publishers".format(len(sim))))
                 for f in sim:
                     print(f"  SIMULT channel={f['channel']} topics={f['topics']} "
+                          f"window={f['window_start']:.3f}-{f['window_end']:.3f}s "
+                          f"overlap={f['overlap_sec']:.3f}s")
+                rc = 1
+
+        # ------- Check 4: cross-channel overlap (position vs velocity) -------
+        if not args.no_cross_channel:
+            cross = analyze_cross_channel_setpoint(
+                bag, pos_tpcs, vel_tpcs, mission_state_tpc,
+                args.simul_min_overlap,
+            )
+            if cross:
+                findings.append(("SIMULT-CROSS",
+                                 "{} phase segment(s) with cross-channel overlap".format(len(cross))))
+                for f in cross:
+                    print(f"  SIMULT-CROSS phase={f['phase']}({f['phase_name']}) "
+                          f"authoritative={f['authoritative']} offending={f['offending_channel']} "
                           f"window={f['window_start']:.3f}-{f['window_end']:.3f}s "
                           f"overlap={f['overlap_sec']:.3f}s")
                 rc = 1
