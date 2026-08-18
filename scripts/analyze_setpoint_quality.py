@@ -33,6 +33,14 @@ Four failure modes are detected (each can be enabled/disabled via flags):
                           during TAKING_OFF, colliding with mission_manager's
                           position setpoint → PX4 OFFBOARD type_mask 冲突
                           → thrust=0 → 10s 后 AUTO.LAND.
+                          Findings whose overlap window falls within
+                          ±--cross-grace-sec of any phase transition are
+                          tagged as SUPPRESSED (handoff design region: the
+                          position channel primes before HOLDING via
+                          waiting_for_waypoint_velocity_handoff_ latch, and
+                          waypoint_executor stops ~50ms after a new task_flow
+                          — both produce short bursts of concurrent
+                          publishing that are NOT bugs).
 
 Default invocation checks all four; rc=0 if none of the enabled checks fail.
 Output is human-readable and machine-parseable (each finding starts with a
@@ -349,12 +357,53 @@ def _intersection_duration(pos_ts, vel_ts, win_start, win_end):
     return max(last[0], last[1]) - min(first[0], first[1]), min(first[0], first[1]), max(last[0], last[1])
 
 
+def _phase_transition_timestamps(samples):
+    """Return list of timestamps where phase value changes between consecutive samples."""
+    out = []
+    for i in range(1, len(samples)):
+        if samples[i][1] != samples[i - 1][1]:
+            out.append(samples[i][0])
+    return out
+
+
+def _near_phase_transition(overlap_start, overlap_end, transitions, grace_sec):
+    """
+    Return (is_near, nearest_transition_ts, distance_sec) if overlap window
+    is within grace_sec of any phase transition AND overlap is short enough
+    to plausibly be a designed handoff.
+
+    Designed handoff overlaps (mission_manager's setpoint_thread pre-priming
+    for HOLDING via waiting_for_waypoint_velocity_handoff_ latch, or
+    waypoint_executor stopping lag) typically occur within ±1s of a phase
+    transition AND last < 1s. We additionally require overlap duration to
+    be < 2*grace_sec so that a 5-second real bug whose start coincides
+    with a transition is NOT suppressed.
+    """
+    if not transitions:
+        return False, None, float("inf")
+    nearest_ts = None
+    nearest_d = float("inf")
+    for ts in transitions:
+        d = min(abs(ts - overlap_start), abs(ts - overlap_end))
+        if d < nearest_d:
+            nearest_d = d
+            nearest_ts = ts
+    if nearest_d >= grace_sec:
+        return False, nearest_ts, nearest_d
+    # Even if near transition, a long overlap is not a handoff — it's a real bug
+    overlap_dur = overlap_end - overlap_start
+    if overlap_dur > 2 * grace_sec:
+        return False, nearest_ts, nearest_d
+    return True, nearest_ts, nearest_d
+
+
 def analyze_cross_channel_setpoint(
     bag,
     candidate_topics_for_position,
     candidate_topics_for_velocity,
     mission_state_topic,
     min_overlap_sec,
+    grace_sec,
 ):
     """
     Detect cross-channel overlap (position + velocity topics both receiving
@@ -364,9 +413,16 @@ def analyze_cross_channel_setpoint(
     Phase 1/2/9 (POSITION_AUTHORITATIVE): position OK, velocity must NOT publish.
     Phase 3/6 (VELOCITY_AUTHORITATIVE): velocity OK, position must NOT publish.
 
+    Suppression: findings whose overlap window falls within ±grace_sec of any
+    phase transition are tagged with `suppressed=True` and excluded from the
+    error count. They are still returned so the caller can log them as INFO.
+    Rationale: the position channel primes before phase transitions (latch
+    mechanism) and waypoint_executor stops ~50ms after the new task_flow.
+    Both produce short bursts of concurrent publishing that are NOT bugs.
+
     Returns list of findings:
         {phase, phase_name, authoritative, offending_channel, window_start,
-         window_end, overlap_sec}
+         window_end, overlap_sec, suppressed, suppression_reason}
     """
     samples, segments = _index_phase_segments(bag, mission_state_topic)
     if not segments:
@@ -374,6 +430,7 @@ def analyze_cross_channel_setpoint(
 
     pos_ts = _topic_timestamps(bag, candidate_topics_for_position)
     vel_ts = _topic_timestamps(bag, candidate_topics_for_velocity)
+    transitions = _phase_transition_timestamps(samples)
 
     phase_name = {
         PHASE_GROUND_IDLE:     "GROUND_IDLE",
@@ -400,6 +457,13 @@ def analyze_cross_channel_setpoint(
         overlap, ovl_start, ovl_end = _intersection_duration(
             pos_ts, vel_ts, seg_start, seg_end)
         if overlap >= min_overlap_sec:
+            suppressed, near_ts, near_dist = _near_phase_transition(
+                ovl_start, ovl_end, transitions, grace_sec)
+            if suppressed:
+                reason = "near phase transition (t={:.3f}s, dist={:.3f}s, grace={:.2f}s)".format(
+                    near_ts, near_dist, grace_sec)
+            else:
+                reason = ""
             findings.append({
                 "phase": ph,
                 "phase_name": phase_name.get(ph, f"PHASE_{ph}"),
@@ -410,6 +474,8 @@ def analyze_cross_channel_setpoint(
                 "window_start": ovl_start,
                 "window_end": ovl_end,
                 "overlap_sec": overlap,
+                "suppressed": suppressed,
+                "suppression_reason": reason,
             })
     return findings
 
@@ -438,6 +504,11 @@ def main():
     ap.add_argument("--simul-min-overlap", type=float, default=0.5,
                     help="Minimum overlap duration to flag as simultaneous "
                          "(default 0.5 s)")
+    ap.add_argument("--cross-grace-sec", type=float, default=1.5,
+                    help="SIMULT-CROSS phase-transition grace window in seconds. "
+                         "Overlap windows within ±N seconds of any phase transition "
+                         "are tagged as suppressed (handoff design region, not a bug). "
+                         "(default 1.5 s)")
     args = ap.parse_args()
 
     pos_tpcs = [t.format(ns=args.ns) for t in SETPOINT_POSITION_TOPICS]
@@ -493,17 +564,27 @@ def main():
         if not args.no_cross_channel:
             cross = analyze_cross_channel_setpoint(
                 bag, pos_tpcs, vel_tpcs, mission_state_tpc,
-                args.simul_min_overlap,
+                args.simul_min_overlap, args.cross_grace_sec,
             )
-            if cross:
+            failing = [f for f in cross if not f["suppressed"]]
+            suppressed = [f for f in cross if f["suppressed"]]
+            if failing:
                 findings.append(("SIMULT-CROSS",
-                                 "{} phase segment(s) with cross-channel overlap".format(len(cross))))
-                for f in cross:
+                                 "{} phase segment(s) with cross-channel overlap".format(len(failing))))
+                for f in failing:
                     print(f"  SIMULT-CROSS phase={f['phase']}({f['phase_name']}) "
                           f"authoritative={f['authoritative']} offending={f['offending_channel']} "
                           f"window={f['window_start']:.3f}-{f['window_end']:.3f}s "
                           f"overlap={f['overlap_sec']:.3f}s")
                 rc = 1
+            if suppressed:
+                # INFO only — designed handoff region, not a bug
+                for f in suppressed:
+                    print(f"  SIMULT-CROSS-SUPPRESSED phase={f['phase']}({f['phase_name']}) "
+                          f"authoritative={f['authoritative']} offending={f['offending_channel']} "
+                          f"window={f['window_start']:.3f}-{f['window_end']:.3f}s "
+                          f"overlap={f['overlap_sec']:.3f}s "
+                          f"reason={f['suppression_reason']}")
 
     if not findings:
         print(f"OK: bag {args.bag} passed all enabled checks")
