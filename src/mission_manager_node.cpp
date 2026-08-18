@@ -2065,14 +2065,30 @@ public:
         //=========setpoint====//
         // position 保持到新 skill 已实际写入第一帧 velocity；短暂重叠只存在于明确
         // 的接管窗口，不会出现两边都停掉的 OFFBOARD 断流。
+        // === 2026-08-18 修:WPF→HOLD 1秒 position+velocity 重叠 ===
+        //   bug:condition 只看 setpoint_running_,不看 current_phase_。WPF 期间
+        //   setpoint_thread 仍 alive,但被 position_phase gate 住不发;taskFlowCallback
+        //   收到新 task_flow 时 latch=true 绕过 gate,让 position 50Hz 立即开火,
+        //   跟 waypoint_executor 还在发的 velocity 撞 ~1s (1Hz mission_state tick
+        //   + waypoint_executor 10Hz 停 velocity 延迟),PX4 OFFBOARD type_mask 冲突。
+        //   修法:加 current_phase_ 闸,只在 POSITION_AUTHORITATIVE (TAKEOFF/HOVER/HOLD)
+        //   才允许 latch 触发 position 发。WPF/RETURNING 期间 position 本来就不该发,
+        //   phase 切到 HOLD 时 position_phase 自然 true,WPF→HOLD 不会撞。
+        //   保留的转移路径:HOVER→WPF / HOLD→WPF / TAKEOFF→HOVERING。
         waiting_for_waypoint_velocity_handoff_ =
             !skill_queue_.empty() &&
             skill_queue_[0].msg.skill_type != 100 &&
             skill_queue_[0].msg.skill_type != 106 &&
-            setpoint_running_;
+            setpoint_running_ &&
+            (current_phase_ == MissionPhase::PHASE_TAKING_OFF ||
+             current_phase_ == MissionPhase::PHASE_HOVERING ||
+             current_phase_ == MissionPhase::PHASE_HOLDING);
         if (!skill_queue_.empty() &&
             skill_queue_[0].msg.skill_type != 100 &&
-            skill_queue_[0].msg.skill_type != 106 && setpoint_running_) {
+            skill_queue_[0].msg.skill_type != 106 && setpoint_running_ &&
+            (current_phase_ == MissionPhase::PHASE_TAKING_OFF ||
+             current_phase_ == MissionPhase::PHASE_HOVERING ||
+             current_phase_ == MissionPhase::PHASE_HOLDING)) {
             ROS_WARN("[MissionManager] Holding position setpoint until velocity ack for skill=%s",
                      skill_queue_[0].msg.skill_id.c_str());
         }
