@@ -177,7 +177,7 @@
   <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge"
           respawn="true" output="screen">
-      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.0.103)" />
+      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.43.5)" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />
