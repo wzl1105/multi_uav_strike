@@ -324,7 +324,8 @@ public:
 
         std::lock_guard<std::mutex> g(clusters_mtx_);
         // === 2026-07-31: 归一化 label (YOLO 数字串 → 语义串) ===
-        //   同一份代码同时服务真机 YOLO ("0"/"1") 和仿真云台 ("person"/"car")
+        //   同一份代码同时服务真机 YOLO ("1"/"2",gimbal_node.cpp:1461 +1 偏移后)
+        //   和仿真云台 ("person"/"car" 语义串)。
         //   聚类匹配、新建 cluster、raw marker text 全部用归一化后的 label
         const std::string norm_label = normalizeYoloLabel(det.label);
         const std::string& label = norm_label;
@@ -1145,23 +1146,29 @@ private:
         return h;
     }
 
-    // === 2026-07-31: 数字→语义 归一化 ===
-    //   YOLO 真机 (starling_gimbal) 发的是 class_id 字符串 ("0"/"1"/...)
-    //   仿真 gimbal_simulator 发的是语义字符串 ("person"/"car"/...)
+    // === 2026-08-19: 数字→语义 归一化 (对齐 gimbal_node.cpp:1461 +1 偏移协议) ===
+    //   YOLO 真机 (starling_gimbal) C++ 端 class_id 映射 (gimbal_node.cpp L710):
+    //     class_id=0 → person, class_id=1 → car, class_id=2 → other (过滤丢弃)
+    //   publishYoloDetections (gimbal_node.cpp:1461) 推到 ROS 前做了 +1 偏移:
+    //     class_id=0 (person) → "1", class_id=1 (car) → "2"
+    //   仿真 gimbal_simulator 直接发语义字符串 ("person"/"car"/...)
     //   target_estimator 内部统一用语义字符串, 聚类匹配不再受部署源影响
-    //   协议:
-    //     "0"            → "person"
-    //     "1"            → "car"
-    //     "2" 及以上数字 → "car"  // 兜底: 用户已确认, 等 YOLO 开发者收紧协议
+    //   协议(与 gimbal_node.cpp +1 偏移对齐):
+    //     "1"            → "person"
+    //     "2"            → "car"
+    //     "3" 及以上数字 → "car"  // 兜底: 防止 3+ 漏到下游被误判 unknown
+    //   "0"             → 原样返回 (防御: 旧版/未来版本可能不再 +1, 直接是 class_id)
     //   其他字符串 → 原样返回(已语义,例如 "person"/"car"/"truck")
     static std::string normalizeYoloLabel(const std::string& raw) {
-        if (raw == "0") return "person";
-        if (raw == "1") return "car";
-        // 2+ 数字串兜底为 car(防 YOLO 漏报 0/1 时被当 unknown 误过滤)
-        if (!raw.empty() && std::all_of(raw.begin(), raw.end(),
-                                        [](unsigned char c){ return std::isdigit(c); })) {
+        if (raw == "1") return "person";
+        if (raw == "2") return "car";
+        // 3+ 数字串兜底为 car(防 YOLO 漏报 1/2 时被当 unknown 误过滤)
+        if (raw.size() >= 1 && raw[0] >= '3' && raw[0] <= '9' &&
+            std::all_of(raw.begin(), raw.end(),
+                        [](unsigned char c){ return std::isdigit(c); })) {
             return "car";
         }
+        // "0" 或语义串: 原样返回
         return raw;
     }
 
