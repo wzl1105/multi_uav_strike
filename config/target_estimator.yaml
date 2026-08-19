@@ -26,14 +26,20 @@ merge_radius_m: 10.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster
                               # === 2026-08-19: 15 → 10 (实机:小范围目标更稳) ===
                               # 实机两次飞行观察到远处同 label 投影噪声大,
                               # 10m 兼顾"同车跟踪稳定"+"远距不误合并"。
-cluster_ttl_sec: 60.0         # 多久无新命中 → 释放 cluster (秒)
-min_hit_count: 10             # 同 cluster 被检测到这么多次才晋升为正式目标
+cluster_ttl_sec: 120.0        # 多久无新命中 → 释放 cluster (秒)
+                              # === 2026-08-19: 60 → 120 (实机:防打击瞬间死掉) ===
+                              # 问题:target_estimator TTL 默认 60s,但本 bag 实测 cluster 8
+                              # 在 strike 前 14s 死掉(可能 promoted 状态被某种边界清掉)。
+                              # 拉到 120s 给"飞过去再打"留两分钟 buffer。
+min_hit_count: 15             # 同 cluster 被检测到这么多次才晋升为正式目标
                               # === 2026-07-16: 误检门禁 ===
                               # 10Hz yolo 下 20 hits ≈ 2s 持续命中,误检基本进不来;
                               # 真目标在视野停留 3~5s 时稳定晋升。
                               # 单次或零星命中被门禁过滤,不会触发 mission_manager 上报/跟踪。
                               # === 2026-08-19: 15 → 10 (实机:真目标 ~1s 内可达晋升) ===
                               # 设 ≤ 1 关闭门禁(每次命中都晋升,等价于老版行为)。
+                              # === 2026-08-19 (本日): 10 → 15 (TTL 拉长后晋升门槛同步抬高) ===
+                              # 15 hit ≈ 1.5s 持续命中,降低合并抖动导致的伪晋升。
 tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后多久丢弃 (秒)
                               # 比 cluster_ttl_sec 短得多 — tentative 没有发过 cluster_event,
                               # mission_manager 不感知,过期丢弃对上游无影响。

@@ -219,6 +219,10 @@ public:
                                             &TargetClusterer::missionStateCallback, this);
         waypoint_status_sub_ = nh_.subscribe("waypoint_executor/status", 10,
                                             &TargetClusterer::waypointStatusCallback, this);
+        // === 2026-08-20: 订阅 Attack(105) 原 WP2 GPS,主目标 fallback 用 ===
+        //   mission_manager 在 Attack(105) push 时一次性 latched publish。
+        attack_wp2_sub_     = nh_.subscribe("attack_wp2_gps", 1,
+                                            &TargetClusterer::attackWp2Callback, this);
 
         // 发布
         // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
@@ -807,6 +811,27 @@ public:
             msg->skill_type, msg->state, msg->phase, is_attack_active_ ? "true" : "false");
     }
 
+    // === 2026-08-20: 接收 Attack(105) 原 WP2 GPS (latched 一次) ===
+    //   用于主目标 fallback: 没显式 primary_target 时,选 cluster 中离这个 GPS 最近的。
+    void attackWp2Callback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX) {
+            ROS_WARN_THROTTLE(2.0, "[TargetClusterer] attack_wp2_gps: NavSatFix status < FIX, ignore");
+            return;
+        }
+        attack_wp2_gps_      = *msg;
+        attack_wp2_received_ = true;
+        if (std::isfinite(msg->latitude) && std::isfinite(msg->longitude)) {
+            attack_wp2_gps_valid_ = true;
+            ROS_WARN_THROTTLE(5.0,
+                "[TargetClusterer] attack_wp2_gps received: lat=%.7f lon=%.7f alt=%.2f "
+                "(will pick closest cluster for primary fallback)",
+                msg->latitude, msg->longitude, msg->altitude);
+        } else {
+            attack_wp2_gps_valid_ = false;
+            ROS_WARN_THROTTLE(2.0, "[TargetClusterer] attack_wp2_gps: non-finite lat/lon, ignore");
+        }
+    }
+
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         if (use_sim_) {
             current_uav_pose_.pose.position.x =  msg->pose.position.x;
@@ -915,7 +940,12 @@ public:
         cluster_states_pub_.publish(state);
         target_est_marker_pub_.publish(markers);
 
-        // primary 选择: 优先 primary_cluster_id_, 否则最高置信度 (仅看 promoted)
+        // primary 选择:
+//   1) 优先 primary_cluster_id_ (GS 或 mission_manager 显式指定)
+//   2) fallback 在 Attack 阶段:用 attack_wp2 GPS (latched) 选最近 cluster
+//      (替代旧的"最高置信度" — bag 02-11-07 实测 3 cluster 时挑错,
+//       因为最高置信度可能不是 GS 推的 WP2 处那个)
+//   3) 其他情况:最高置信度 (旧行为)
         const TargetCluster* primary = nullptr;
         if (primary_cluster_id_ != 0) {
             auto it = clusters_.find(primary_cluster_id_);
@@ -924,11 +954,60 @@ public:
             }
         }
         if (primary == nullptr) {
-            for (const auto& kv : clusters_) {
-                const TargetCluster& c = kv.second;
-                if (!c.is_promoted) continue;
-                if (primary == nullptr || c.best_confidence > primary->best_confidence) {
-                    primary = &c;
+            bool used_wp2_fallback = false;
+            if (is_attack_active_ && attack_wp2_gps_valid_ && is_home_locked_) {
+                // WP2 GPS → NWU(相对 home,与 cluster.ned_x/ned_y 同系)
+                //   c.ned_y 是 NWU y = west_m(正值=西)
+                //   GPS lon delta → east_m(正值=东),转换:wp2_nwu_y = -east_m
+                //   bag 02-25-41 复盘:符号反了导致 cluster 3 (N130 E100, WP2 处) 距离
+                //   被算成 200m,所有 cluster 越界 sanity range,fallback 回最高置信度。
+                constexpr double DEG_PER_M_LAT = 1.0 / 111320.0;
+                const double cos_lat = std::cos(home_gps_.latitude * M_PI / 180.0);
+                if (std::isfinite(cos_lat) && std::fabs(cos_lat) > 1e-9) {
+                    const double deg_per_m_lon = DEG_PER_M_LAT / cos_lat;
+                    const double wp2_n = (attack_wp2_gps_.latitude - home_gps_.latitude) /
+                                          DEG_PER_M_LAT;
+                    const double wp2_east_m = (attack_wp2_gps_.longitude - home_gps_.longitude) /
+                                              deg_per_m_lon;
+                    const double wp2_nwu_y = -wp2_east_m;  // NWU y = west_m
+                    constexpr double kWp2SanityRange = 100.0;  // m
+                    const TargetCluster* closest = nullptr;
+                    double closest_dist_sq = std::numeric_limits<double>::infinity();
+                    for (const auto& kv : clusters_) {
+                        const TargetCluster& c = kv.second;
+                        if (!c.is_promoted) continue;
+                        const double dx = c.ned_x - wp2_n;
+                        const double dy = c.ned_y - wp2_nwu_y;
+                        const double dist_sq = dx*dx + dy*dy;
+                        if (dist_sq < closest_dist_sq) {
+                            closest_dist_sq = dist_sq;
+                            closest = &c;
+                        }
+                    }
+                    if (closest != nullptr &&
+                        closest_dist_sq < kWp2SanityRange * kWp2SanityRange) {
+                        primary = closest;
+                        used_wp2_fallback = true;
+                        ROS_INFO_THROTTLE(2.0,
+                            "[TargetClusterer] Primary fallback: closest-to-WP2 cluster_id=%lu "
+                            "(dist=%.1fm, WP2 lat=%.7f lon=%.7f)",
+                            closest->id, std::sqrt(closest_dist_sq),
+                            attack_wp2_gps_.latitude, attack_wp2_gps_.longitude);
+                    } else {
+                        ROS_WARN_THROTTLE(5.0,
+                            "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS, "
+                            "falling back to highest-confidence",
+                            kWp2SanityRange);
+                    }
+                }
+            }
+            if (primary == nullptr) {
+                for (const auto& kv : clusters_) {
+                    const TargetCluster& c = kv.second;
+                    if (!c.is_promoted) continue;
+                    if (primary == nullptr || c.best_confidence > primary->best_confidence) {
+                        primary = &c;
+                    }
                 }
             }
         }
@@ -1019,6 +1098,7 @@ private:
     ros::Publisher target_est_marker_pub_;
     ros::Publisher raw_det_marker_pub_;          // 单帧识别 (红色点)
     ros::Publisher target_est_gps_pub_;
+    ros::Subscriber attack_wp2_sub_;             // /attack_wp2_gps → Attack 阶段原 WP2 GPS (NavSatFix, latched)
     //===================制导修改====================
     ros::Publisher primary_image_target_pub_;
     //===================制导修改====================
@@ -1030,6 +1110,13 @@ private:
     sensor_msgs::NavSatFix      current_gps_;
     sensor_msgs::NavSatFix      home_gps_;     // PX4 home, 锁一次作为 GPS 输出的参考原点
     bool                       is_home_locked_ = false;
+    // === 2026-08-20: Attack 阶段原 WP2 GPS (GS 推的 cluster 位置) ===
+    //   由 mission_manager 在 Attack(105) push 时一次性 latched publish,
+    //   主目标选取 fallback 用:在 primary_target topic 没人推时,优先选 cluster
+    //   中离 attack_wp2_gps_ 最近的(而不是"最高置信度")。
+    sensor_msgs::NavSatFix      attack_wp2_gps_;
+    bool                        attack_wp2_received_ = false;
+    bool                        attack_wp2_gps_valid_ = false;
     double                      current_gimbal_pitch_ = 0.0;
     bool is_uav_pose_received_    = false;
     bool is_gps_received_         = false;

@@ -54,15 +54,39 @@ xte_damping_min_along_fraction: 0.0
 
 # ===== 航向 P-controller(机头跟踪 vx/vy 反算 bearing)=====
 #   yaw_max_rate: 角速度饱和上限(rad/s),避免 P 输出过旋转。
+#     === 2026-08-19: 0.5 → 1.0 (Fix A) ===
+#     0.5 rad/s 太慢,154° 偏差需 5.4s,UAV 沿旧方向漂 75m。
+#     1.0 rad/s (≈57°/s) 给 PX4 物理上限 (~3 rad/s) 留 3 倍余量,
+#     残差由 Fix C 预转向彻底消除。1.5 偏激进,YAW 速率饱和后 PX4
+#     内环可能短暂姿态震荡。
 #   yaw_kp: 转弯期 yaw 跟踪 bearing 的紧度。
 #     增大 → 航向跟踪更紧(转弯期 yaw 更快对齐速度方向,减小侧滑);
 #     过大会震荡(原硬编码 2.0 → 推荐 3.0)。
 #   yaw_deadband: 航向误差死区(rad),低于此值不旋转,避免小幅抖动。
 #     0.02 rad ≈ 1.15°;过大死区会让 L1=18m 下 XTE<0.9m 时 yaw 不响应,
 #     产生 0.85 Hz 极限环;过小(< 0.01)会让 yaw 控制器对 XTE 抖动敏感。
-yaw_max_rate: 0.5
+yaw_max_rate: 1.0
 yaw_kp: 3.0
 yaw_deadband: 0.02
+
+# ===== 速度斜坡 (2026-08-19 Fix B) =====
+#   publish path 上饱和 |Δv_horiz| ≤ vel_slew_max_horiz_accel × dt,
+#   |Δvz| ≤ vel_slew_max_vert_accel × dt,把段切换 / phase 切换的硬切阶
+#   跃在 2~3 s 内铺平,避免 PX4 OFFBOARD 收到 19 m/s 单 tick 跳变。
+#   正常 L1 控制 delta 在 0.05~0.1 m/s/tick,远低于限幅 → 透明;
+#   仅段切换 (>5 m/s 跳变) 时启动斜坡。
+#   不影响压线:XTE 反馈由 L1 τ=2.5s 决定稳态,~100ms 斜坡窗口里
+#   XTE 漂移可忽略。
+vel_slew_max_horiz_accel: 8.0   # m/s²,水平速度斜坡上限 (≈ tick 0.16 m/s)
+vel_slew_max_vert_accel: 4.0    # m/s²,垂直速度斜坡上限
+
+# ===== WP1 预转向 (2026-08-19 Fix C) =====
+#   接近 WP1(段末 / 相切换)< pre_align_radius_ 起,blend desired_yaw 朝
+#   下一段方向(WP1→WP2 direction),smoothstep 让到达 WP1 时 desired_yaw
+#   已经对齐,无阶跃切换。154° 转弯变成"接近过程里慢慢转",UAV 不再
+#   在 WP1 瞬间换向。
+#   仅 attack (skill 105) 且下一段存在时启用,不影响搜索模式。
+pre_align_radius: 30.0           # m,WP1 预转向触发半径
 
 # 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
 lidar_building_avoidance_enabled: false

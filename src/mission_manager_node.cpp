@@ -237,6 +237,17 @@ struct SkillRuntime {
     double                   attack_point_lon_ = 0.0;
     double                   attack_point_alt_ = 0.0;
 
+    // === 2026-08-20: GS 推送的 Attack 原始 WP2 GPS(目标 cluster 坐标) ===
+    //   planCoordinatedAttack 之后 sr.msg.skill_area_path.poses.back() 被改成 attack_point,
+    //   原始 WP2(目标 GPS)丢失。这里在 taskFlowCallback 排队时缓存,用于:
+    //     1) 发布到 /attack_wp2_gps 给 target_estimator 做主目标 fallback 选取
+    //   与 attack_point_* 区别:attack_point_* 是 UAV 的进场点(formation=2 才有);
+    //   attack_target_gps_* 是 GS 推送的目标 GPS,所有 formation 都用。
+    bool                     attack_target_gps_valid_ = false;
+    double                   attack_target_lat_ = 0.0;
+    double                   attack_target_lon_ = 0.0;
+    double                   attack_target_alt_ = 0.0;
+
     // === CODEX DIRECT-LOOK START ===
     // Attack(105) 收到后先原地朝 WP2 观察。预检期间尚未把 Skill 下发给
     // waypoint_executor，避免飞机先向 WP1 窜动；超时后再原样下发旧路径。
@@ -345,6 +356,12 @@ private:
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
     bool waiting_for_waypoint_velocity_handoff_ = false;
     bool waiting_for_guidance_velocity_handoff_ = false;
+    // === 2026-08-19: armVehicle(true) 同步写 armed=true (L5323) 后,mavros/state cb
+    //   可能在 1 秒内报 armed=false (PX4 还没回报 armed=true),触发下面 1591 行的
+    //   disarm 守卫 → TAKING_OFF 被错误重置 → PX4 卡 AUTO.RTL (uav0_strike_19-17-36.bag)。
+    //   修法:armVehicle(true) 成功时设 arming_transition_until_=now+2.0s,mavrosStateCallback
+    //   在窗口内 disarm 守卫被抑制;窗口外或 armed=true 后自动失效,正常 disarm 仍触发。
+    ros::Time arming_transition_until_;
 
     // ==============
 
@@ -355,6 +372,16 @@ private:
     ros::Publisher guidance_target_pub_;
     ros::Publisher target_filter_debug_pub_;   // 2026-07-16: 位置滤波前后对比 debug topic
     ros::Publisher guidance_speed_pub_;  // 拦截速度(下发到 guidance_control)
+    // === 2026-08-20: Attack(105) WP1→WP2 强制 guidance (always-on) ===
+    //   user 要求:从 WP1 飞 WP2 的过程中一定要开 guidance,无论 cluster 是否 lock。
+    //   绕过 triggerStrike() 的 locked_cluster_id_ gate (L3156-3159)。
+    //   当 cluster 还没 lock 时,本节点用 WP2 自身作为 PN 目标,以
+    //   /wp2_fallback/target_pose (PoseStamped NWU) 喂给 guidance_control_node。
+    //   cluster 一旦 lock (locked_cluster_id_ != 0) 或 guidance disable,本通道自动停。
+    ros::Publisher wp2_fallback_target_pub_;
+    ros::Timer      wp2_fallback_timer_;        // 10 Hz,publish WP2 NWU
+    bool            wp2_fallback_active_  = false;
+    geometry_msgs::PoseStamped wp2_fallback_pose_;  // cached WP2 in NWU
     ros::Publisher emergency_stop_pub_;
     ros::Publisher status_pub_;
     ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
@@ -369,6 +396,15 @@ private:
     //   改为复用 InterUavStatus.phase(机间避障同一条总线),UavGatherStatus 不再参与数据通路。
     ros::Publisher primary_target_pub_;      // 主目标 cluster_id → target_estimator (UInt64)
                                              // 0 = mission 未指定主目标(estimator 回退最高置信度)
+
+    // === 2026-08-20: Attack(105) 原 WP2 GPS → target_estimator,用于主目标选取 ===
+    //   user 反馈:Attack 推送时 GS 给的 WP2 GPS 就是用户要打的那个 cluster 的坐标,
+    //   estimator 在没有显式 primary_target 时回退"最高置信度"会挑错目标(典型: WP2 处
+    //   的 cluster 置信度排第 2、第 3,estimator 选了别的 cluster)。
+    //   修法:把 Attack 的原始 WP2 GPS 一次性 latched publish 到 /attack_wp2_gps,
+    //   estimator 收到后用作 fallback "选 cluster 中离这个 GPS 最近的"。
+    ros::Publisher attack_wp2_pub_;
+    bool          attack_wp2_published_ = false;  // 一次性 publish 标志(防重复)
 
     // === Search(102) 云台俯仰角下发(2026-07-29) ===
     //   102 IN_TASK 期间:publish sr.msg.gimbal_pitch(度)
@@ -746,6 +782,12 @@ private:
     //   → AUTO.LAND failsafe。复用 attack_hover 同样的 latch 模式:startSetpointPublisher
     //   锁当前位置 + 50Hz 喂 OFFBOARD 心跳,resume 时再停。
     bool        target_lost_hover_setpoint_latched_ = false;
+    // === 2026-08-19 Fix A1: STRIKE yaw pre-align 期间 setpoint_thread 必须继续发 ===
+    //   startGuidanceApproach 检测到 yaw_diff>30° 时,把 takeoff_setpoint_ orientation
+    //   强制改 = target_bearing,启 setpoint_publisher 50Hz 锁航向 ~1s,期间 phase 已被
+    //   切到 GUIDANCE_STRIKE,position_phase 闸门 false 会让 setpoint_thread 停摆 →
+    //   PX4 OFFBOARD 失流 failsafe。这个 latch 让闸门在那 1s 内保持 true。
+    bool        strike_yaw_align_pending_         = false;
 
     // === Attack(105) 多机协同参数 ===
     double      attack_safety_margin_m_         = 3.0;   // 协同:每架距目标保留距离
@@ -831,6 +873,7 @@ public:
         takeoff_retry_delay_(5.0),
         takeoff_failed_logged_(false),
         is_landing_in_progress_(false),
+        arming_transition_until_(ros::Time()),
         landing_start_time_(ros::Time()),
         landing_complete_logged_(false),
         landing_already_triggered_(false),
@@ -1191,6 +1234,13 @@ public:
         guidance_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "guidance/target_pose", 10);
 
+        // === 2026-08-20: WP2 fallback target (NWU) for Attack(105) always-on guidance ===
+        wp2_fallback_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
+            "wp2_fallback/target_pose", 10);
+        wp2_fallback_timer_ = nh_.createTimer(
+            ros::Duration(0.1), &MissionManager::wp2FallbackTimerCallback, this,
+            /*oneshot=*/false, /*autostart=*/false);
+
         target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
             "mission/target_filter_debug", 10);
 
@@ -1246,6 +1296,12 @@ public:
         // 最高置信度在目标间跳变。
         primary_target_pub_ = nh_.advertise<std_msgs::UInt64>(
             "mission/primary_target", 10);
+
+        // === 2026-08-20: Attack(105) 原 WP2 GPS → target_estimator(latched) ===
+        //   target_estimator 启动可能晚于 mission_manager,latch=true 让 estimator
+        //   一旦订阅就立刻拿到 WP2 GPS,不依赖时序。
+        attack_wp2_pub_ = nh_.advertise<sensor_msgs::NavSatFix>(
+            "attack_wp2_gps", 1, /*latch=*/true);
 
         // === 云台俯仰角下发(2026-07-29) ===
         //   102 Search IN_TASK → publish sr.msg.gimbal_pitch(度)
@@ -1582,7 +1638,16 @@ public:
         //     - runPx4TakeoffSequence 在 2964 行门控早 return,起飞卡死;用户看到的现象:
         //         "triggerOffboardAndArm SUCCESS 之后立刻 UAV disarmed on landing → AUTO.LAND"
         //   只有 armed 从 1→0 的真 disarm 才需要 reset (PX4 真的飞不起来),初始 0 不是 disarm 事件。
-        if (!msg->armed && was_armed) {
+        //
+        // === 2026-08-19 fix: arming_transition_until_ 抑制窗口 ===
+        //   08-17 在 armVehicle() 同步写 armed=true 后,本 cb 可能在窗口内看到
+        //   was_armed=true(cache) + msg->armed=false (PX4 未回报) → 误触发 disarm。
+        //   arming_transition_until_ 在 armVehicle(true) 成功时设 now+2.0s,期间
+        //   抑制守卫。窗口外(>2s)或 armed=true 真的回报后守卫自动恢复 → 真 disarm
+        //   仍能正常处理(RETURNING→AUTO.LAND 等场景)。
+        const bool in_arming_transition = !arming_transition_until_.isZero() &&
+                                          ros::Time::now() < arming_transition_until_;
+        if (!msg->armed && was_armed && !in_arming_transition) {
             ROS_WARN("[MissionManager] UAV disarmed (mode=%s prev_phase=%s) — "
                      "cancelling guidance and stale TaskFlow",
                      msg->mode.c_str(), missionPhaseToString().c_str());
@@ -1969,6 +2034,8 @@ public:
         // === 新 TaskFlow:重置 Attack(105) WP2-gate + 云台状态(2026-07-30) ===
         attack_wp2_target_seen_      = false;
         attack_wp1_reached_          = false;
+        // === 2026-08-20: 新 Attack flow 允许重新 publish WP2 GPS ===
+        attack_wp2_published_        = false;
         attack_wp1_reached_time_     = ros::Time();
         attack_strike_phase_active_  = false;
 
@@ -2006,6 +2073,21 @@ public:
             //   - partners 列表 fallback 到 launch 私有 param ~expected_sns(空时退化为单机)
             if (s.skill_type == 105) {
                 sr.attack_phase_ = SkillRuntime::AttackPhase::IDLE;
+                // === 2026-08-20: 缓存 GS 推送的 Attack 原始 WP2 GPS(目标 cluster) ===
+                //   planCoordinatedAttack(formation=2) 会把 skill_area_path.poses.back()
+                //   改成本机 attack_point,原始目标 GPS 在那之后会丢失,这里提前缓存。
+                //   即便 formation=0 不调 planCoordinatedAttack,这里也赋值,
+                //   publish 入口统一读 attack_target_*_,处理路径无分叉。
+                if (!s.skill_area_path.poses.empty()) {
+                    const auto& wp2 = s.skill_area_path.poses.back().pose.position;
+                    if (std::isfinite(wp2.x) && std::isfinite(wp2.y) &&
+                        std::isfinite(wp2.z)) {
+                        sr.attack_target_lat_ = wp2.x;
+                        sr.attack_target_lon_ = wp2.y;
+                        sr.attack_target_alt_ = wp2.z;
+                        sr.attack_target_gps_valid_ = true;
+                    }
+                }
                 auto full_partners = parseDevicesSnFromParamsJson(s.params_json);
                 if (full_partners.empty()) {
                     full_partners = expected_sns_;  // fallback
@@ -2273,6 +2355,30 @@ public:
         if (sr.msg.skill_type == 100 || sr.msg.skill_type == 106) {
             return;
         }
+        // === 2026-08-20: Attack(105) 原 WP2 GPS → target_estimator (一次性 latched) ===
+        //   user 反馈:"primary cluster 不能随便选,应该从我已有的里面选在 WP2 范围之内的"。
+        //   estimator 在 primary_target topic 没人推时会回退"最高置信度",导致挑错目标
+        //   (典型: 多个 cluster 同时在视野,WP2 处的 cluster 置信度只排第 2)。
+        //   这里把 GS 推送的原始 WP2 GPS(sr.attack_target_*) 发布一次,latched,estimator
+        //   启动晚于 mission_manager 也能拿到。
+        if (sr.msg.skill_type == 105 && !attack_wp2_published_ &&
+            sr.attack_target_gps_valid_) {
+            sensor_msgs::NavSatFix wp2_msg;
+            wp2_msg.header.stamp    = ros::Time::now();
+            wp2_msg.header.frame_id = "wgs84";
+            wp2_msg.status.status   = sensor_msgs::NavSatStatus::STATUS_FIX;
+            wp2_msg.status.service  = sensor_msgs::NavSatStatus::SERVICE_GPS;
+            wp2_msg.latitude        = sr.attack_target_lat_;
+            wp2_msg.longitude       = sr.attack_target_lon_;
+            wp2_msg.altitude        = sr.attack_target_alt_;
+            wp2_msg.position_covariance_type =
+                sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+            attack_wp2_pub_.publish(wp2_msg);
+            attack_wp2_published_ = true;
+            ROS_WARN("[MissionManager] Attack(105) WP2 GPS published to /attack_wp2_gps: "
+                     "lat=%.7f lon=%.7f alt=%.2f (estimator will use for primary fallback)",
+                     sr.attack_target_lat_, sr.attack_target_lon_, sr.attack_target_alt_);
+        }
         // === Attack(105) formation=2 协同:实时规划 attack_point + strike_sync_time ===
         //   仅 attack_partners_ 非空时执行(空 → 退化为 formation=0 单机);
         //   若 partner 心跳未收齐则稍后重试(本 tick 不推 executor)。
@@ -2288,6 +2394,14 @@ public:
         // 在航点下发前降低 WP1 准备高度，使无人机飞向 WP1 的同时完成预下降。
         // 该计算幂等，pushCurrentSkillToExecutor() 重试不会继续累积降低高度。
         if (sr.msg.skill_type == 105) {
+            // === 2026-08-19: WP1 swap if UAV closer to WP2 than WP1 ===
+            //   接到 Attack 时若 UAV 已经过 WP1 或更靠近 WP2(典型: U 形路线刚好路过
+            //   WP2 附近才接指令),把 WP1.x/y 重写到 UAV 当前位置 → waypoint_executor
+            //   立即认为 "WP1 reached" → 进入 SKILL_AREA 段直飞 WP2。节省 14-15s 来回。
+            //   22-08-54 bag 实测:21s (东飞 → 掉头西飞 WP1 → 掉头东飞 WP2) 缩到 6-7s。
+            //   wp1.z 不动 — pre-descent 会按新的 horizontal (UAV→WP2) 重算合理高度,
+            //   若 UAV 已低于 planned_wp1_alt 则不强制降低,executor 自然处理过渡。
+            rewriteWp1ToUavIfCloserToWp2(sr);
             applyAttackPreDescentToWp1(sr);
         }
         //=======高度下降===========//
@@ -2543,9 +2657,43 @@ public:
             return;
         }
 
-        const double north = gpsDeltaN(wp1.x, wp2.x);
-        const double east = gpsDeltaE(wp1.y, wp2.y, 0.5 * (wp1.x + wp2.x));
-        const double horizontal_distance = std::hypot(north, east);
+        const double wp1_to_wp2_n = gpsDeltaN(wp1.x, wp2.x);
+        const double wp1_to_wp2_e = gpsDeltaE(wp1.y, wp2.y, 0.5 * (wp1.x + wp2.x));
+        const double horizontal_distance = std::hypot(wp1_to_wp2_n, wp1_to_wp2_e);
+
+        // === 2026-08-20: 几何门 — 仅当 UAV 大致在 WP1→WP2 连线上才预降 ===
+        //   user 反馈:预降只在"UAV→WP1→WP2 三点接近共线"时有意义。
+        //   - UAV off-axis (垂直距离大): 预降只会让 UAV 在错的水平位置下沉到 strike 高度,
+        //     之后 PN 还得把 UAV 拉回目标,既浪费油又错过平滑下沉窗口。off-axis 时直接跳过,
+        //     让 PN 在 strike 阶段自然下沉。
+        //   - UAV 在 WP1 反向 (scalar<0): UAV 要先飞回 WP1,WP1 降高没意义。
+        //   - horizontal≈0 (UAV 已在 WP1 上方) 也跳过:没什么可降的。
+        if (is_gps_received_ && horizontal_distance > 1.0) {
+            const double uav_n_from_wp1 = gpsDeltaN(wp1.x, current_gps_.latitude);
+            const double uav_e_from_wp1 = gpsDeltaE(wp1.y, current_gps_.longitude, wp1.x);
+            const double dot = uav_n_from_wp1 * wp1_to_wp2_n +
+                               uav_e_from_wp1 * wp1_to_wp2_e;
+            const double scalar = dot / (horizontal_distance * horizontal_distance);
+            const double perp_n = uav_n_from_wp1 - scalar * wp1_to_wp2_n;
+            const double perp_e = uav_e_from_wp1 - scalar * wp1_to_wp2_e;
+            const double perp_dist = std::hypot(perp_n, perp_e);
+
+            constexpr double kPerpThreshold = 30.0;  // m, off-axis 阈值
+            constexpr double kScalarMin     = -0.1;  // UAV 必须在 WP1 附近或朝 WP2 方向
+            if (perp_dist > kPerpThreshold) {
+                ROS_INFO("[MissionManager] Attack pre-descent skipped: UAV %.1fm off "
+                         "WP1→WP2 line (perp>%.1fm threshold), let PN handle descent",
+                         perp_dist, kPerpThreshold);
+                return;
+            }
+            if (scalar < kScalarMin) {
+                ROS_INFO("[MissionManager] Attack pre-descent skipped: UAV behind WP1 "
+                         "(scalar=%.2f < %.2f), must fly back over WP1 before strike",
+                         scalar, kScalarMin);
+                return;
+            }
+        }
+
         const double allowed_height_above_target =
             horizontal_distance * strike_descent_rate_ / speed;
         const double planned_wp1_alt = wp2.z + allowed_height_above_target;
@@ -2564,6 +2712,64 @@ public:
                      wp1.z, planned_wp1_alt, horizontal_distance,
                      speed, strike_descent_rate_);
         }
+    }
+
+    /**
+     * 接到 Attack 指令时,若 UAV 已经离 WP2 比 WP1 更近,把 WP1 重写到 UAV 当前位置,
+     * 让 waypoint_executor 立即"到达 WP1" → 下一段直飞 WP2。省掉绕路耗时
+     * (22-08-54 bag 实测 21s 缩到 ~6-7s)。
+     *
+     * 安全守卫 (用户提的"目标自己没见过 / LOS 被遮挡"场景):
+     *  - 仅 Attack (105)
+     *  - 当前 target_estimator 已锁定 (current_target_.is_locked=true)
+     *      - 目标没见过的场景 → is_locked=false → 不换,保留 WP1 绕行
+     *      - LOS 被遮挡场景     → YOLO 收不到 → is_locked=false → 不换,保留 WP1 绕行
+     *  - UAV pose 已收 + WP1/WP2 finite
+     *  - dWP2 < dWP1 (几何前提)
+     *
+     * WP1.z 不动 — applyAttackPreDescentToWp1 用新的 horizontal (UAV→WP2)
+     * 重算可行高度,UAV 已低于 planned 时 planned < wp1.z 失败,不强制下沉。
+     * 该函数幂等 (pushCurrentSkillToExecutor 重试时 dWP1=0, dWP2 > 0, 不再触发)。
+     */
+    void rewriteWp1ToUavIfCloserToWp2(SkillRuntime& sr) {
+        // === 2026-08-20: 拿掉 is_locked 守门 ===
+        //   user 口径:"WP2 一定有 cluster,坐标系对了就有";攻击推到时刻 UAV 已经在
+        //   飞 WP2 的航路上时,WP1 直接改写到 UAV 当前位置,省掉绕路。
+        //   之前 gate 在 is_locked 上,但 bag 01-13-37 走 search 路径 cluster 没 lock,
+        //   导致攻击推到 WP1 之间仍保留原 WP1 → UAV 绕回 WP1 再去 WP2。
+        //   现在无条件按几何判定 (dWP2 < dWP1 即改写)。
+        if (sr.msg.skill_type != 105 ||
+            sr.msg.skill_area_path.poses.size() < 2 ||
+            !is_pose_received_) {
+            return;
+        }
+        auto& wp1 = sr.msg.skill_area_path.poses.front().pose.position;
+        const auto& wp2 = sr.msg.skill_area_path.poses.back().pose.position;
+        if (!std::isfinite(wp1.x) || !std::isfinite(wp1.y) ||
+            !std::isfinite(wp2.x) || !std::isfinite(wp2.y)) {
+            return;
+        }
+        const double cur_x = current_pose_.pose.position.x;
+        const double cur_y = current_pose_.pose.position.y;
+        const double d_wp1 = std::hypot(wp1.x - cur_x, wp1.y - cur_y);
+        const double d_wp2 = std::hypot(wp2.x - cur_x, wp2.y - cur_y);
+        if (d_wp2 >= d_wp1) {
+            ROS_INFO_THROTTLE(2.0,
+                "[MissionManager] WP1 swap not triggered: dWP2=%.1fm >= dWP1=%.1fm "
+                "(WP1 still closer, keep original route)",
+                d_wp2, d_wp1);
+            return;
+        }
+        ROS_WARN("[MissionManager] Attack WP1 swap (cluster locked): "
+                 "UAV closer to WP2 (%.1fm) than WP1 (%.1fm); "
+                 "rewrite WP1 to current UAV pos (%.3fN, %.3fE, alt=%.2f); "
+                 "original WP1 was (%.3fN, %.3fE, alt=%.2f)",
+                 d_wp2, d_wp1,
+                 cur_x, cur_y, current_pose_.pose.position.z,
+                 wp1.x, wp1.y, wp1.z);
+        wp1.x = cur_x;
+        wp1.y = cur_y;
+        // wp1.z 不动 — 交给 applyAttackPreDescentToWp1() 按新 horizontal 重算
     }
     //=======高度下降===========//
 
@@ -2892,6 +3098,20 @@ public:
                     }
                 }
                 ROS_WARN("[MissionManager] AttackCmd action=0 (打) — triggering strike");
+                // === 2026-08-19 Fix B: STRIKE 接管前 yield 旧 waypoint_executor 速度源 ===
+                //   背景:HOLDING 之后 waypoint_executor 处于 stop 状态,triggerStrike →
+                //   startGuidanceApproach 只 publish enable=true,**没动 waypoint_executor**,
+                //   case 1/2 (忽略/暂存) 路径会 yield ([mission_manager_node.cpp:2940]),
+                //   case 0 缺这一步。结果:guidance 第一帧到位时 waypoint_executor 还在
+                //   is_executing_=false 状态不会主动让位,后续 guidance_velocity_active 回调
+                //   会 yield,但第一次 setpoint 交接存在 race。提前 yield 让 waypoint_executor
+                //   在 enable 之前就闭嘴,避免任何残留速度与 guidance 同时发。
+                {
+                    std_msgs::String yield_cmd;
+                    yield_cmd.data = "yield_to_guidance";
+                    waypoint_control_pub_.publish(yield_cmd);
+                    ROS_WARN("[MissionManager]   - STRIKE: yielded waypoint_executor before guidance enable");
+                }
                 triggerStrike();
                 detect_target_pub_.publish(dt);
                 {
@@ -3349,6 +3569,11 @@ public:
                 locked_cluster_id_            = cluster.cluster_id;
                 locked_cluster_time_          = ros::Time::now();
                 locked_cluster_last_seen_us_  = cluster.last_seen_us;
+                // === 2026-08-20: cluster lock 后立即停 WP2 fallback ===
+                //   真实 cluster 已锁,target_estimator 会通过 target_estimated_pose
+                //   接管 PN 目标。fallback 通道在 disableGuidance() 集中处理之外,
+                //   这里也直接 stop 一次,保证 PN 在 cluster 接管时不再有 WP2 干扰。
+                stopWp2Fallback("cluster locked");
                 // 当前 cluster_id 加入 strike_dispatched_(C1 拆分容器),避免同一 cluster 反复 transfer 触发 startGuidanceApproach
                 strike_dispatched_[cluster.cluster_id] = -1;
                 // === 多目标: 通知 estimator 主目标 cluster_id 转移 ===
@@ -5094,7 +5319,8 @@ public:
                     current_phase_ == MissionPhase::PHASE_TAKING_OFF ||
                     current_phase_ == MissionPhase::PHASE_HOVERING ||
                     current_phase_ == MissionPhase::PHASE_HOLDING ||
-                    waiting_for_waypoint_velocity_handoff_;
+                    waiting_for_waypoint_velocity_handoff_ ||
+                    strike_yaw_align_pending_;  // 2026-08-19 Fix A1
                 const bool armed = use_sim_ || current_mavros_state_.armed;
                 if (armed && position_phase) {
                     takeoff_setpoint_pub_.publish(takeoff_setpoint_);
@@ -5300,6 +5526,17 @@ public:
             //   修法:这里直接同步写 current_mavros_state_.armed,下一拍 state machine
             //   立刻看见 armed=true → 启动 setpoint_thread,衔接零延迟。
             current_mavros_state_.armed = arm;
+            // === 2026-08-19: 设置 disarm 守卫抑制窗口 ===
+            //   同步写 armed=true 之后,mavrosStateCallback 可能在窗口内看到
+            //   was_armed=true (cache) + msg->armed=false (PX4 还没回报) →
+            //   触发下面 1591 行的误 disarm → TAKING_OFF 被错误 reset。设一个
+            //   2s 抑制窗口,只挡 TAKING_OFF 阶段的 race,不挡其他阶段的真 disarm。
+            if (arm) {
+                arming_transition_until_ = ros::Time::now() + ros::Duration(2.0);
+                ROS_INFO("[MissionManager] arming transition window armed (2.0s, suppress disarm guard)");
+            } else {
+                arming_transition_until_ = ros::Time();  // disarm 时清空,正常守卫
+            }
             return true;
         }
 
@@ -5897,6 +6134,11 @@ public:
                     ROS_WARN("[MissionManager] Attack(105) WP1 reached (skill_idx=%u), "
                              "gimbal will look at WP2 after %.1fs",
                              latest_wp_status_->skill_idx, attack_wp2_look_delay_sec_);
+                    // === 2026-08-20: WP1→WP2 必开 guidance (always-on) ===
+                    //   user 口径:从 WP1 飞 WP2 一定要开 guidance,无论 cluster 是否 lock。
+                    //   绕过 triggerStrike() 的 locked_cluster_id_ gate,startGuidanceApproach()
+                    //   内启 fallback 通道,把 WP2 自身作为 PN 目标。
+                    enterGuidanceForAttackWp1toWp2(sr);
                 }
 
                 // skill_type=101 集结合:本机先到点进入 HOLDING,再等伙伴 HOLDING 或 timeout
@@ -5981,6 +6223,15 @@ public:
                         //===================制导修改====================
                         // 全程没有形成可打目标时，WP2 本身就是必执行 Attack 的世界坐标
                         // 兜底点。到达 WP2 即完成本次技能，不再无限 IN_TASK/悬停等待。
+                        // === 2026-08-20: WP2 fallback 已开启时 (always-on guidance) ===
+                        //   user 要求 WP1→WP2 必开 guidance,此时 is_guidance_active_=true,
+                        //   上面那个 `!is_guidance_active_` 守卫进不来。先 disable guidance,
+                        //   让 L6110 的 EXIT_PENDING 分支在同一 tick 接管。
+                        if (wp2_fallback_active_) {
+                            ROS_WARN("[MissionManager] Attack(105) WP2-reached cleanup: "
+                                     "always-on guidance disable before EXIT_PENDING");
+                            disableGuidance();
+                        }
                         if (!is_guidance_active_ && locked_cluster_id_ == 0) {
                             sr.state = SkillState::EXIT_PENDING;
                             sr.state_enter_time = now;
@@ -6503,10 +6754,82 @@ public:
         speed_msg.data = static_cast<float>(guidance_speed_);
         guidance_speed_pub_.publish(speed_msg);
 
-        // 使能制导
-        std_msgs::Bool enable;
-        enable.data = true;
-        guidance_enable_pub_.publish(enable);
+        // === 2026-08-19 Fix A1: STRIKE 接管前先把 yaw 锁到目标方位 ===
+        //   背景:waypoint_executor 末尾航向(实测 093° 东)与目标方位(~306° NW)偏差 146°,
+        //   guidance_control_node 接管后 strike_los_max_rate=0.6 rad/s(34°/s)需要 4.3s
+        //   才能把机头转过去,期间 heading 在目标方位外面 → user 观察"航向背对目标"。
+        //   治本:在 enable 之前先 startYawAlignmentPublisher 把 yaw 强制写 = target_bearing,
+        //   PX4 POSCTL 内层会自己转过去(~0.8s),期间 OFFBOARD setpoint 仍按 50Hz 发,
+        //   strike_yaw_align_pending_ 把 position_phase 闸门打开 1s,不让 setpoint_thread 停摆。
+        //   1s 后 stopSetpointPublisher + publish enable,guidance 第一帧下发时机头已对准。
+        bool need_yaw_alignment = false;
+        double align_yaw_enu = 0.0;
+        if (is_pose_received_) {
+            const double dx = current_target_.pose.pose.position.x - current_pose_.pose.position.x;
+            const double dy = current_target_.pose.pose.position.y - current_pose_.pose.position.y;
+            const double horiz = std::hypot(dx, dy);
+            if (horiz > 1e-3) {
+                const double target_yaw_ned = std::atan2(dy, dx);
+                // 当前机头 NED yaw
+                const auto& q = current_pose_.pose.orientation;
+                const double cur_yaw_ned = std::atan2(
+                    2.0 * (q.w * q.z + q.x * q.y),
+                    1.0 - 2.0 * (q.z * q.z + q.x * q.x));
+                double yaw_diff = target_yaw_ned - cur_yaw_ned;
+                yaw_diff = std::atan2(std::sin(yaw_diff), std::cos(yaw_diff));
+                if (std::fabs(yaw_diff) * 180.0 / M_PI > 30.0) {
+                    need_yaw_alignment = true;
+                    align_yaw_enu = M_PI_2 - target_yaw_ned;
+                    while (align_yaw_enu > M_PI)  align_yaw_enu -= 2.0 * M_PI;
+                    while (align_yaw_enu < -M_PI) align_yaw_enu += 2.0 * M_PI;
+                    ROS_WARN("[MissionManager] >>>> STRIKE pre-align: yaw_diff=%.1f° > 30°, "
+                             "force yaw=target_bearing (%.1f° NED / %.1f° ENU) for 1s",
+                             yaw_diff * 180.0 / M_PI,
+                             target_yaw_ned * 180.0 / M_PI,
+                             align_yaw_enu * 180.0 / M_PI);
+                }
+            }
+        }
+
+        if (need_yaw_alignment) {
+            // 复用 startSetpointPublisher 50Hz 线程,start 后立刻覆盖 orientation 为目标 yaw
+            startSetpointPublisher();
+            const double half = 0.5 * align_yaw_enu;
+            takeoff_setpoint_.pose.orientation.x = 0.0;
+            takeoff_setpoint_.pose.orientation.y = 0.0;
+            takeoff_setpoint_.pose.orientation.z = std::sin(half);
+            takeoff_setpoint_.pose.orientation.w = std::cos(half);
+            strike_yaw_align_pending_ = true;
+            // === 2026-08-20 Fix: enable=True 立即发,timer 只做清理 ===
+            //   bag 01-13-37 实测:1s timer 在某些路径下不会 fire(具体原因待查 — 可能是
+            //   oneshot lambda 捕获 this 后被某种 callback 抢占、或 setpoint_thread
+            //   restart 干扰),导致 guidance 全程没 enable=True,UAV 卡在航点+预降高度上。
+            //   治本:enable 立即发,1s timer 仅负责停 setpoint publisher。guidance_control
+            //   收到 enable=True 后立刻出 PN velocity;PX4 OFFBOARD 下最新 setpoint 优先,
+            //   1s 内 guidance velocity 与 mission_manager position setpoint 并存,
+            //   1s 后 setpoint publisher 停,只剩 guidance velocity。PX4 在这 1s 内已完成
+            //   航向预转 (waypoint_executor 改 yaw + POSCTL 内环 ~0.8s 转完)。
+            std_msgs::Bool enable;
+            enable.data = true;
+            guidance_enable_pub_.publish(enable);
+            ROS_WARN("[MissionManager] >>>> STRIKE pre-align: enable=True published, "
+                     "setpoint publisher holds target-yaw for 1s then stops");
+            // 1s 后:只停 position publisher (cleanup),不再 publish enable。
+            ros::Timer oneshot = nh_.createTimer(
+                ros::Duration(1.0),
+                [this](const ros::TimerEvent&) {
+                    strike_yaw_align_pending_ = false;
+                    if (setpoint_running_) stopSetpointPublisher();
+                    ROS_WARN("[MissionManager] >>>> STRIKE pre-align done, "
+                             "setpoint publisher stopped");
+                },
+                /*oneshot=*/true);
+        } else {
+            // 当前机头本来就对着目标方向,直接 enable
+            std_msgs::Bool enable;
+            enable.data = true;
+            guidance_enable_pub_.publish(enable);
+        }
         //========速度修改========
 
         ROS_WARN_THROTTLE(5.0, "[MissionManager] Starting guidance approach to target (mode: %s, guidance_speed_=%.2f)",
@@ -6522,8 +6845,147 @@ public:
         enable.data = false;
         guidance_enable_pub_.publish(enable);
 
+        // === 2026-08-20: WP2 fallback 兜底清理 (统一入口) ===
+        //   任何调用 disableGuidance() 的路径 (disarm / landing / new task_flow /
+        //   completeAttackStrikeIfReached / WP2 reached) 都自动停 fallback 通道,
+        //   避免残留 timer 在 guidance off 后还在喂 PN target。
+        stopWp2Fallback("guidance disabled");
+
         ROS_INFO("[MissionManager] Guidance disabled for SEARCH_ONLY mode");
     }
+
+    //===================制导修改====================
+    // === 2026-08-20: Attack(105) WP1→WP2 强制 guidance (always-on) ===
+
+    /**
+     * 10 Hz 周期 publish WP2 NWU 到 /wp2_fallback/target_pose。
+     * 仅当 wp2_fallback_active_=true 时由 timer 触发;否则 timer 已 stop,不会 publish。
+     */
+    void wp2FallbackTimerCallback(const ros::TimerEvent&) {
+        if (!wp2_fallback_active_) {
+            return;
+        }
+        wp2_fallback_pose_.header.stamp = ros::Time::now();
+        wp2_fallback_pose_.header.frame_id = viz_frame_;
+        wp2_fallback_target_pub_.publish(wp2_fallback_pose_);
+    }
+
+    /**
+     * 把 WP2 GPS 转成 NWU(相对 home)。
+     * 复制 applyAttackPreDescentToWp1 (L2548+) / clusterDistToWp2Meters (L2718+) 的 guard 风格:
+     *   - ref_initialized_ 必须 true (PX4 home 锁过)
+     *   - WP2 lat/lon/alt 必须 finite
+     * 返回 true 表示 NWU 可用,写入 out_nwu。
+     */
+    bool computeWp2Nwu(const geometry_msgs::Pose& wp2_gps,
+                       geometry_msgs::Point& out_nwu) const {
+        if (!ref_initialized_) {
+            return false;
+        }
+        if (!std::isfinite(wp2_gps.position.x) ||
+            !std::isfinite(wp2_gps.position.y) ||
+            !std::isfinite(wp2_gps.position.z)) {
+            return false;
+        }
+        const double north_m = gpsDeltaN(ref_lat_, wp2_gps.position.x);
+        const double east_m  = gpsDeltaE(ref_lon_, wp2_gps.position.y, ref_lat_);
+        // NWU: x=north, y=west (east 取反), z=up (相对 home)
+        out_nwu.x =  north_m;
+        out_nwu.y = -east_m;
+        out_nwu.z =  wp2_gps.position.z - ref_alt_;
+        return std::isfinite(out_nwu.x) && std::isfinite(out_nwu.y) && std::isfinite(out_nwu.z);
+    }
+
+    /**
+     * Attack(105) 进入 WP1→WP2 段时,无条件开 guidance(无论 cluster 是否 lock)。
+     * 这是 user 要求"WP1→WP2 必须开 guidance"的实现入口:
+     *   - 绕过 triggerStrike() 的 locked_cluster_id_ gate (L3156-3159)
+     *   - startGuidanceApproach() 本身无 cluster 检查 (L6573+),可直接调
+     *   - 同步启动 10 Hz WP2 fallback publisher,直到 cluster lock 或 guidance disable
+     *
+     * 调用方:advanceSkillStateMachine() IN_TASK 分支,在 attack_wp1_reached_ 上升沿
+     *        (L6001-6009) 后调用一次(守门 `!wp2_fallback_active_` 保证幂等)。
+     */
+    void enterGuidanceForAttackWp1toWp2(SkillRuntime& sr) {
+        if (wp2_fallback_active_ || is_guidance_active_) {
+            return;  // 幂等守门:已激活则跳过
+        }
+        if (sr.msg.skill_area_path.poses.size() < 2) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] enterGuidanceForAttackWp1toWp2: "
+                                    "skill_area_path<2, skip");
+            return;
+        }
+        const auto& wp2_gps = sr.msg.skill_area_path.poses.back().pose;
+
+        geometry_msgs::Point wp2_nwu;
+        if (!computeWp2Nwu(wp2_gps, wp2_nwu)) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] enterGuidanceForAttackWp1toWp2: "
+                                    "WP2 NWU invalid (ref=%d, finite check failed), skip",
+                                    ref_initialized_ ? 1 : 0);
+            return;
+        }
+
+        // === Pre-set current_target_.pose = WP2 NWU ===
+        //   startGuidanceApproach() 内 yaw 对齐 (L6626-6627) 用 current_target_.pose
+        //   算 target_bearing。若 current_target_ 是 stale/zero,机头会朝原点。
+        //   WP2 = cluster 坐标 (user 口径),先填上让 yaw 对齐朝 WP2。
+        current_target_.is_detected = true;
+        current_target_.is_locked   = false;  // 还没 cluster lock
+        current_target_.pose.pose.position.x = wp2_nwu.x;
+        current_target_.pose.pose.position.y = wp2_nwu.y;
+        current_target_.pose.pose.position.z = wp2_nwu.z;
+        current_target_.pose.pose.orientation.w = 1.0;
+
+        // === 缓存 WP2 NWU + 启动 10 Hz timer ===
+        wp2_fallback_pose_.pose.position = wp2_nwu;
+        wp2_fallback_pose_.pose.orientation.w = 1.0;
+        wp2_fallback_pose_.header.frame_id = viz_frame_;
+
+        // === startGuidanceApproach() (无 cluster lock 守门) ===
+        attack_strike_phase_active_ = true;
+        startGuidanceApproach();  // 内部设 is_guidance_active_=true, 发 enable=true
+
+        // === 启动 fallback publisher (必须在 startGuidanceApproach 之后,保证 enable 已发) ===
+        wp2_fallback_active_ = true;
+        wp2_fallback_timer_.start();
+
+        ROS_WARN("[MissionManager] Attack(105) WP1→WP2 always-on guidance ENABLED "
+                 "(WP2 NWU=(%.2f, %.2f, %.2f), fallback=10Hz /wp2_fallback/target_pose)",
+                 wp2_nwu.x, wp2_nwu.y, wp2_nwu.z);
+    }
+
+    /**
+     * 停 WP2 fallback publisher + timer。cluster lock、guidance disable、
+     * disarm、landing、新 task_flow、WP2 reached 都会调它。
+     * 集中在一处方便 disableGuidance() 复用,避免多处重复 timer.stop()。
+     */
+    void stopWp2Fallback(const char* reason) {
+        if (!wp2_fallback_active_) {
+            return;
+        }
+        wp2_fallback_timer_.stop();
+        wp2_fallback_active_ = false;
+        ROS_WARN("[MissionManager] WP2 fallback stopped (%s)", reason);
+    }
+
+    /**
+     * Attack(105) WP2 已被 waypoint_executor 消耗 (skill_idx >= skill_total) 时,
+     * 关掉 fallback 通道并 disable guidance,让现有 WP2 fallback 完成逻辑 (L6093-6110)
+     * 把 skill 转 EXIT_PENDING。
+     */
+    void exitGuidanceForAttackWp2Reached(SkillRuntime& sr) {
+        if (!wp2_fallback_active_) {
+            return;
+        }
+        if (sr.msg.skill_area_path.poses.size() < 2) {
+            return;
+        }
+        ROS_WARN("[MissionManager] Attack(105) WP2 reached (skill_idx>=skill_total) "
+                 "— disable WP2 fallback + guidance");
+        // 调 disableGuidance() 统一停 fallback + 发 enable=false
+        disableGuidance();
+    }
+    //===================制导修改====================
 
     // void enableGuidance() {
     //     is_guidance_active_ = true;

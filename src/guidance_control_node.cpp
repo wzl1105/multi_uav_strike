@@ -41,6 +41,7 @@ private:
     ros::Subscriber los_angle_sub_;
     ros::Subscriber real_target_sub_;  // 真实目标位置用于评估
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
+    ros::Subscriber wp2_fallback_target_sub_;  // 2026-08-20: WP2 fallback target (NWU PoseStamped)
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber heartbeat_sub_;        // 邻居心跳 /inter_uav/uav_status(替代原 other_uav_poses)
@@ -166,6 +167,14 @@ private:
     geometry_msgs::PoseStamped pn_filtered_target_pose_;
     bool pn_filtered_target_valid_ = false;
     ros::Time pn_last_target_update_time_;
+    // === 2026-08-20: Attack(105) WP1→WP2 强制 guidance 时,接收 mission_manager 发的 WP2 fallback 目标 ===
+    //   绕过 triggerStrike() 的 cluster lock gate,直接用 WP2 自身作为 PN 目标。
+    //   一旦 cluster 被 target_estimator 接管 (target_estimated_pose 持续更新),
+    //   mission_manager 自动停 fallback (cluster lock 路径),这里 wp2_fallback_valid_ 也会 stale timeout。
+    geometry_msgs::PoseStamped wp2_fallback_pose_;
+    bool wp2_fallback_valid_ = false;
+    ros::Time wp2_fallback_last_seen_;
+    double wp2_fallback_stale_timeout_sec_ = 0.5;  // > 100ms publish 周期 ⇒ 视为 mission_manager 停了
     double pn_cluster_stale_timeout_sec_ = 0.5;
     double pn_cluster_stale_speed_scale_ = 0.33;
     bool pn_cluster_stale_latch_ = false;
@@ -616,6 +625,13 @@ public:
             "guidance/primary_image_target", 10,
             &GuidanceControlNode::primaryImageTargetCallback, this);
         //===================制导修改====================
+
+        // === 2026-08-20: WP2 fallback target subscription ===
+        //   Attack(105) WP1→WP2 强制 guidance 路径:cluster 未 lock 时,
+        //   mission_manager 用 WP2 自身作为 PN 目标 publish 到这个 topic。
+        wp2_fallback_target_sub_ = nh_.subscribe(
+            "wp2_fallback/target_pose", 10,
+            &GuidanceControlNode::wp2FallbackTargetCallback, this);
     }
 
     void initPublishers() {
@@ -792,6 +808,57 @@ public:
                 }
             }
         }
+    }
+    //===================制导修改====================
+
+    // === 2026-08-20: WP2 fallback target callback (NWU PoseStamped from mission_manager) ===
+    //   Attack(105) WP1→WP2 always-on guidance 路径:cluster 未 lock 时,
+    //   mission_manager 用 WP2 自身作为 PN 目标 publish,这里同步喂给:
+    //     1. PN 路径:pn_filtered_target_pose_ (经 OneEuro LPF) + pn_last_target_update_time_ = now
+    //     2. image_geo 路径:current_target_pose_ + last_target_pose_receive_time_
+    //   FIFO subscriber ordering 保证此 callback 在 enableCallback 之后触发。
+    //   一旦 cluster 被 target_estimator 接管 (target_estimated_pose 持续更新),
+    //   guidanceTimerCallback 会通过 stale timeout 把 wp2_fallback_valid_ 清掉。
+    void wp2FallbackTargetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        if (!std::isfinite(msg->pose.position.x) ||
+            !std::isfinite(msg->pose.position.y) ||
+            !std::isfinite(msg->pose.position.z)) {
+            ROS_WARN_THROTTLE(2.0, "[Guidance] WP2 fallback: non-finite pose, ignore");
+            return;
+        }
+
+        wp2_fallback_pose_         = *msg;
+        wp2_fallback_valid_        = true;
+        wp2_fallback_last_seen_    = ros::Time::now();
+
+        const double t = msg->header.stamp.isZero()
+            ? ros::Time::now().toSec()
+            : msg->header.stamp.toSec();
+
+        // === PN 路径:经 OneEuro LPF (避免 cold filter 首帧 0, A1/A5) ===
+        pn_filtered_target_pose_ = *msg;
+        pn_filtered_target_pose_.pose.position.x =
+            pn_target_filter_x_.filter(msg->pose.position.x, t);
+        pn_filtered_target_pose_.pose.position.y =
+            pn_target_filter_y_.filter(msg->pose.position.y, t);
+        pn_filtered_target_pose_.pose.position.z =
+            pn_target_filter_z_.filter(msg->pose.position.z, t);
+        pn_filtered_target_valid_    = true;
+        pn_last_target_update_time_  = ros::Time::now();  // FIFO 在 enableCallback 之后
+
+        // === image_geo 路径:同步 current_target_pose_ 让 strike_target_latched_valid_ 也走通 ===
+        current_target_pose_          = pn_filtered_target_pose_;
+        is_target_pose_received_      = true;
+        last_target_pose_receive_time_ = ros::Time::now();
+        if (is_enabled_ && current_mode_ == "strike") {
+            strike_target_latched_valid_ = true;
+        }
+
+        ROS_INFO_THROTTLE(2.0, "[Guidance] WP2 fallback target (NWU)=(%.2f, %.2f, %.2f) "
+                              "fed into PN + image_geo paths",
+                          pn_filtered_target_pose_.pose.position.x,
+                          pn_filtered_target_pose_.pose.position.y,
+                          pn_filtered_target_pose_.pose.position.z);
     }
     //===================制导修改====================
 
@@ -1641,6 +1708,18 @@ public:
     //===================制导修改====================
 
     void guidanceTimerCallback(const ros::TimerEvent&) {
+        // === 2026-08-20: WP2 fallback stale timeout ===
+        //   mission_manager 停 publish (cluster 接管 / guidance disable / disarm) 后,
+        //   这里清 wp2_fallback_valid_ 防止 stale 数据继续喂 PN。
+        if (wp2_fallback_valid_ &&
+            !wp2_fallback_last_seen_.isZero() &&
+            (ros::Time::now() - wp2_fallback_last_seen_).toSec() >
+                wp2_fallback_stale_timeout_sec_) {
+            wp2_fallback_valid_ = false;
+            ROS_WARN_THROTTLE(2.0, "[Guidance] WP2 fallback stale (>%.2fs); cleared",
+                              wp2_fallback_stale_timeout_sec_);
+        }
+
         //=========setpoint====//
         // Guidance velocity 只允许在明确的跟踪/打击阶段发布。TAKING_OFF、
         // HOVERING、GROUND_IDLE 等阶段连零速度也不发，避免与 position 混流。
@@ -1851,8 +1930,14 @@ public:
                     // 2026-08-02: STRIKE 用更保守的 kp / max_rate, 避免 87° 大误差下
                     //   卡到 los_max_rate_ 限幅引发的 yaw spin (实测 09:18 bag: yaw std=54°,
                     //   body_rate r 饱和 ±1.4 rad/s). 0.5 / 0.6 不影响 TRACK 模式.
-                    const double strike_los_kp_yaw    = 0.5;
-                    const double strike_los_max_rate  = 0.6;
+                    // === 2026-08-19 Fix A2: 提速但仍保守 ===
+                    //   背景:0.6 rad/s (34°/s) 太慢,146° 偏差需要 4.3s 才能追上,
+                    //   期间 heading 在目标方位外 → user 观察"航向背对目标"。
+                    //   现在 startGuidanceApproach (Fix A1) 已经先把 yaw 锁到目标方位
+                    //   再 enable,残留 yaw_diff ≤ 30°,0.8 / 1.0 足够 0.4s 收敛。
+                    //   保守提速:PX4 物理允许 ~3 rad/s,我们留余量到 1.0。
+                    const double strike_los_kp_yaw    = 0.8;
+                    const double strike_los_max_rate  = 1.0;
                     double yaw_rate = strike_los_kp_yaw * yaw_err_ctrl;
                     yaw_rate = std::max(-strike_los_max_rate, std::min(strike_los_max_rate, yaw_rate));
                     vel_cmd.angular.z = yaw_rate;

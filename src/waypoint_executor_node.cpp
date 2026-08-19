@@ -259,13 +259,26 @@ private:
     //   (硬切),waypoint 飞 14.9 m/s,接近目标 brake 到 4-5 m/s。
     //   修法:publishVelocityCommandWithYaw 加 LERP 斜坡,目标速度跳变时
     //   用 ~300ms 平滑过去。避免硬切冲击 PX4 OFFBOARD,降低能量消耗。
+    // === 2026-08-19: Fix B — 真实实现斜坡 ===
+    //   字段原本在 08-05 注释里说有 LERP,但 publishVelocityCommandWithYaw
+    //   一直没真正用它;publishZeroVelocity 还把它们清零准备 ramp 起点。
+    //   这次在 publish path 上饱和 |Δv| ≤ max_horiz_accel × dt,
+    //   |Δvz| ≤ max_vert_accel × dt,把 19 m/s 段切换阶跃在 2~3 s 内铺平。
     double filt_vx_ = 0.0;   // 已发布的水平速度
     double filt_vy_ = 0.0;
     double filt_vz_ = 0.0;
     double filt_yaw_ = 0.0;
     ros::Time last_vel_pub_time_;
-    // 斜坡时间常数:300ms 内从 0 爬到目标速度的 90% (~3 tau)
-    static constexpr double kVelRampTauSec = 0.10;
+    double vel_slew_max_horiz_accel_;  // m/s²,水平速度斜坡上限
+    double vel_slew_max_vert_accel_;   // m/s²,垂直速度斜坡上限
+
+    // === 2026-08-19: Fix C — WP1 预转向 (治本) ===
+    //   接近 WP1(段末/相切换)时,desired_yaw 在该点突然从旧段方向跳到新段
+    //   方向。154° 偏差在 yaw_max_rate=0.5 rad/s 下需 5.4s,期间 UAV 沿旧
+    //   方向漂 75m。修法:距离 < pre_align_radius_ 起,blend desired_yaw
+    //   朝下一段方向,到达 WP1 时 desired_yaw 已经对齐,无阶跃切换。
+    //   仅 attack (skill 105) 末段(WP1→WP2)启用,不影响搜索模式。
+    double pre_align_radius_;   // m,WP1 预转向触发半径
 
     // 最后一个航点 P-controller 增益（用于位置保持，避免震荡）
     double hold_kp_;
@@ -285,7 +298,20 @@ private:
     //=======高度下降===========//
     double   strike_descent_rate_ = 2.0;
     double   strike_commit_radius_ = 3.0;
-    double   strike_min_commit_altitude_ = 2.0;
+    double   strike_min_commit_altitude_ = 0.0;  // === 2026-08-19: 2.0 → 0 ===
+        // 用户观察:进入 WP2 3m 球时 UAV 还在目标上方约 2m,撞不到地面目标。
+        // 改为 0 → waypoint 阶段直接冲到 WP2.z,水平 commit 时 altitude 已在 WP2 高度。
+        // 下降速率由 strike_descent_rate (默认 2 m/s) + applyAttackPreDescentToWp1
+        // 限速保护,不依赖这 2m 缓冲防超调。
+    double   strike_final_commit_radius_m_  = 5.0;  // === 2026-08-20: 新增 ===
+        // 进入此水平距离后,放开 strike_descent_rate vz 钳,允许 uav_vertical_speed_
+        // (默认 3 m/s) 满速冲底。让 UAV 在最近点 (horiz~0) 真正贴近 0m AGL。
+        // 不加此半径的话,strike_descent_rate=2 m/s + slew 4 m/s² 启动延迟 + 水平
+        // overshoot 都会让 UAV 在最近点剩 ~2m AGL (uav0_strike_23-54-14 实测)。
+    double   strike_ground_safety_margin_m_ = 0.5;  // === 2026-08-20: 新增 ===
+        // 放开 vz 钳后兜底:current_ned_z_ > 此值 (NED z 正向 = 下) 时强制 vz <= 0,
+        // 防止 UAV 冲过地面继续往下。0.5m 默认 = 接受 UAV 擦地 0.5m 后刹停。
+        // SITL 平地无地形,够用;真实场景需配合 terrain map。
     //=======高度下降===========//
 
 public:
@@ -318,6 +344,9 @@ public:
         xte_damping_min_along_fraction_(0.0),
         yaw_kp_(3.0),
         yaw_deadband_(0.05),
+        vel_slew_max_horiz_accel_(8.0),   // 水平斜坡上限 8 m/s² — 19 m/s 跳变约 2.4s 铺平
+        vel_slew_max_vert_accel_(4.0),    // 垂直斜坡上限 4 m/s²
+        pre_align_radius_(30.0),          // WP1 预转向触发半径 (m)
         current_work_mode_("SEARCH_ONLY"),
         segment_phase_(SegmentPhase::IDLE),
         arrive_idx_(0),
@@ -413,6 +442,17 @@ public:
         // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
         nh_private_.param<double>("accel_limit", accel_limit_, 3.0);
         nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
+        // === 2026-08-19: Fix B/C 参数 ===
+        //   vel_slew_max_horiz_accel: publish path 上 |Δv_horiz| 上限 (m/s²),
+        //     把段切换 / phase 切换的硬切阶跃在 2~3 s 内铺平,避免 PX4 OFFBOARD 跳变。
+        //   vel_slew_max_vert_accel: |Δvz| 上限,垂直变化通常比水平更敏感,设小一些。
+        //   pre_align_radius: 接近 WP1 / 段末 < 此距离时,开始 blend desired_yaw 朝下
+        //     一段方向(下一段 direction);到达时 desired_yaw 已经对齐,不再瞬时切。
+        nh_private_.param<double>("vel_slew_max_horiz_accel",
+                                  vel_slew_max_horiz_accel_, 8.0);
+        nh_private_.param<double>("vel_slew_max_vert_accel",
+                                  vel_slew_max_vert_accel_, 4.0);
+        nh_private_.param<double>("pre_align_radius", pre_align_radius_, 30.0);
         nh_private_.param<bool>("lidar_building_avoidance_enabled",
                                 lidar_building_avoidance_enabled_, false);
         nh_private_.param<double>("lidar_climb_rate", lidar_climb_rate_, 1.0);
@@ -470,10 +510,17 @@ public:
         nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.0);
         nh_private_.param<double>("strike_commit_radius", strike_commit_radius_, 3.0);
         nh_private_.param<double>("strike_min_commit_altitude",
-                                  strike_min_commit_altitude_, 2.0);
+                                  strike_min_commit_altitude_, 0.0);  // === 2026-08-19: 2.0 → 0 ===
+        // === 2026-08-20: 放开 commit zone vz 钳相关参数 ===
+        nh_private_.param<double>("strike_final_commit_radius_m",
+                                  strike_final_commit_radius_m_, 5.0);
+        nh_private_.param<double>("strike_ground_safety_margin_m",
+                                  strike_ground_safety_margin_m_, 0.5);
         strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
         strike_commit_radius_ = std::max(0.1, strike_commit_radius_);
-        strike_min_commit_altitude_ = std::max(0.1, strike_min_commit_altitude_);
+        strike_min_commit_altitude_ = std::max(0.0, strike_min_commit_altitude_);  // === 2026-08-19: 0.1 → 0.0 ===
+        strike_final_commit_radius_m_ = std::max(0.5, strike_final_commit_radius_m_);  // 不要小于 0.5m
+        strike_ground_safety_margin_m_ = std::max(0.0, strike_ground_safety_margin_m_);
         //=======高度下降===========//
     }
 
@@ -968,19 +1015,25 @@ public:
         //   看不到就一直按 waypoint_exec 沿 WP1→WP2 飞。
         double target_z_for_flight = target_wp.ned_z;
         //=======高度下降===========//
-        // Attack 航点阶段不能先飞到地面目标高度。最终接触只允许由 guidance 在
-        // 水平进入提交范围后执行；waypoint 阶段至少保留目标上方提交高度。
+        // Attack 航点阶段不再钳离地高度(strike_min_commit_altitude_=0,2026-08-19):
+        //   进入 WP2 3m 球之前,UAV 已经沿 WP1→WP2 段按 strike_descent_rate 降到
+        //   WP2.z (=0)。用户观察:"到目标上方一点点" = 2m 钳余导致,改 0 后 UAV 在
+        //   水平 commit 时已在 WP2.z。
+        //   下冲速率由 strike_descent_rate (默认 2 m/s) + applyAttackPreDescentToWp1
+        //   限速,guidance 在 commit 后接管。
         if (active_skill_type_ == 105 && *cur_idx + 1 == cur_queue->size() &&
-            horizontal_to_target > strike_commit_radius_) {
+            horizontal_to_target > strike_commit_radius_ &&
+            strike_min_commit_altitude_ > 0.0) {
             target_z_for_flight = std::min(
                 target_z_for_flight,
                 target_wp.ned_z - strike_min_commit_altitude_);
-        } else if (active_skill_type_ == 105 && *cur_idx + 1 == cur_queue->size()) {
+        } else if (active_skill_type_ == 105 && *cur_idx + 1 == cur_queue->size() &&
+                   horizontal_to_target <= strike_commit_radius_) {
             ROS_WARN_THROTTLE(1.0,
                 "[WaypointExecutor] Attack final commit: horizontal=%.2fm <= %.2fm; "
-                "releasing %.2fm altitude guard and descending to WP2",
+                "descending to WP2 (target_z=%.2f)",
                 horizontal_to_target, strike_commit_radius_,
-                strike_min_commit_altitude_);
+                target_z_for_flight);
         }
         //=======高度下降===========//
         // (attack_min_altitude_ned_ 参数仍保留读取兼容,但不再做固定20m钳)
@@ -1224,10 +1277,60 @@ public:
         //=======高度下降===========//
         // NED z 正方向为向下。Attack 飞向 WP1、WP1->WP2以及避障处理后的最终
         // 下降指令统一受 common.yaml 的 strike_descent_rate 限制；向上避障不受影响。
-        if (active_skill_type_ == 105 && vz > strike_descent_rate_) {
-            vz = strike_descent_rate_;
+        // === 2026-08-20: 进入 commit zone (horiz ≤ strike_final_commit_radius_m_)
+        //   放开 vz 钳 → 允许 uav_vertical_speed_ (3 m/s) 满速冲底。
+        //   uav0_strike_23-54-14 实测:WP2 commit 时 horiz=0.30m 但 alt=2.02m AGL,
+        //   因为 strike_descent_rate=2 m/s + 水平 overshoot,下降没走完。放开后
+        //   改由 uav_vertical_speed_+ dz P-controller 直接驱动。
+        // === 2026-08-20: ground safety margin 兜底
+        //   放开 vz 钳后如果水平已过 WP2 但还在 descend,UAV 会冲过地面。
+        //   current_ned_z_ > strike_ground_safety_margin_m_ (即低于地面 NED+) 时
+        //   强制 vz <= 0,擦地刹停。
+        if (active_skill_type_ == 105) {
+            const bool in_final_commit = dist_h <= strike_final_commit_radius_m_;
+            if (!in_final_commit && vz > strike_descent_rate_) {
+                vz = strike_descent_rate_;
+            }
+            if (current_ned_z_ > strike_ground_safety_margin_m_ && vz > 0.0) {
+                // 已经越过 ground safety margin (NED z > +safety) → 刹停
+                vz = 0.0;
+                ROS_WARN_THROTTLE(1.0,
+                    "[WaypointExecutor] Alt clamp: current=%.2fm below ground safety "
+                    "margin %.2fm, vz clamped to 0 (in_final_commit=%d)",
+                    current_ned_z_, strike_ground_safety_margin_m_,
+                    static_cast<int>(in_final_commit));
+            }
         }
         //=======高度下降===========//
+
+        // === 2026-08-19: Fix C — WP1 预转向 (治本航向硬切) ===
+        //   背景:接近 WP1 时(段末 idx→idx+1),desired_yaw 突然从旧段方向(搜索 /
+        //   转弯结束)切换到新段方向(WP1→WP2)。154° 偏差在 yaw_max_rate=0.5 rad/s
+        //   下需要 5.4s,UAV 沿旧方向漂 ~75m,看起来"到 WP1 突然换向"。
+        //   治本:距离 < pre_align_radius_ 起,blend desired_yaw 朝下一段方向;
+        //   smoothstep 让接近 WP1 时转得越快,到达时 desired_yaw 已对齐,无阶跃。
+        //   仅在 attack (skill 105) 且下一段存在(非终段)时启用,
+        //   不影响搜索 / gather / return 模式。
+        //   注意:不会影响压线 — 只 blend bearing,不动 vx/vy/vz。
+        if (active_skill_type_ == 105 &&
+            segment_phase_ == SegmentPhase::SKILL_AREA &&
+            *cur_idx + 1 < cur_queue->size() &&
+            dist_h < pre_align_radius_) {
+            const Waypoint& wp_next = (*cur_queue)[*cur_idx + 1];
+            const double ndx = wp_next.ned_x - target_wp.ned_x;
+            const double ndy = wp_next.ned_y - target_wp.ned_y;
+            if (std::hypot(ndx, ndy) > 0.5) {
+                const double next_bearing_ned = std::atan2(ndy, ndx);
+                // Smoothstep blend:t=0 at pre_align_radius_, t=1 at WP1
+                const double t = 1.0 - std::min(1.0, dist_h / pre_align_radius_);
+                const double blend = t * t * (3.0 - 2.0 * t);
+                // Angular wrap 差值,保证走最短路径
+                double diff = next_bearing_ned - bearing;
+                while (diff >  M_PI) diff -= 2.0 * M_PI;
+                while (diff < -M_PI) diff += 2.0 * M_PI;
+                bearing += blend * diff;
+            }
+        }
 
         // (2026-08-03 重构:段切换 fall-through 已移至函数顶端,不再在此处
         //  publishZeroVelocity()+return。avoidance 之后直接 publish velocity)
@@ -1453,10 +1556,50 @@ public:
             return;
         }
         //===================制导修改====================
+        // === 2026-08-19: Fix B — 速度斜坡(治本段切换 19 m/s 阶跃) ===
+        //   背景:12:58 bag 实测 executeSegmentFlight 段切换(ARRIVE idx→SKILL_AREA idx、
+        //   或 SKILL_AREA idx 内换段)时,L1 算法瞬间算新段方向,|Δv| 单 tick 跳到 19 m/s。
+        //   PX4 OFFBOARD 收到这种阶跃会让 UAV 出现 yaw/速度剧烈抖动,横滚看到 2~3 m/s²
+        //   瞬时加速度,能耗高且 control 环容易 saturate。
+        //   修法:publish path 上饱和 |Δv_horiz| ≤ vel_slew_max_horiz_accel × dt,
+        //   |Δvz| ≤ vel_slew_max_vert_accel × dt。19 m/s 跳变在 dt=0.02 s 下:
+        //   delta_horiz_limit = 8.0 × 0.02 = 0.16 m/s/tick → ~2.4 s 铺平。
+        //   dt clamp 到 [1e-3, 0.1] — 防止首次发布(last_vel_pub_time_ zero)或
+        //   长时停摆后一帧暴走。
+        const ros::Time now_vel = ros::Time::now();
+        double dt_vel = last_vel_pub_time_.isZero()
+            ? (1.0 / executor_rate_) : (now_vel - last_vel_pub_time_).toSec();
+        dt_vel = std::max(1e-3, std::min(0.1, dt_vel));
+        const double horiz_accel_limit = vel_slew_max_horiz_accel_ * dt_vel;
+        const double vert_accel_limit = vel_slew_max_vert_accel_ * dt_vel;
+        const double prev_vx = filt_vx_;
+        const double prev_vy = filt_vy_;
+        const double prev_vz = filt_vz_;
+        double new_vx = vx;
+        double new_vy = vy;
+        double new_vz = vz;
+        // 水平:每个轴分别限幅(避免水平总速度被 2D 等比缩放搞乱方向)
+        if (new_vx - prev_vx >  horiz_accel_limit) new_vx = prev_vx + horiz_accel_limit;
+        if (new_vx - prev_vx < -horiz_accel_limit) new_vx = prev_vx - horiz_accel_limit;
+        if (new_vy - prev_vy >  horiz_accel_limit) new_vy = prev_vy + horiz_accel_limit;
+        if (new_vy - prev_vy < -horiz_accel_limit) new_vy = prev_vy - horiz_accel_limit;
+        // 垂直:上下分别限幅
+        if (new_vz - prev_vz >  vert_accel_limit) new_vz = prev_vz + vert_accel_limit;
+        if (new_vz - prev_vz < -vert_accel_limit) new_vz = prev_vz - vert_accel_limit;
+        // 兜底:NaN/Inf 检测(防止单个轴被钳成 NaN 把整个 twist 污染)
+        if (!std::isfinite(new_vx) || !std::isfinite(new_vy) || !std::isfinite(new_vz)) {
+            new_vx = prev_vx;
+            new_vy = prev_vy;
+            new_vz = prev_vz;
+        }
+        filt_vx_ = new_vx;
+        filt_vy_ = new_vy;
+        filt_vz_ = new_vz;
+        last_vel_pub_time_ = now_vel;
         geometry_msgs::Twist vel_cmd;
-        vel_cmd.linear.x = vx;
-        vel_cmd.linear.y = vy;
-        vel_cmd.linear.z = vz;
+        vel_cmd.linear.x = new_vx;
+        vel_cmd.linear.y = new_vy;
+        vel_cmd.linear.z = new_vz;
 
         // === 航向控制:P-controller ===
         // mavros setpoint_velocity.angular.z 是机体角速度(ENU:左转/CCW 为正,rad/s),
