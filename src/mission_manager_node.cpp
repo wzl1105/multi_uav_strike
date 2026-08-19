@@ -2856,6 +2856,41 @@ public:
             case 0: {
                 // 打击
                 dt.target_type = 1;
+                // === 2026-08-19: SEARCH_TRACK + attack_cmd 必须用 params_json.attack_speed ===
+                //   当前 skill 是 SEARCH_TRACK(102)时,sr.msg.task_speed = search_speed(来自
+                //   starling_bridge kcp_comm.cpp:715),而不是攻击速度。攻击意图必须用
+                //   params_json.attack_speed(GS 协议上是 search skill 给的"打击"参数)。
+                //   skill 105 ATTACK 下 task_speed 本身就是 attack_speed,这条覆盖不影响。
+                if (current_skill_index_ < skill_queue_.size()) {
+                    const auto& sr_ref = skill_queue_[current_skill_index_];
+                    const std::string& pj = sr_ref.msg.params_json;
+                    double parsed_attack_speed = -1.0;
+                    const std::string key = "\"attack_speed\"";
+                    size_t key_pos = pj.find(key);
+                    if (key_pos != std::string::npos) {
+                        size_t colon = pj.find(':', key_pos);
+                        if (colon != std::string::npos) {
+                            size_t val_start = pj.find_first_not_of(" \t\r\n", colon + 1);
+                            if (val_start != std::string::npos) {
+                                try {
+                                    parsed_attack_speed = std::stod(
+                                        pj.substr(val_start, 32));
+                                } catch (...) {}
+                            }
+                        }
+                    }
+                    if (parsed_attack_speed > 0.0) {
+                        const double new_speed = std::min(parsed_attack_speed, attack_max_speed_);
+                        ROS_WARN("[MissionManager] AttackCmd action=0: override strike_speed "
+                                 "%.2f → %.2f m/s (params_json.attack_speed, skill=%d)",
+                                 guidance_speed_, new_speed, sr_ref.msg.skill_type);
+                        guidance_speed_ = new_speed;
+                    } else {
+                        ROS_WARN_THROTTLE(2.0, "[MissionManager] AttackCmd action=0: no "
+                                              "attack_speed in params_json, keep guidance_speed_=%.2f",
+                                              guidance_speed_);
+                    }
+                }
                 ROS_WARN("[MissionManager] AttackCmd action=0 (打) — triggering strike");
                 triggerStrike();
                 detect_target_pub_.publish(dt);

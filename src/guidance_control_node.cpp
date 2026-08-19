@@ -247,6 +247,14 @@ private:
     double strike_vertical_lag_ = 2.0;
     double strike_commit_radius_ = 3.0;
     double strike_min_commit_altitude_ = 2.0;
+    // === 2026-08-19: STRIKE 闭环下降 ===
+    //   跟踪 UAV 实际下降率 (PX4 限速 / 电机饱和时实际比 commanded 小),
+    //   feasibleHorizontalSpeedForDescent 据此反推水平速度,确保水平/垂直同时到达。
+    double actual_descent_rate_ema_ = 0.0;
+    double last_altitude_nwu_ = 0.0;
+    ros::Time last_altitude_time_;
+    bool altitude_filter_initialized_ = false;
+    //=============闭环下降=============//
     //=======高度下降===========//
     bool strike_slant_descent_enabled_ = true;
     double strike_slant_descent_max_angle_deg_ = 25.0;
@@ -981,6 +989,9 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
+            // === 2026-08-19: 进入 strike 重置闭环下降跟踪器 ===
+            //   否则上一个 strike 的实际下降率 EMA 会污染新一次 strike 的闭环水平计算。
+            resetActualDescentRate();
             //========速度修改========
             // mode 消息可能晚于 enable 到达，不能把 enableCallback 已建立的交接速度清零。
             // last_strike_cmd_valid_ = false;
@@ -1264,12 +1275,70 @@ public:
     }
 
     //=======高度下降===========//
-    // 水平速度始终采用地面站 Attack task_speed，不再为了追赶高度而减慢水平速度。
-    // 垂直通道在 computeSlantDescentSpeed() 内主动滞后，确保不会高度先到地面。
+    // === 2026-08-19: STRIKE 闭环下降 — 水平跟随实际垂直能力 ===
+    //   原实现直接返回 requested_speed,导致 commanded_vz 和 actual_vz 不一致时
+    //   (PX4 MPC_Z_VEL_MAX_DN 限速、电机饱和、目标在下方但 UAV 还没低头 等) 水平
+    //   先到、垂直慢 10s 才落地,体验"下降速率不够"。
+    //   修法:用实际下降率 (actual_descent_rate_ema_) 反推水平速度,确保水平/垂直同步
+    //   到达命中圈。actual_vz ≥ commanded_vz 时不影响,直接走 requested_speed。
+    //   关键:不被 commanded vz 假设绑架,所以 PX4 内部限多少都不影响闭环正确性。
     double feasibleHorizontalSpeedForDescent(const StrikeTargetGeometry& g,
                                              double requested_speed) const {
-        (void)g;
-        return requested_speed;
+        // 目标在上方 / 已进命中圈 / 实际下降率还没收敛:不走闭环,保持原 requested_speed
+        if (g.down <= 0.0 || g.horizontal <= strike_distance_threshold_ ||
+            actual_descent_rate_ema_ < 0.05) {
+            return requested_speed;
+        }
+        // 水平剩余距离 (扣掉命中圈)
+        const double horizontal_to_hit = std::max(
+            0.0, g.horizontal - strike_distance_threshold_);
+        // 实际需要多久才能落到目标高度
+        const double time_to_land = g.down / actual_descent_rate_ema_;
+        // 闭环水平速度 = 剩余水平 / (落地时间 + 安全留余)
+        // 确保水平在垂直落地后 (lag 秒) 关闭,实现水平/垂直同步到达
+        const double closed_loop_h_speed = horizontal_to_hit /
+            std::max(0.1, time_to_land + strike_vertical_lag_);
+        return std::min(requested_speed, closed_loop_h_speed);
+    }
+
+    // === 2026-08-19: 实际下降率 EMA 跟踪器 ===
+    //   每次 STRIKE tick 调一次,基于 current_uav_pose_.pose.position.z (NWU)
+    //   与上一 tick 的差分算 actual_vz = -(dz/dt)。EMA 平滑避免单 tick 噪声。
+    //   在 entering_strike 时 altitude_filter_initialized_ 清掉,Strike 头两秒
+    //   还没收敛 (actual_descent_rate_ema_ < 0.05) 时 feasibleHorizontalSpeedForDescent
+    //   走 fallback 用 requested_speed,不会因 EMA 接近 0 算成 horizontal≈0 卡死。
+    void updateActualDescentRate(const ros::Time& now) {
+        const double current_z = current_uav_pose_.pose.position.z;
+        if (!altitude_filter_initialized_) {
+            last_altitude_nwu_ = current_z;
+            last_altitude_time_ = now;
+            altitude_filter_initialized_ = true;
+            return;
+        }
+        const double dt = (now - last_altitude_time_).toSec();
+        if (dt < 0.005 || dt > 1.0) {
+            // 异常 dt:不更新 EMA,只推进参考点
+            last_altitude_nwu_ = current_z;
+            last_altitude_time_ = now;
+            return;
+        }
+        // NWU: z=Up,下降时 z 减小 → altitude_drop > 0
+        const double altitude_drop = last_altitude_nwu_ - current_z;
+        const double actual_vz = std::max(0.0, altitude_drop / dt);
+        if (actual_descent_rate_ema_ < 0.01) {
+            actual_descent_rate_ema_ = actual_vz;
+        } else {
+            // 0.6 / 0.4 EMA:对新 vz 略敏感,飞行控制器限速时会快速反映
+            actual_descent_rate_ema_ = 0.6 * actual_descent_rate_ema_ +
+                                       0.4 * actual_vz;
+        }
+        last_altitude_nwu_ = current_z;
+        last_altitude_time_ = now;
+    }
+
+    void resetActualDescentRate() {
+        altitude_filter_initialized_ = false;
+        actual_descent_rate_ema_ = 0.0;
     }
     //=======高度下降===========//
 
@@ -1314,16 +1383,20 @@ public:
     // 所有混合/斜率限制之后：提交区外按剩余高度逐渐刹停，到保护高度后立即禁止
     // 继续向下。它只覆盖下降分量，不阻止为修正扰动而爬升。
     void enforcePreCommitAltitudeGuard(geometry_msgs::Twist& cmd,
-                                       const StrikeTargetGeometry& g) const {
+                                       const StrikeTargetGeometry& g,
+                                       double closing_speed) const {
         if (!strike_slant_descent_enabled_ ||
             g.horizontal <= strike_distance_threshold_ || cmd.linear.z <= 0.0) {
             return;
         }
 
-        // source blend、OneEuro 或 slew limit 都可能遗留更大的下降量。最终硬限制
-        // 使用实时原始目标几何和当前水平闭合速度，再次保证高度晚于命中圈到达。
-        const double closing_speed = std::max(
-            std::hypot(cmd.linear.x, cmd.linear.y), 0.1);
+        // === 2026-08-19: closing_speed 必须是"非钳位的预期水平速度",不能用 cmd.linear.x/y ===
+        //   uav0_strike_2026-08-19-12-58-47_0.bag: PX4 MPC_Z_VEL_MAX_DN ≈ 1.5 → 我的
+        //   feasibleHorizontalSpeedForDescent 把 horizontal 钳到 0.16,guard 用 cmd.linear.x/y
+        //   当 closing_speed → time_to_hit = 169s → max_guarded_descent = 0.10 → vz 锁 0.10
+        //   → strike 永远到不了。caller 必须传 scheduled_speed(终端减速调度)或
+        //   track_max_speed_(PN 路径)这类"想要的速度",不是闭环后的实测值。
+        closing_speed = std::max(closing_speed, 0.1);
         const double time_to_hit =
             (g.horizontal - strike_distance_threshold_) / closing_speed;
         const double max_guarded_descent = std::min(
@@ -1367,7 +1440,14 @@ public:
         // 原垂直控制保留：
         // cmd.linear.z = clampValue(g.down, -image_max_vertical_speed_,
         //                                    image_max_vertical_speed_);
-        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        // === 2026-08-19: slant 公式必须用 scheduled_speed,不用被钳位的 `speed` ===
+        //   computeSlantDescentSpeed 把 horizontal_speed 当 closing_speed 反推 vz:
+        //     closing_speed 小 → time_to_hit 大 → desired_vz 小 → PX4 跟小 →
+        //   actual_vz 小 → 我的 feasibleHorizontalSpeedForDescent 用 actual_vz
+        //   进一步把 horizontal 钳小 → 闭环稳定在 ~0.1 m/s,strike 永远到不了
+        //   (uav0_strike_2026-08-19-12-40-57_0.bag)。scheduled_speed 是基于
+        //   终端距离调度的,不被 h_speed 钳位影响,slant 算出来的 vz 不再自反馈死锁。
+        cmd.linear.z = computeSlantDescentSpeed(g, scheduled_speed);
         //===================制导修改====================
         if (g.horizontal > 0.1) {
             cmd.angular.z = terminalYawRate(std::atan2(g.east, g.north), g.horizontal);
@@ -1414,6 +1494,10 @@ public:
         // 原图像射线垂直分量保留；新斜线下降统一使用目标三维几何，避免两套高度源跳变。
         // const double down = -ray.z();
         //===================制导修改====================
+        // === 2026-08-19: slant 公式用 scheduled_speed,不用被钳的 speed,治自反馈死锁 ===
+        //   (详见 computeGeoFallbackVelocity 中的同主题注释)
+        cmd.linear.z = computeSlantDescentSpeed(g, scheduled_speed);
+        //===================制导修改====================
         double horizontal = std::hypot(north, east);
 
         // bag中8m内图像射线趋近垂直并多次换边。末端仅保留图像可见性和速度调度，
@@ -1433,7 +1517,7 @@ public:
         //     g.distance > 1e-3 ? g.down : (down >= 0.0 ? 1.0 : -1.0);
         // cmd.linear.z = clampValue(descent_sign_source,
         //                           -image_max_vertical_speed_, image_max_vertical_speed_);
-        cmd.linear.z = computeSlantDescentSpeed(g, speed);
+        // (cmd.linear.z 已在 L1495 用 scheduled_speed 赋值,这里不再重复,避免双赋值)
         //===================制导修改====================
 
         if (horizontal > 0.1) {
@@ -1472,6 +1556,10 @@ public:
     }
 
     void computeImageGeoStrikeVelocity(geometry_msgs::Twist& cmd) {
+        // === 2026-08-19: 闭环下降 — 每 tick 更新实际下降率 EMA ===
+        //   feasibleHorizontalSpeedForDescent 据此反推水平速度,确保水平/垂直同步到达
+        updateActualDescentRate(ros::Time::now());
+
         const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
         const bool stamp_valid = image_target_received_ &&
                                  current_image_target_.stamp_us > 0 &&
@@ -1529,7 +1617,14 @@ public:
         applyStrikeCommandSlewLimit(cmd);
         //=======高度下降===========//
         // 必须在 source blend 和 slew limit 之后执行，防止旧下降速度穿透保护高度。
-        enforcePreCommitAltitudeGuard(cmd, strikeDescentGeometry());
+        // closing_speed 用 scheduled_speed (终端减速调度结果),不用 cmd.linear.x/y,
+        // 否则会被 feasibleHorizontalSpeedForDescent 钳位后的 h_speed 反向锁死 vz
+        // (uav0_strike_2026-08-19-12-58-47_0.bag 复盘)。
+        const StrikeTargetGeometry g_for_guard = strikeDescentGeometry();
+        const double closing_speed_for_guard = strike_terminal_speed_schedule_enabled_
+            ? terminalHorizontalSpeed(track_max_speed_, g_for_guard.horizontal)
+            : track_max_speed_;
+        enforcePreCommitAltitudeGuard(cmd, g_for_guard, closing_speed_for_guard);
         //=======高度下降===========//
         last_strike_cmd_ned_ = cmd;
         last_strike_cmd_valid_ = true;
@@ -1700,8 +1795,10 @@ public:
                         strikeDescentGeometry();
                     const double pn_horizontal_speed = std::hypot(
                         vel_cmd.linear.x, vel_cmd.linear.y);
+                    // === 2026-08-19: slant 公式用非钳位的 track_max_speed_,治自反馈死锁 ===
+                    //   (详见 computeGeoFallbackVelocity 中的同主题注释)
                     vel_cmd.linear.z = computeSlantDescentSpeed(
-                        pn_descent_geometry, pn_horizontal_speed);
+                        pn_descent_geometry, track_max_speed_);
                     //===================制导修改====================
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
@@ -1766,7 +1863,9 @@ public:
                     filterVelocityCmd(vel_cmd);
                     //=======高度下降===========//
                     // PN 滤波器也可能残留旧下降量，使用同一提交高度硬保护。
-                    enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry);
+                    // closing_speed 用 track_max_speed_,不用被 PN 钳位后的 vel_cmd.linear.x/y,
+                    // 否则会被自反馈死锁 (uav0_strike_2026-08-19-12-58-47_0.bag 复盘)。
+                    enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry, track_max_speed_);
                     //=======高度下降===========//
 
                     multi_uav_strike::GuidancePnDebug pn_dbg;

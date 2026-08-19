@@ -44,6 +44,18 @@ image_ray_alpha: 0.25
 image_yaw_kp: 0.6
 image_yaw_rate_max: 0.5
 
+# === 2026-08-19: STRIKE 闭环下降 (替代原半开环 strike_descent_rate=2.0) ===
+#   computeSlantDescentSpeed 算 desired_vz = g.down / (time_to_hit + strike_vertical_lag_),
+#   钳到 strike_descent_rate 后把闭环压成半开环:
+#     - 本 bag (52m 水平 / 30m 高 / 10 m/s 水平) desired_vz=4.3 m/s,钳到 2.0 后
+#       水平先到、垂直慢 10s 才落地,用户体验"下降速率不够"。
+#   strike_vertical_lag 是末端让水平先于垂直命中的安全留余,2.0s 太大。
+#   把 strike_descent_rate 提到 5.0 m/s 给闭环公式空间,strike_vertical_lag 砍到 0.5s。
+#   兜底安全由 enforcePreCommitAltitudeGuard (二次钳,按实时几何算) 负责,
+#   PX4 SITL 默认 MPC_Z_VEL_MAX_DN 约 2 m/s,真正饱和值由 PX4 内部限制,这里放高不引坠地。
+strike_descent_rate: 5.0
+strike_vertical_lag: 0.5
+
 # PN专用目标输入滤波和陈旧目标软降速；IMAGE/GEO不使用这些滤波结果。
 pn_target_filter_min_cutoff_hz: 1.0
 pn_target_filter_beta: 0.005
@@ -51,11 +63,16 @@ pn_target_filter_d_cutoff_hz: 1.0
 pn_cluster_stale_timeout_sec: 0.5
 pn_cluster_stale_speed_scale: 0.33
 
-# 本次 bag 中 8m 内图像射线接近垂直，水平分量反复换向；末端改用已锁定目标的
-# 世界坐标方向，并随水平距离连续减速，1m内停止水平追逐。
+# === 2026-08-19: 8m → 30m ===
+#   原 8m 内图像射线趋近垂直、水平反复换向、SEARCH_TRACK + attack_cmd 直接
+#   远距俯冲时 yaw 没追上 target bearing,IMAGE 射线 (image_ray_alpha=0.25 LPF
+#   时间常数 ~0.4s) 滞后让速度方向偏,导致 UAV 越顶 41m 后 world coord 接管再反向。
+#   把世界坐标接管半径提到 30m:水平 ≤ 30m 起就锁到稳定的 cluster 世界坐标,
+#   仅 30m 以上才用 IMAGE 射线(yaw 误差此时较小)。skill 105 ATTACK 走 attack_point
+#   waypoint 起跑距离小,这一改动对它的影响可忽略。
 strike_slowdown_radius_m: 10.0
 strike_horizontal_stop_radius_m: 1.0
-strike_terminal_world_direction_radius_m: 8.0
+strike_terminal_world_direction_radius_m: 30.0
 # 近目标逐渐冻结偏航，避免机头在目标正上方来回寻找像面中心。
 strike_yaw_freeze_radius_m: 3.0
 # 每次进入 STRIKE 后必须收到本轮新目标坐标，且坐标持续保持新鲜。
