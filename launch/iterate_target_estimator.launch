@@ -55,6 +55,13 @@
       <!-- bag 的 uav_pose 是 1Hz,默认 yaw_rate_sample_max_dt_sec=0.5s
            会被反复 reset,YOLO batch 全被跳过。放宽到 2.0s 适配 bag -->
       <param name="yaw_rate_sample_max_dt_sec" value="2.0"/>
+      <!-- === 2026-08-19: replay FOV override (本 bag 专属) ===
+           当前 bag 是用旧 gimbal_simulator.yaml (fov_h=66/fov_v=52) 录的,
+           反投影必须用同一组 FOV 才能匹配 forward 几何。
+           2026-08-19 起 gimbal_simulator.yaml 已同步到 68/45.6 (跟真机实测),
+           新录的 bag 不再需要此 override。 -->
+      <param name="fov_h_deg" value="66.0"/>
+      <param name="fov_v_deg" value="52.0"/>
       <rosparam command="load" file="$(find multi_uav_strike)/config/common.yaml"/>
       <rosparam command="load" file="$(find multi_uav_strike)/config/target_estimator.yaml"/>
     </node>

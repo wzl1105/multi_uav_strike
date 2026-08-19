@@ -15,8 +15,12 @@ image_height: 1080         # 图像高度（像素）
 #   focal_x = (W/2) / tan(fov_h/2)
 #   focal_y = (H/2) / tan(fov_v/2)
 # 设 fov_v_deg=0 表示按方形像素假设 (fov_v 从 fov_h + image aspect 推导)
-fov_h_deg: 66.0           # 水平 FOV（度）
-fov_v_deg: 52.0           # 垂直 FOV（度），0 = 按方形像素推导
+# === 2026-08-19: 66/52 → 68/45.6 ===
+#   gimbal_simulator 是仿真真机的相机模型, FOV 必须与 target_estimator 反投影
+#   用同一组 (真机实测 68/45.6)。否则 forward/back 几何不对应,每个 cand 偏离
+#   真目标 ~10m, 红球视觉上跟着 UAV 走。
+fov_h_deg: 68.0           # 水平 FOV（度） — 与 target_estimator.yaml 真机值同步
+fov_v_deg: 45.6           # 垂直 FOV（度），0 = 按方形像素推导 — 与 target_estimator.yaml 真机值同步
 
 gimbal_p_gain: 1.0         # 云台 P 控制增益
 max_pitch_rate: 1.2        # 最大俯仰角速度（rad/s）
