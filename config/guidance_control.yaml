@@ -10,7 +10,16 @@ guidance_strategy: "intercept"   # intercept / minsnap / los
 # //===================制导修改====================
 # STRIKE 主逻辑：image_geo_fallback=图像视线优先，图像过期后用世界坐标纯追踪；
 # pn=融合main分支增强后的比例导引；legacy_pn作为pn的兼容别名。
-strike_guidance_logic: "image_geo_fallback"
+# === 2026-08-19: image_geo_fallback → pn (uav0_strike_2026-08-19-15-39-13_0.bag) ===
+#   image_geo_fallback 的偏航角控制走 atan2(target_bearing) - current_yaw,
+#   UAV 起点 (76,4,20) heading 1°(北)、目标 bearing 233°(西南) 时,yaw_error ≈ -128°
+#   应走 CW 短边 128°,但反馈链路上 EMA(image_ray_alpha=0.25) + yaw_kp 反复
+#   触发 target_bearing 振荡,yaw 在 3s 内绕 332°(CCW 长边),期间相机始终
+#   不朝向目标 → image_visible_timeout_sec=0.4 触发 → GEO_FALLBACK → 又拉回
+#   bearing → 反复,导致大绕圈。
+#   PN (InterceptGuidance) 的速度向量来自 LOS-rate + 前置角约束,yaw 跟速度向量
+#   走,无 wrap bug,也不会因目标位置 EMA 滞后反复拉扯。
+strike_guidance_logic: "pn"
 # 实际速度仍完全来自 Attack Skill.task_speed；这里只做第二层硬上限保护。
 attack_max_speed: 40.0
 

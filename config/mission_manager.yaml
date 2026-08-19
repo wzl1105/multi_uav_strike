@@ -60,7 +60,11 @@ max_report_cluster_age_sec: 5.0
 #   否则 EMA 漂移会让 C2 漏抓造成重复上报。
 # === 2026-07-31: 40 → 25 ===
 # 跟随 target_estimator.merge_radius_m=10, 留 2.5x EMA 噪声 + WP2-gate 余量
-report_dedup_radius_m: 25.0
+# === 2026-08-19: 25 → 15 (uav0_strike_2026-08-19-15-39-13_0.bag) ===
+# 25m 时 SIM car (-30,-130) 旁边的 car cluster + 一个误检 person cluster
+#   各自独立报一次,GS 看到 2 条相同物体会要求多机协调(但 SIM 是单机)。
+# 15m (1.5x merge_radius) 把相邻真目标合并,远距伪目标仍能各自上报。
+report_dedup_radius_m: 15.0
 
 # === 云台俯仰角控制(2026-07-29) ===
 # Search(102) 任务激活期间,把 Skill.gimbal_pitch 持续低频下发到 /<ns>/mission/gimbal_command
