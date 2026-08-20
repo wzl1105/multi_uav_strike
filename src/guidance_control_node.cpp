@@ -291,6 +291,22 @@ private:
     //===================制导修改====================
     double strike_max_yaw_accel_ = 1.0;
     double attack_max_speed_ = 40.0;
+    // === 2026-08-20: 图像居中终端冲刺 (image-terminal chase) ===
+    //   进入条件: image_ready && bbox 居中 && g.horizontal ≤ chase_min_horiz_m_
+    //   chase 中 vx/vy/vz 完全沿 filtered_image_ray_nwu_,speed = track_max_speed_,
+    //   绕过 terminalHorizontalSpeed / feasibleHorizontalSpeedForDescent /
+    //   computeSlantDescentSpeed / enforcePreCommitAltitudeGuard 全部前馈钳位.
+    bool   strike_terminal_image_chase_enabled_      = true;
+    double strike_terminal_image_chase_min_horiz_m_  = 16.0;
+    double strike_terminal_image_chase_latch_sec_    = 0.5;
+    // 2026-08-20: chase 触发用更宽的死区(>image_center_deadband_),
+    //   17-43-21 bag 在 horiz=1.37m 时 bbox 漂出 0.06 带导致 chase 提前退出,
+    //   放宽到 0.10 允许更大波动, 让 chase 覆盖到命中圈边缘。ray 在 ~1m 内仍可信。
+    double strike_terminal_image_chase_center_band_ = 0.10;
+    bool   terminal_image_chase_active_              = false;
+    ros::Time terminal_image_chase_enter_time_;
+    // chase enter/exit 边沿日志 (2026-08-20),last=true/false 翻转时打 WARN
+    bool   last_chase_log_active_                    = false;
     // 本次 Attack 一旦得到有效世界坐标便锁存；图像或 cluster 后续消失时
     // GEO 继续使用该坐标，直到 guidance 被明确关闭。
     bool strike_target_latched_valid_ = false;
@@ -538,6 +554,21 @@ public:
         //===================制导修改====================
         nh_private_.param<double>("strike_max_yaw_accel", strike_max_yaw_accel_, 1.0);
         nh_private_.param<double>("attack_max_speed", attack_max_speed_, 40.0);
+        // === 2026-08-20: 图像居中终端冲刺 ===
+        nh_private_.param<bool>("strike_terminal_image_chase_enabled",
+                                strike_terminal_image_chase_enabled_, true);
+        nh_private_.param<double>("strike_terminal_image_chase_min_horiz_m",
+                                  strike_terminal_image_chase_min_horiz_m_, 10.0);
+        nh_private_.param<double>("strike_terminal_image_chase_latch_sec",
+                                  strike_terminal_image_chase_latch_sec_, 0.5);
+        nh_private_.param<double>("strike_terminal_image_chase_center_band",
+                                  strike_terminal_image_chase_center_band_, 0.06);
+        strike_terminal_image_chase_min_horiz_m_ =
+            std::max(strike_terminal_image_chase_min_horiz_m_, 0.0);
+        strike_terminal_image_chase_latch_sec_ =
+            std::max(strike_terminal_image_chase_latch_sec_, 0.0);
+        strike_terminal_image_chase_center_band_ =
+            std::max(strike_terminal_image_chase_center_band_, image_center_deadband_);
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
         strike_slowdown_radius_m_ = std::max(
             strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
@@ -945,6 +976,9 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
+            // === 2026-08-20: 重置 chase latch, 新一轮 strike 不继承上一次末尾状态 ===
+            terminal_image_chase_active_ = false;
+            terminal_image_chase_enter_time_ = ros::Time();
             const double target_age = last_target_pose_receive_time_.isZero()
                 ? std::numeric_limits<double>::infinity()
                 : (ros::Time::now() - last_target_pose_receive_time_).toSec();
@@ -1056,6 +1090,11 @@ public:
             image_ray_filter_valid_ = false;
             strike_vision_state_ = StrikeVisionState::GEO_FALLBACK;
             strike_vision_switch_time_ = ros::Time();
+            // === 2026-08-20: 新一轮 strike 必须重置 chase latch ===
+            //   否则上一次 strike 末尾残留的 terminal_image_chase_active_ 会让这次
+            //   进入 strike 时 image 还没收到就误触发 chase, 跳过必要的前置检查。
+            terminal_image_chase_active_ = false;
+            terminal_image_chase_enter_time_ = ros::Time();
             // === 2026-08-19: 进入 strike 重置闭环下降跟踪器 ===
             //   否则上一个 strike 的实际下降率 EMA 会污染新一次 strike 的闭环水平计算。
             resetActualDescentRate();
@@ -1521,6 +1560,87 @@ public:
         }
     }
 
+    // === 2026-08-20: 图像居中终端冲刺 helper ===
+//   共享于 computeImageVelocity (image_geo_fallback) 和 pn 分支 (pn) 两条 strike 路径.
+//   输入: 目标几何 g (用于 in_terminal_zone 判定)
+//   输出: chase_active 时把 cmd 设成 ray*track_max_speed_ 3D 全速, 并设 yaw rate → 返回 true
+//         否则 cmd 保持原值,terminal_image_chase_active_ 清零 → 返回 false
+//   副作用: 维护 terminal_image_chase_active_ + terminal_image_chase_enter_time_
+//           (sticky latch), caller 用 terminal_image_chase_active_ 决定是否绕过
+//           enforcePreCommitAltitudeGuard
+bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
+                                  const StrikeTargetGeometry& g) {
+        Eigen::Vector3d ray = filtered_image_ray_nwu_;
+        if (ray.norm() < 1e-6) {
+            terminal_image_chase_active_ = false;
+            return false;
+        }
+        ray.normalize();
+
+        const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
+        const bool stamp_valid = image_target_received_ &&
+            current_image_target_.stamp_us > 0 &&
+            now_us >= current_image_target_.stamp_us;
+        const double image_age = stamp_valid
+            ? (now_us - current_image_target_.stamp_us) * 1e-6
+            : std::numeric_limits<double>::infinity();
+        const bool image_fresh = stamp_valid &&
+            current_image_target_.visible &&
+            image_age <= image_visible_timeout_sec_ &&
+            image_ray_filter_valid_;
+        const bool image_centered =
+            std::fabs(current_image_target_.center_x - 0.5) <= strike_terminal_image_chase_center_band_ &&
+            std::fabs(current_image_target_.center_y - 0.5) <= strike_terminal_image_chase_center_band_;
+        const bool in_terminal_zone =
+            g.horizontal > 0.1 &&
+            g.horizontal <= strike_terminal_image_chase_min_horiz_m_;
+        const bool should_chase = strike_terminal_image_chase_enabled_ &&
+                                  image_fresh && image_centered && in_terminal_zone;
+
+        if (should_chase) {
+            terminal_image_chase_enter_time_ = ros::Time::now();
+        }
+        const bool in_latch_period =
+            terminal_image_chase_active_ &&
+            !terminal_image_chase_enter_time_.isZero() &&
+            (ros::Time::now() - terminal_image_chase_enter_time_).toSec() <
+                strike_terminal_image_chase_latch_sec_;
+        const bool chase_active = should_chase ||
+            (terminal_image_chase_active_ && in_latch_period && image_fresh);
+        terminal_image_chase_active_ = chase_active;
+
+        // === 状态切换日志 (2026-08-20):便于下次跑 bag 直接确认 chase 是否起作用 ===
+        if (chase_active && !last_chase_log_active_) {
+            ROS_WARN("[Guidance] CHASE ENTERED: image_centered=%.3f,%.3f horiz=%.2fm "
+                     "(min=%.1fm, latch=%.1fs, image_age=%.3fs)",
+                     current_image_target_.center_x, current_image_target_.center_y,
+                     g.horizontal, strike_terminal_image_chase_min_horiz_m_,
+                     strike_terminal_image_chase_latch_sec_, image_age);
+        } else if (!chase_active && last_chase_log_active_) {
+            ROS_WARN("[Guidance] CHASE EXITED: image_fresh=%d image_centered=%d in_zone=%d "
+                     "(horiz=%.2fm image_age=%.3fs)",
+                     image_fresh, image_centered, in_terminal_zone,
+                     g.horizontal, image_age);
+        }
+        last_chase_log_active_ = chase_active;
+
+        if (!chase_active) return false;
+
+        // 沿相机射线 3D 全速冲向. NWU ray → NED velocity:
+        //   v_north =  speed * ray.x
+        //   v_east  = -speed * ray.y    (NWU +y=西, NED +y=东)
+        //   v_down  = -speed * ray.z    (NWU +z=上, NED +z=下)
+        // ray 已 normalize, |v|=speed. PX4 SITL 物理限速仍由 MPC_Z_VEL_* 兜底,
+        // 但不主动钳位 (用户要求"不要减速冲过去")。
+        const double chase_speed = track_max_speed_;
+        cmd.linear.x =  chase_speed * ray.x();
+        cmd.linear.y = -chase_speed * ray.y();
+        cmd.linear.z = -chase_speed * ray.z();
+        cmd.angular.z = terminalYawRate(
+            std::atan2(ray.y(), ray.x()), g.horizontal);
+        return true;
+    }
+
     void computeImageVelocity(geometry_msgs::Twist& cmd) {
         //=======高度下降===========//
         // 图像负责中远距视线方向；末端距离调度和世界坐标方向与命中判定统一。
@@ -1529,9 +1649,22 @@ public:
         Eigen::Vector3d ray = filtered_image_ray_nwu_;
         if (ray.norm() < 1e-6) {
             computeGeoFallbackVelocity(cmd);
+            terminal_image_chase_active_ = false;
             return;
         }
         ray.normalize();
+
+        // === 2026-08-20: 图像居中终端冲刺 (image-terminal chase) ===
+        //   helper 同时被 image_geo_fallback 和 pn 两条 strike 分支共享,
+        //   chase 中 vx/vy/vz 完全沿 filtered_image_ray_nwu_,speed = track_max_speed_,
+        //   绕过 terminalHorizontalSpeed / feasibleHorizontalSpeedForDescent /
+        //   computeSlantDescentSpeed / enforcePreCommitAltitudeGuard 全部前馈钳位.
+        //   "图像丢了" 判定 = !image_ready (与现有 IMAGE_GUIDANCE→GEO_FALLBACK 同源),
+        //   但 chase 自身 sticky_latch_sec 秒: 进入 chase 后最少保持 latch 时长,
+        //   容忍 1-2 帧 bbox 抖动 (visible=false) 不在 chase/GEO 间反复切。
+        if (maybeApplyTerminalImageChase(cmd, g)) {
+            return;  // chase 分支已完整设置 cmd
+        }
 
         //========速度修改========
         // 原逻辑保留：bbox 中心只用于速度调度，偏离中心时 alignment 会把速度
@@ -1687,11 +1820,16 @@ public:
         // closing_speed 用 scheduled_speed (终端减速调度结果),不用 cmd.linear.x/y,
         // 否则会被 feasibleHorizontalSpeedForDescent 钳位后的 h_speed 反向锁死 vz
         // (uav0_strike_2026-08-19-12-58-47_0.bag 复盘)。
-        const StrikeTargetGeometry g_for_guard = strikeDescentGeometry();
-        const double closing_speed_for_guard = strike_terminal_speed_schedule_enabled_
-            ? terminalHorizontalSpeed(track_max_speed_, g_for_guard.horizontal)
-            : track_max_speed_;
-        enforcePreCommitAltitudeGuard(cmd, g_for_guard, closing_speed_for_guard);
+        // === 2026-08-20: 图像居中终端冲刺时跳过此 guard ===
+        //   chase 中 vx/vy/vz 完全沿相机射线, 几何上天然同步,不靠时间预算算 vz。
+        //   guard 会把 ray 的 vz 钳到 time_to_hit 公式,破坏 chase 闭环。
+        if (!terminal_image_chase_active_) {
+            const StrikeTargetGeometry g_for_guard = strikeDescentGeometry();
+            const double closing_speed_for_guard = strike_terminal_speed_schedule_enabled_
+                ? terminalHorizontalSpeed(track_max_speed_, g_for_guard.horizontal)
+                : track_max_speed_;
+            enforcePreCommitAltitudeGuard(cmd, g_for_guard, closing_speed_for_guard);
+        }
         //=======高度下降===========//
         last_strike_cmd_ned_ = cmd;
         last_strike_cmd_valid_ = true;
@@ -1942,6 +2080,15 @@ public:
                     yaw_rate = std::max(-strike_los_max_rate, std::min(strike_los_max_rate, yaw_rate));
                     vel_cmd.angular.z = yaw_rate;
 
+                    // === 2026-08-20: 图像居中终端冲刺 (覆盖 PN 输出) ===
+                    //   当 bbox 在 deadband 内 + g.horizontal ≤ 阈值时, 直接沿相机射线 3D
+                    //   全速冲向, 完全覆盖 PN 输出的 vx/vy/vz/yaw_rate。
+                    //   PN 的世界坐标追击在近距会因 cluster z=0 + 图像未用 → 砸地,
+                    //   切 chase 后 3D 速度由相机射线主导, 几何天然同步, 不刹停。
+                    //   chase 中仍跑 filterVelocityCmd (指令斜率限制), 不跑 pre-commit guard。
+                    const StrikeTargetGeometry pn_chase_geometry = strikeDescentGeometry();
+                    maybeApplyTerminalImageChase(vel_cmd, pn_chase_geometry);
+
                     // 保存 pitch 门控后的 NED 指令；One Euro 也统一在 NED 下运行。
                     const geometry_msgs::Vector3 gated_velocity_ned = vel_cmd.linear;
                     evaluateStrike();
@@ -1950,7 +2097,10 @@ public:
                     // PN 滤波器也可能残留旧下降量，使用同一提交高度硬保护。
                     // closing_speed 用 track_max_speed_,不用被 PN 钳位后的 vel_cmd.linear.x/y,
                     // 否则会被自反馈死锁 (uav0_strike_2026-08-19-12-58-47_0.bag 复盘)。
-                    enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry, track_max_speed_);
+                    // === 2026-08-20: chase 中跳过 pre-commit guard (同上 image_geo_fallback) ===
+                    if (!terminal_image_chase_active_) {
+                        enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry, track_max_speed_);
+                    }
                     //=======高度下降===========//
 
                     multi_uav_strike::GuidancePnDebug pn_dbg;

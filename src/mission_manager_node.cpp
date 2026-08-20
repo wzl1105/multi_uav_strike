@@ -426,6 +426,11 @@ private:
     // 内部约定:current_gimbal_pitch_ 正值=下视(度);starling_bridge 注释 angular.y 正=向上,
     //   所以积分时取负号使向上 = 内部 pitch 减小。
     GimbalControlState current_gimbal_state_ = GimbalControlState::LOCKED_AT_ZERO;
+    // === 2026-08-20: gimbal angle latch 状态切换检测 ===
+    //   gimbalCommandTimerCallback 检测 phase / skill_index 变化 → 清 latch,
+    //   防止上一次 phase / skill 的 GS 角度在新阶段继续生效。
+    MissionPhase last_gimbal_latch_phase_ = MissionPhase::PHASE_GROUND_IDLE;
+    int         last_gimbal_latch_skill_index_ = -1;
     double         gimbal_user_offset_deg_   = 0.0;   // 用户角速度积分累积偏移,LOCKED 进入时清零
     ros::Time      last_gimbal_vel_time_;              // 上一次收到 angular velocity 的时间(用于 dt 积分)
     ros::Subscriber gimbal_ang_vel_sub_;
@@ -1890,6 +1895,16 @@ public:
         if (msg->device_id != 0 && msg->device_id != self_device_id_) {
             return;
         }
+
+        // === 2026-08-20: 新 TaskFlow 到达 → 清 gimbal angle latch ===
+        //   用户口径:GS 发 angle → 保持到下次状态切换;新 task_flow 是切换信号。
+        //   防止上一次任务的 GS 角度在新任务里继续生效(尤其 task_flow 整体变化时)。
+        if (gimbal_attitude_cmd_valid_) {
+            ROS_WARN("[MissionManager] New TaskFlow → gimbal angle latch cleared (was %.2f deg)",
+                     quaternionToBodyPitchDeg(latest_gimbal_attitude_cmd_));
+        }
+        gimbal_attitude_cmd_valid_ = false;
+        latest_gimbal_attitude_stamp_ = ros::Time();
 
         //===================制导修改====================
         // Attack 速度必须由任务协议显式给出。在改变 OFFBOARD 或当前任务状态前
@@ -7393,6 +7408,12 @@ public:
         if (new_state != current_gimbal_state_) {
             if (new_state == GimbalControlState::LOCKED_AT_ZERO) {
                 gimbal_user_offset_deg_ = 0.0;
+                // 锁框架角意味着起飞/返航阶段,angle latch 也应清零 (用户协议:锁 360)
+                if (gimbal_attitude_cmd_valid_) {
+                    ROS_WARN("[MissionManager] LOCKED → gimbal angle latch cleared");
+                }
+                gimbal_attitude_cmd_valid_ = false;
+                latest_gimbal_attitude_stamp_ = ros::Time();
                 ROS_WARN("[MissionManager] Gimbal state: %s -> LOCKED_AT_ZERO "
                          "(user_offset reset, will publish 360 sentinel)",
                          gimbalStateToString(current_gimbal_state_));
@@ -7403,6 +7424,24 @@ public:
                          gimbalStateToString(new_state));
             }
             current_gimbal_state_ = new_state;
+        }
+
+        // === 2026-08-20: phase / skill_index 变化 → 清 angle latch ===
+        //   用户口径"保持到下次状态切换",这里 catch LOCKED 切换覆盖不到的事件
+        //   (e.g. GUIDANCE_TRACK → GUIDANCE_STRIKE 同为 SKILL_FOLLOW_USER 但 phase 变)。
+        if (current_phase_ != last_gimbal_latch_phase_ ||
+            current_skill_index_ != last_gimbal_latch_skill_index_) {
+            if (gimbal_attitude_cmd_valid_) {
+                ROS_WARN("[MissionManager] Phase/skill change (%d → %d, skill %d → %d) "
+                         "→ gimbal angle latch cleared",
+                         static_cast<int>(last_gimbal_latch_phase_),
+                         static_cast<int>(current_phase_),
+                         last_gimbal_latch_skill_index_, current_skill_index_);
+            }
+            gimbal_attitude_cmd_valid_ = false;
+            latest_gimbal_attitude_stamp_ = ros::Time();
+            last_gimbal_latch_phase_       = current_phase_;
+            last_gimbal_latch_skill_index_ = current_skill_index_;
         }
 
         std_msgs::Float32 msg;
@@ -7428,20 +7467,23 @@ public:
                 final_deg = base_deg;
             } else {
                 // === 优先级:rate > angle > base+offset(2026-08-20) ===
+                // === 2026-08-20: angle 命令改为 latch 模式 (保持到下次状态切换) ===
+                //   原 5s timeout 让 GS 一次角度指令 5s 后被丢弃,云台转回 base+offset;
+                //   用户口径"GS 发一帧 → 保持该角度 → 直到状态切换 (新 task_flow / skill 变化 / phase 变化)"。
+                //   latch 清零事件:
+                //     1) taskFlowCallback 入口 (新 task_flow)
+                //     2) gimbalCommandTimerCallback 检测 phase / skill_index 变化
                 const ros::Time now = ros::Time::now();
                 const bool rate_recent = !last_gimbal_vel_time_.isZero() &&
                                          (now - last_gimbal_vel_time_).toSec() < 0.5;
-                const bool angle_recent = gimbal_attitude_cmd_valid_ &&
-                                          !latest_gimbal_attitude_stamp_.isZero() &&
-                                          (now - latest_gimbal_attitude_stamp_).toSec() <
-                                              GIMBAL_ANGLE_CMD_STALE_SEC;
+                const bool angle_recent = gimbal_attitude_cmd_valid_;
                 if (rate_recent) {
                     // 角速度最新一手 GS 指令:base + offset (offset 由
                     //   gimbalAngularVelocityCallback 持续积分,这里直接用)
                     final_deg = base_deg + gimbal_user_offset_deg_;
                 } else if (angle_recent) {
-                    // 角度指令是绝对值,覆盖 base + offset
-                    final_deg = quaternionToBodyPitchDeg(latest_gimbal_attitude_cmd_);
+                    // 角度指令是绝对值,覆盖 base + offset，取绝对值因为云台只往下看，单方向
+                    final_deg = fabs(quaternionToBodyPitchDeg(latest_gimbal_attitude_cmd_));
                     gimbal_user_offset_deg_ = 0.0;  // 清零:绝对指令不留历史偏移
                 } else {
                     // 没有 GS 输入:base + offset(用户预调过的偏移保留)
