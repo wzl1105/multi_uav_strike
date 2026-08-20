@@ -45,6 +45,8 @@
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int16.h>
 #include <std_msgs/Float32.h>
+#include <std_msgs/UInt8.h>
+#include <std_srvs/Trigger.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Point.h>
@@ -351,6 +353,8 @@ private:
     ros::ServiceClient set_mode_client_; // PX4 SITL: 模式切换
     ros::ServiceClient arming_client_;  // PX4 SITL: 解锁
     ros::ServiceClient command_long_client_; // PX4 SITL: COMMAND_LONG 备用通道（绕过 SET_MODE 静默拒绝问题）
+    ros::ServiceClient trigger_gas_gen_client_; // 弹射起飞:调 power_interact_node 触发气体发生器(/trigger_gas_generator)
+    bool gas_gen_triggered_ = false; // 当前弹射会话是否已调过气体发生器(防重入)
 
     // ============== PX4 起飞 ==============
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
@@ -614,15 +618,18 @@ private:
     double takeoff_climb_rate_;    // 起飞爬升斜坡速率 (m/s,默认 3.0,避免阶跃 setpoint 引起速度饱和)
     double takeoff_start_alt_;     // TAKEOFF_EXEC 起始时刻的高度(米,ENU 上为正),用作斜坡起点
     // ===== 弹射起飞流程状态(skill_type=100) =====
+    // 2026-08-16 重构:从基于两个 dead Bool 标志(is_px4_catapult_mode_ + catapult_trigger_received_)
+    //   改为基于 starling_bridge /tzs/state/launch_state 的 vtol_state 轮询(EXTENDED_SYS_STATE #245)。
+    //   原 is_px4_catapult_mode_ / catapult_trigger_received_ 全 codebase 无 publisher, 是死订阅。
     // TODO(skill_type_mapping): 协议升级后 skill_type=100 仅表示弹射,
     //   skill_type=106 表示地面起飞;此处所有判定同步更新
     bool is_catapult_takeoff_ = false;          // 当前 task_flow 是否为弹射起飞
-    bool is_px4_catapult_mode_ = false;         // PX4 是否已被 comm_node 切到抛飞模式
-    bool catapult_trigger_received_ = false;    // 是否收到 /mission/catapult_trigger
-    ros::Time catapult_posctl_enter_time_;      // PX4 进入 POSCTL 的时刻(用于稳定等待)
-    double catapult_posctl_stable_sec_ = 1.0;   // POSCTL 持续多久才算稳定
-    ros::Subscriber catapult_trigger_sub_;
-    ros::Subscriber px4_catapult_mode_sub_;
+    uint8_t current_vtol_state_ = 0;            // PX4 EXTENDED_SYS_STATE.vtol_state(由 starling_bridge 转发)
+                                                // 0=空闲 1=抛飞未解锁 2=等待弹射 3=弹出姿态修正 4=弹射完成进位置
+    ros::Subscriber launch_state_sub_;          // 订阅 /tzs/state/launch_state(UInt8)
+    ros::Subscriber launch_intent_sub_;         // 订阅 /tzs/state/launch_intent(UInt8, 仅日志)
+    ros::Time catapult_launch_done_wait_time_;  // 触发气体发生器后开始等 vtol_state==4 的时刻(用于 60s 超时)
+    double catapult_wait_state4_timeout_sec_ = 60.0;  // 弹射完成超时,yaml 可覆盖
     // LOCAL_POSITION_NED 发送频率（Hz）。某些板子 PX4 重启后默认频率太低，
     // 必须上电后用 MAV_CMD_SET_MESSAGE_INTERVAL (511) 设置一次，否则位置数据延迟大、
     // OFFBOARD 控制发散。FCU 断连后 flag 会清掉，PX4 重启重连时自动重发。
@@ -1100,6 +1107,12 @@ public:
                                attack_direct_look_confirm_hits_, 3);
         attack_direct_look_confirm_hits_ = std::max(1, attack_direct_look_confirm_hits_);
         // === CODEX DIRECT-LOOK END ===
+
+        // === 弹射起飞 vtol_state 等待超时(2026-08-16) ===
+        // 触发气体发生器后等 vtol_state==4(PX4 弹射完成,进入位置)的兜底
+        // 默认 60s(1 分钟),yaml 可覆盖
+        nh_private_.param<double>("catapult_wait_state4_timeout_sec",
+                                  catapult_wait_state4_timeout_sec_, 60.0);
     }
 
     void initSubscribers() {
@@ -1229,13 +1242,17 @@ public:
         gimbal_attitude_sub_ = nh_.subscribe("tzs/cmd/gimbal_attitude", 10,
                                              &MissionManager::gimbalAttitudeCallback, this);
 
-        // ===== 弹射起飞流程(协议 TODO: skill_type=100 = 弹射, 106 = 地面) =====
-        // 弹射指令触发(由外部弹射控制节点发,本节点不实现发端)
-        catapult_trigger_sub_ = nh_.subscribe("mission/catapult_trigger", 10,
-                                              &MissionManager::catapultTriggerCallback, this);
-        // PX4 抛飞模式就绪(由 comm_node 切完 PX4 模式后发 true)
-        px4_catapult_mode_sub_ = nh_.subscribe("px4/catapult_mode_ready", 10,
-                                               &MissionManager::px4CatapultModeCallback, this);
+        // ===== 弹射起飞流程:vtol_state 由 starling_bridge 从 PX4 EXTENDED_SYS_STATE(#245) 转发 =====
+        // vtol_state(UInt8):0=空闲 1=抛飞未解锁 2=等待弹射 3=弹出姿态修正 4=弹射完成进位置
+        launch_state_sub_ = nh_.subscribe("tzs/state/launch_state", 10,
+                                          &MissionManager::launchStateCallback, this);
+        // launch_intent(UInt8):1=GS 已发 cmd=175 进入弹射 2=GS 已发 cmd=175 退出弹射
+        //   仅作为日志/辅助,门控只看 vtol_state
+        launch_intent_sub_ = nh_.subscribe("tzs/state/launch_intent", 10,
+                                           &MissionManager::launchIntentCallback, this);
+        // 触发气体发生器(由 power_interact_node 暴露 /trigger_gas_generator 服务)
+        trigger_gas_gen_client_ = nh_.serviceClient<std_srvs::Trigger>(
+            "/trigger_gas_generator");
     }
 
     void initPublishers() {
@@ -1807,35 +1824,29 @@ public:
     }
 
     /**
-     * 弹射起飞 trigger 回调
-     * 由外部弹射控制节点触发,本节点不实现发端
-     * 仅当 is_catapult_takeoff_=true(当前 task_flow 首发是 skill_type=100)时认账,
-     *   否则丢弃(防御性:防止地面起飞误触发)
+     * starling_bridge 转发的 PX4 EXTENDED_SYS_STATE(#245) vtol_state
+     * 0=空闲 1=抛飞未解锁 2=等待弹射 3=弹出姿态修正 4=弹射完成进位置
+     * 弹射状态机门控只看此值。
      */
-    void catapultTriggerCallback(const std_msgs::Bool::ConstPtr& msg) {
-        if (!msg->data) return;
-        if (!is_catapult_takeoff_) {
-            ROS_WARN_THROTTLE(2.0, "[MissionManager] catapult_trigger received but current task_flow "
-                                   "is NOT catapult takeoff (skill_type=%s) — ignored",
-                              (skill_queue_.empty() ? "none" :
-                               std::to_string(skill_queue_[0].msg.skill_type).c_str()));
-            return;
+    void launchStateCallback(const std_msgs::UInt8::ConstPtr& msg) {
+        if (msg->data != current_vtol_state_) {
+            ROS_WARN("[MissionManager] vtol_state changed: %u -> %u (catapult_takeoff=%s)",
+                     static_cast<unsigned>(current_vtol_state_),
+                     static_cast<unsigned>(msg->data),
+                     is_catapult_takeoff_ ? "true" : "false");
+            current_vtol_state_ = msg->data;
         }
-        catapult_trigger_received_ = true;
-        ROS_WARN("[MissionManager] >>>> Catapult TRIGGER received (armed in PX4 catapult mode=%s)",
-                 is_px4_catapult_mode_ ? "YES" : "NO (waiting for comm_node)");
     }
 
     /**
-     * PX4 抛飞模式就绪回调(由 comm_node 切完 PX4 模式后发 true)
-     * - true:  comm_node 已把 PX4 切到抛飞模式(MAV_CMD_DO_GO_ARMED/类似指令)
-     * - false: 收到 reset,准备 reset 流程
-     * 配合 is_catapult_takeoff_ 使用:只有当前 task_flow 是弹射起飞时才接收
+     * starling_bridge 转发的弹射意图(UInt8):1=GS 已发 cmd=175 param1=1 进入弹射
+     * 仅作为日志/诊断,不影响判断(门控只看 vtol_state)
      */
-    void px4CatapultModeCallback(const std_msgs::Bool::ConstPtr& msg) {
-        is_px4_catapult_mode_ = msg->data;
-        ROS_WARN("[MissionManager] PX4 catapult_mode_ready = %s",
-                 is_px4_catapult_mode_ ? "TRUE (PX4 in catapult mode)" : "FALSE");
+    void launchIntentCallback(const std_msgs::UInt8::ConstPtr& msg) {
+        ROS_WARN("[MissionManager] launch_intent=%u (vtol_state=%u, catapult_takeoff=%s)",
+                 static_cast<unsigned>(msg->data),
+                 static_cast<unsigned>(current_vtol_state_),
+                 is_catapult_takeoff_ ? "true" : "false");
     }
 
     /**
@@ -1895,6 +1906,51 @@ public:
             }
         }
         //===================制导修改====================
+
+        // === 弹射起飞 TaskFlow 验证(2026-08-16 重构) ===
+        // 业务约束:
+        //   (1) 只能在 PHASE_GROUND_IDLE 时接收(地面起飞路径是 106,这里是 100=弹射)
+        //   (2) 必须有后置技能:101 Gather(集结) 或 102 Search(搜索),无后继或非 101/102 整条拒收
+        //   (3) vtol_state 必须 == 2(PX4 等待弹射),否则 GS 必须先发 cmd=175 param1=1
+        // 全部三个条件都满足才允许进入 skill_queue_;任一不满足 → ROS_ERROR + return
+        if (!msg->skills.empty() && msg->skills[0].skill_type == 100) {
+            // (1) 地面检查
+            if (current_phase_ != MissionPhase::PHASE_GROUND_IDLE) {
+                ROS_ERROR("[MissionManager] REJECT catapult TaskFlow id=%s: not on ground "
+                          "(phase=%s, armed=%d). Catapult(100) only allowed in PHASE_GROUND_IDLE.",
+                          msg->flow_id.c_str(),
+                          missionPhaseToString().c_str(),
+                          current_mavros_state_.armed ? 1 : 0);
+                return;
+            }
+            // (2) 后继技能必须是 Gather(101) 或 Search(102)
+            if (msg->skills.size() < 2 ||
+                (msg->skills[1].skill_type != 101 && msg->skills[1].skill_type != 102)) {
+                ROS_ERROR("[MissionManager] REJECT catapult TaskFlow id=%s: skill_type=100 must be "
+                          "followed by Gather(101) or Search(102) — got '%s' (type=%u). Ignored for safety.",
+                          msg->flow_id.c_str(),
+                          msg->skills.size() >= 2 ? msg->skills[1].skill_id.c_str() : "<none>",
+                          msg->skills.size() >= 2 ? static_cast<unsigned>(msg->skills[1].skill_type) : 0);
+                return;
+            }
+            // (3) vtol_state==2 门控
+            if (current_vtol_state_ != 2) {
+                const char* hint = (current_vtol_state_ == 0)
+                    ? "no vtol_state received yet — check if starling_bridge is running"
+                    : "PX4 not in 'waiting for catapult' mode — GS must send cmd=175 param1=1 first";
+                ROS_ERROR("[MissionManager] REJECT catapult TaskFlow id=%s: vtol_state=%u (need 2). %s.",
+                          msg->flow_id.c_str(),
+                          static_cast<unsigned>(current_vtol_state_),
+                          hint);
+                return;
+            }
+            ROS_WARN("[MissionManager] >>>> Catapult TaskFlow id=%s ACCEPTED (ground + follow-up "
+                     "skill_id=%s type=%u + vtol_state=2). Will trigger gas generator on entering "
+                     "TAKEOFF_CATAPULT_ARMED.",
+                     msg->flow_id.c_str(),
+                     msg->skills[1].skill_id.c_str(),
+                     static_cast<unsigned>(msg->skills[1].skill_type));
+        }
 
         // === 飞手接管场景下的"新任务"路径(2026-07-23,用户口径 E)===
         // 与"继续任务"路径(等 GS 发 50000 切回 OFFBOARD, mavrosStateCallback 触发 snapshot recovery)
@@ -2216,8 +2272,8 @@ public:
         // 协议 TODO(skill_type_mapping): 100=弹射起飞,106=地面起飞
         if (!skill_queue_.empty() && (skill_queue_[0].msg.skill_type == 100 || skill_queue_[0].msg.skill_type == 106)) {
             // === 弹射起飞判定 (skill_type=100) ===
-            // 设置 is_catapult_takeoff_,并在每个新 task_flow 开始时清掉旧的 trigger 状态
-            // 这样:新一发 task_flow 是弹射则重新等 trigger;不是则彻底忽略外部 trigger。
+            // 设置 is_catapult_takeoff_,并在每个新 task_flow 开始时清掉旧的弹射会话状态
+            // 这样:新一发 task_flow 是弹射则重新等 vtol_state==2 + 重新触发;不是则彻底忽略。
             bool new_is_catapult = (skill_queue_[0].msg.skill_type == 100);
             if (new_is_catapult != is_catapult_takeoff_) {
                 ROS_WARN("[MissionManager] Takeoff type changed: %s -> %s "
@@ -2225,11 +2281,9 @@ public:
                          is_catapult_takeoff_ ? "CATAPULT(100)" : "GROUND(106)",
                          new_is_catapult ? "CATAPULT(100)" : "GROUND(106)");
             }
-            is_catapult_takeoff_       = new_is_catapult;
-            catapult_trigger_received_ = false;   // 每个新 task_flow 重新等 trigger
-            // is_px4_catapult_mode_ 保持:comm_node 切的模式有持续性,不应每次 flow 重置
-            //   (万一 comm_node 没发 false 关闭信号,这里避免误清)
-            catapult_posctl_enter_time_ = ros::Time();  // isZero() 表示还没进入 POSCTL
+            is_catapult_takeoff_            = new_is_catapult;
+            gas_gen_triggered_              = false;  // 每个新 task_flow 重新允许触发
+            catapult_launch_done_wait_time_  = ros::Time();  // 重置超时起点
 
             if (current_phase_ != MissionPhase::PHASE_TAKING_OFF) {
                 // 缓存起飞前的 phase 和 work_mode,performTakeoffHandoff 用
@@ -4594,8 +4648,8 @@ public:
                     if (is_catapult_takeoff_) {
                         takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_ARMED;
                         ROS_WARN("[MissionManager] PX4 Connected, CATAPULT takeoff flow — "
-                                 "waiting for catapult_mode_ready=%s + catapult_trigger",
-                                 is_px4_catapult_mode_ ? "true" : "false (need comm_node)");
+                                 "waiting for vtol_state==2 (current=%u)",
+                                 static_cast<unsigned>(current_vtol_state_));
                     } else {
                         takeoff_state_ = TakeoffState::TAKEOFF_WAITING_FCU;
                         ROS_WARN("[MissionManager] PX4 Connected, waiting for initialization...");
@@ -4604,109 +4658,123 @@ public:
                 break;
 
             case TakeoffState::TAKEOFF_CATAPULT_ARMED:
-                // 弹射起飞第一步:等 PX4 抛飞模式就绪 (comm_node 通过 px4/catapult_mode_ready 通知)
-                //                  + 外部 trigger (mission/catapult_trigger)
-                // 必须两者都到,因为:
-                //   - 只到 PX4 模式没 trigger:不会发射, UAV 静等 → 浪费
-                //   - 只到 trigger 没 PX4 模式:外部发弹射但 PX4 没准备好,危险
-                if (!is_px4_catapult_mode_) {
-                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT_ARMED: waiting for PX4 catapult "
-                                          "mode (comm_node sets it via px4/catapult_mode_ready)");
+                // 弹射起飞第一步(2026-08-16 重构):等 PX4 进入 vtol_state==2(等待弹射)
+                // 检测到 state==2 后立即调气体发生器(one-shot),不卡中间态
+                if (current_vtol_state_ != 2) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT_ARMED: waiting for vtol_state==2 "
+                                          "(current=%u, catapult_triggered=%s)",
+                                      static_cast<unsigned>(current_vtol_state_),
+                                      gas_gen_triggered_ ? "true" : "false");
                     break;
                 }
-                if (!catapult_trigger_received_) {
-                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT_ARMED: PX4 catapult mode ready, "
-                                          "waiting for catapult_trigger from external node");
-                    break;
-                }
-                // 两个都齐了 — 记录起始时间,准备监视 POSCTL 进入
-                catapult_posctl_enter_time_ = ros::Time();
-                takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_TRIGGERED;
-                ROS_WARN("[MissionManager] >>>> CATAPULT armed+triggered, watching PX4 enter POSCTL "
-                         "(commander will switch to POSCTL after launch detects sustained climb)...");
-                break;
-
-            case TakeoffState::TAKEOFF_CATAPULT_TRIGGERED: {
-                // 弹射起飞第二步:等 PX4 自动切到 POSCTL(发射后 PX4 自主控制并进入位置模式)
-                // 通过 mavros/state 反馈,current_mavros_state_.mode == "POSCTL" 视为进入
-                // 兜底超时:60s 内没进 POSCTL 视为发射异常,转 FAILED
-                if (current_mavros_state_.mode == "POSCTL") {
-                    catapult_posctl_enter_time_ = ros::Time::now();
-                    takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_POSCTL;
-                    ROS_WARN("[MissionManager] >>>> CATAPULT: PX4 entered POSCTL (mode=%s, armed=%d)",
-                             current_mavros_state_.mode.c_str(),
-                             current_mavros_state_.armed ? 1 : 0);
+                // 调气体发生器(one-shot)。服务不存在时打 ERROR,下个 tick 重试
+                if (trigger_gas_gen_client_.exists() ||
+                    trigger_gas_gen_client_.waitForExistence(ros::Duration(0.5))) {
+                    std_srvs::Trigger srv;
+                    bool ok = trigger_gas_gen_client_.call(srv);
+                    ROS_WARN("[MissionManager] >>>> CATAPULT: gas generator call %s "
+                             "(response: success=%s, msg='%s')",
+                             ok ? "OK" : "FAILED",
+                             ok ? (srv.response.success ? "true" : "false") : "n/a",
+                             ok ? srv.response.message.c_str() : "n/a");
+                    if (!ok) {
+                        ROS_ERROR_THROTTLE(2.0, "[MissionManager] CATAPULT: /trigger_gas_generator call failed");
+                    }
                 } else {
-                    double since_trigger = catapult_posctl_enter_time_.isZero()
-                        ? (ros::Time::now() - (ros::Time::now() - ros::Duration(catapult_posctl_stable_sec_))).toSec()
-                        : 0.0;
-                    // 注意:catapult_posctl_enter_time_ 此时 isZero (TRIGGERED 进入前清零),
-                    // 用 takeoff_start_time_ (Phase=TAKING_OFF 时刻) 估算经过时间更稳
-                    static ros::Time catapult_trigger_armed_time;  // 静态变量,记录 armed→triggered 的过渡
-                    if (catapult_posctl_enter_time_.isZero() && catapult_trigger_armed_time.isZero()) {
-                        catapult_trigger_armed_time = ros::Time::now();
-                    }
-                    double elapsed_in_triggered = (ros::Time::now() - catapult_trigger_armed_time).toSec();
-                    if (elapsed_in_triggered > 60.0) {
-                        ROS_ERROR("[MissionManager] CATAPULT: PX4 did not enter POSCTL within 60s, "
-                                  "FAILED (current mode=%s)",
-                                  current_mavros_state_.mode.c_str());
-                        catapult_trigger_armed_time = ros::Time();  // 重置
-                        takeoff_state_ = TakeoffState::TAKEOFF_FAILED;
-                        current_phase_ = MissionPhase::PHASE_FAILED;
-                    } else {
-                        ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT: waiting for PX4 POSCTL "
-                                              "(current mode=%s, %.1fs/60s)",
-                                          current_mavros_state_.mode.c_str(), elapsed_in_triggered);
-                    }
-                    (void)since_trigger;  // 抑制未使用变量警告
+                    ROS_ERROR_THROTTLE(2.0, "[MissionManager] CATAPULT: /trigger_gas_generator service "
+                                           "unavailable, retry next tick");
                 }
+                gas_gen_triggered_ = true;
+                catapult_launch_done_wait_time_ = ros::Time::now();
+                takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_TRIGGERED;
+                ROS_WARN("[MissionManager] >>>> CATAPULT: vtol_state==2 + gas gen triggered, "
+                         "watching for vtol_state==4 (timeout=%.0fs)",
+                         catapult_wait_state4_timeout_sec_);
                 break;
-            }
 
-            case TakeoffState::TAKEOFF_CATAPULT_POSCTL: {
-                // 弹射起飞第三步:PX4 POSCTL 稳定 catapult_posctl_stable_sec_(1s) 后
-                //                启动 setpoint publisher + 切 OFFBOARD 接管
-                // 此处复用 TAKEOFF_WAITING_FCU 的 LOCAL_POSITION_NED rate 设置逻辑
-                if (is_local_position_rate_set_ == false) {
-                    if (set_message_rate_start_time_.isZero()) {
-                        set_message_rate_start_time_ = ros::Time::now();
-                    }
-                    if (setMessageRate(32, local_position_rate_hz_)) {
-                        is_local_position_rate_set_ = true;
-                        set_message_rate_start_time_ = ros::Time();
-                        set_message_rate_retry_count_ = 0;
-                    } else {
-                        set_message_rate_retry_count_++;
-                        double elapsed = (ros::Time::now() - set_message_rate_start_time_).toSec();
-                        bool retries_done = (set_message_rate_retry_count_ >= max_set_message_rate_retries_);
-                        bool timeout = (elapsed > set_message_rate_max_wait_sec_);
-                        if (retries_done || timeout) {
-                            ROS_ERROR("[MissionManager] CATAPULT: LOCAL_POSITION_NED rate set GIVE UP — "
-                                      "proceeding anyway");
+            case TakeoffState::TAKEOFF_CATAPULT_TRIGGERED:
+                // 弹射起飞第二步:等 vtol_state==4(PX4 弹射完成,进入位置)
+                // 不判断中间态 3=姿态修正,直接看最终态 4。超时 catapult_wait_state4_timeout_sec_=60s
+                if (current_vtol_state_ == 4) {
+                    // === 2026-08-20 Fix A:进 OFFBOARD 前确保 LOCAL_POSITION_NED rate 已设 ===
+                    //   弹射路径绕过 TAKEOFF_WAITING_FCU,旧流程由 TAKEOFF_CATAPULT_POSCTL
+                    //   setMessageRate(32);新流程把 POSCTL 并入 TRIGGERED 后丢了这一步,
+                    //   vtol_state==4 直接进 SETTING_OFFBOARD 会让 PX4 用默认低频
+                    //   LOCAL_POSITION_NED → OFFBOARD position 震荡。复用 WAITING_FCU 的
+                    //   setMessageRate + 重试/超时兜底逻辑,在 TRIGGERED 落地。
+                    if (!is_local_position_rate_set_) {
+                        if (set_message_rate_start_time_.isZero()) {
+                            set_message_rate_start_time_ = ros::Time::now();
+                        }
+                        if (setMessageRate(32, local_position_rate_hz_)) {
                             is_local_position_rate_set_ = true;
+                            ROS_WARN("[MissionManager] >>>> CATAPULT: LOCAL_POSITION_NED rate set "
+                                     "to %.1f Hz (attempt %d, elapsed %.2fs)",
+                                     local_position_rate_hz_,
+                                     set_message_rate_retry_count_ + 1,
+                                     (ros::Time::now() - set_message_rate_start_time_).toSec());
                             set_message_rate_start_time_ = ros::Time();
                             set_message_rate_retry_count_ = 0;
+                            // fall through 进 SETTING_OFFBOARD
                         } else {
-                            break;  // 下个 tick 再试
+                            set_message_rate_retry_count_++;
+                            double elapsed = (ros::Time::now() -
+                                              set_message_rate_start_time_).toSec();
+                            bool retries_done = (set_message_rate_retry_count_ >=
+                                                 max_set_message_rate_retries_);
+                            bool timeout = (elapsed > set_message_rate_max_wait_sec_);
+                            if (retries_done || timeout) {
+                                ROS_ERROR("[MissionManager] >>>> CATAPULT: LOCAL_POSITION_NED rate "
+                                          "set GIVE UP (%s after %d attempts / %.1fs). Proceeding "
+                                          "with PX4 default rate — UAV may oscillate in OFFBOARD.",
+                                          retries_done ? "retries exhausted" : "timeout",
+                                          set_message_rate_retry_count_, elapsed);
+                                is_local_position_rate_set_ = true;
+                                set_message_rate_start_time_ = ros::Time();
+                                set_message_rate_retry_count_ = 0;
+                                // fall through 进 SETTING_OFFBOARD
+                            } else {
+                                ROS_WARN_THROTTLE(2.0, "[MissionManager] >>>> CATAPULT: "
+                                                      "LOCAL_POSITION_NED rate set FAILED "
+                                                      "(attempt %d/%d, elapsed %.1fs/%.1fs), "
+                                                      "will retry",
+                                                  set_message_rate_retry_count_,
+                                                  max_set_message_rate_retries_,
+                                                  elapsed, set_message_rate_max_wait_sec_);
+                                break;  // 还没放弃 —下个 tick 再试
+                            }
                         }
                     }
-                }
-                // POSCTL 稳定等待(系统不抖后再接管)
-                double posctl_elapsed = (ros::Time::now() - catapult_posctl_enter_time_).toSec();
-                if (posctl_elapsed < catapult_posctl_stable_sec_) {
-                    ROS_WARN_THROTTLE(0.3, "[MissionManager] CATAPULT: POSCTL stable wait %.2fs/%.2fs",
-                                      posctl_elapsed, catapult_posctl_stable_sec_);
+                    ROS_WARN("[MissionManager] >>>> CATAPULT: vtol_state==4 (launch complete), "
+                             "handing off to OFFBOARD takeover");
+                    // 复用 TAKEOFF_SETTING_OFFBOARD 的 ARM + setpoint 预发 + OFFBOARD 切换
+                    takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
                     break;
                 }
-                // 稳定时间到 — 进 SETTING_OFFBOARD 接管
-                ROS_WARN("[MissionManager] >>>> CATAPULT: POSCTL stable, switching to OFFBOARD takeover");
-                //=========setpoint====//
-                takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
-                // position 流统一在 SETTING_OFFBOARD 确认 armed 后启动。
-                //=========setpoint====//
+                if ((ros::Time::now() - catapult_launch_done_wait_time_).toSec() >
+                    catapult_wait_state4_timeout_sec_) {
+                    ROS_ERROR("[MissionManager] CATAPULT: vtol_state did not reach 4 within %.0fs "
+                              "(last=%u), FAILED",
+                              catapult_wait_state4_timeout_sec_,
+                              static_cast<unsigned>(current_vtol_state_));
+                    takeoff_state_ = TakeoffState::TAKEOFF_FAILED;
+                    current_phase_ = MissionPhase::PHASE_FAILED;
+                } else {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT: waiting vtol_state==4 "
+                                          "(current=%u, %.1fs/%.0fs)",
+                                      static_cast<unsigned>(current_vtol_state_),
+                                      (ros::Time::now() - catapult_launch_done_wait_time_).toSec(),
+                                      catapult_wait_state4_timeout_sec_);
+                }
                 break;
-            }
+
+            case TakeoffState::TAKEOFF_CATAPULT_POSCTL:
+                // 已被新流程合并到 TAKEOFF_CATAPULT_TRIGGERED。保留枚举值但 case 体仅记 ERROR 提示。
+                // 触发条件:有遗留状态(老版本启动后停在 POSCTL),首 tick 立刻进 SETTING_OFFBOARD。
+                ROS_ERROR("[MissionManager] CATAPULT_POSCTL state entered unexpectedly (should be "
+                          "merged into CATAPULT_TRIGGERED). Forcing OFFBOARD takeover.");
+                takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
+                break;
 
             case TakeoffState::TAKEOFF_WAITING_FCU:
                 if (!is_px4_connected_) {

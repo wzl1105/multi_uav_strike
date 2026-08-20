@@ -105,3 +105,12 @@ attack_direct_look_settle_sec: 1.5
 # 用户确认要求：同一 cluster 必须连续检测 3 帧。
 attack_direct_look_confirm_hits: 3
 # === CODEX DIRECT-LOOK END ===
+
+# === 弹射起飞 vtol_state 等待超时(2026-08-16) ===
+# 触发气体发生器后等 vtol_state==4(PX4 弹射完成,进入位置)的兜底
+# 默认 60s(1 分钟):PX4 内部弹射→姿态修正→定点稳定总时长通常 10~30s,
+#   真机首飞或调参时给 1 分钟余量。超过此值视为发射/定位异常,
+#   转 TAKEOFF_FAILED → PHASE_FAILED。
+# 注:vtol_state==2 的检查在 TaskFlow 接收时已完成,触发后不再判断中间态 3=姿态修正,
+#   直接看最终态 4。
+catapult_wait_state4_timeout_sec: 60.0
