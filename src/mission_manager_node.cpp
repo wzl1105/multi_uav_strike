@@ -2812,9 +2812,24 @@ public:
         //   之前 gate 在 is_locked 上,但 bag 01-13-37 走 search 路径 cluster 没 lock,
         //   导致攻击推到 WP1 之间仍保留原 WP1 → UAV 绕回 WP1 再去 WP2。
         //   现在无条件按几何判定 (dWP2 < dWP1 即改写)。
+        //
+        // === 2026-08-20: 修 rewrite 写错坐标系 + 距离比较单位混算 ===
+        //   旧代码 wp1.x = cur_x 直接把 mavros ENU/NED 米数塞进 GPS 经纬度字段,
+        //   waypoint_executor 把它当真 GPS 喂给 gpsToNed → 算出几百万米的 NED 偏移,
+        //   UAV 朝 9300km 外目标飞,实飞 (strike_runaway.bag) + 仿真
+        //   (uav0_strike_2026-08-20-15-32-04_0.bag) 两次都撞同一颗雷。
+        //   修复:把 UAV 本机 NED 经 nedToGps 转回 GPS 再写;距离比较用 gpsDeltaN/E
+        //   把 WP1/WP2 GPS 也先转到本机 NED,统一米数。
         if (sr.msg.skill_type != 105 ||
             sr.msg.skill_area_path.poses.size() < 2 ||
             !is_pose_received_) {
+            return;
+        }
+        // === 修:nedToGps 必须有 PX4 home 才能保证转换精度,否则回退用 0/0 又会偏 km ===
+        if (!ref_initialized_) {
+            ROS_INFO_THROTTLE(2.0,
+                "[MissionManager] WP1 swap skipped: PX4 home not locked yet "
+                "(ref_initialized_=false), retry on next skill push");
             return;
         }
         auto& wp1 = sr.msg.skill_area_path.poses.front().pose.position;
@@ -2823,10 +2838,20 @@ public:
             !std::isfinite(wp2.x) || !std::isfinite(wp2.y)) {
             return;
         }
-        const double cur_x = current_pose_.pose.position.x;
-        const double cur_y = current_pose_.pose.position.y;
-        const double d_wp1 = std::hypot(wp1.x - cur_x, wp1.y - cur_y);
-        const double d_wp2 = std::hypot(wp2.x - cur_x, wp2.y - cur_y);
+
+        // current_pose_.pose.position 已是 NED 米数 (selfPoseCallback ENU→NED 转好)
+        //   .x = 北, .y = 东, .z = 下
+        const double cur_ned_x = current_pose_.pose.position.x;
+        const double cur_ned_y = current_pose_.pose.position.y;
+        const double cur_ned_z = current_pose_.pose.position.z;
+
+        // === 修:距离比较统一用米 — WP GPS 先转到本机 NED ===
+        const double wp1_n = gpsDeltaN(ref_lat_, wp1.x);
+        const double wp1_e = gpsDeltaE(ref_lon_, wp1.y, ref_lat_);
+        const double wp2_n = gpsDeltaN(ref_lat_, wp2.x);
+        const double wp2_e = gpsDeltaE(ref_lon_, wp2.y, ref_lat_);
+        const double d_wp1 = std::hypot(wp1_n - cur_ned_x, wp1_e - cur_ned_y);
+        const double d_wp2 = std::hypot(wp2_n - cur_ned_x, wp2_e - cur_ned_y);
         if (d_wp2 >= d_wp1) {
             ROS_INFO_THROTTLE(2.0,
                 "[MissionManager] WP1 swap not triggered: dWP2=%.1fm >= dWP1=%.1fm "
@@ -2834,16 +2859,35 @@ public:
                 d_wp2, d_wp1);
             return;
         }
+
+        // === 修:UAV 本机 NED 经 nedToGps 转回 GPS 再写,不是直接塞米数 ===
+        //   当前 y 语义陷阱:
+        //     - selfPoseCallback 把 mavros ENU.x (东向米) 直接当 current_pose.y,
+        //       所以 cur_ned_y 是标准 NED 东向米(正值=东)
+        //     - mission_manager::nedToGps 注释写"NWU +y=西"且按西向米读 y:
+        //         lon = ref_lon_ - ned_y (西向→经度减)
+        //     - 这俩约定相反 —— 直接传 cur_ned_y 进去,经度方向会反。
+        //   跟 waypoint_executor.gpsToNed (ned_y = 东向米) + comm_node.nedToGpsFallback
+        //   (lon = ref_lon + ned_y) 对比,mission_manager::nedToGps 是项目里唯一一个按
+        //   NWD (西向) 写的 caller (cluster.ned_y 也按西向约定,见 L317/L2943)。
+        //   修法:caller 侧反转符号,把东向米转成西向米喂给 nedToGps。
+        //   x/z 不动 (北向/下向,NED/NWD 同方向)。
+        double wp1_lat, wp1_lon, wp1_alt;
+        nedToGps(cur_ned_x, -cur_ned_y, cur_ned_z, wp1_lat, wp1_lon, wp1_alt);
+
         ROS_WARN("[MissionManager] Attack WP1 swap (cluster locked): "
                  "UAV closer to WP2 (%.1fm) than WP1 (%.1fm); "
-                 "rewrite WP1 to current UAV pos (%.3fN, %.3fE, alt=%.2f); "
-                 "original WP1 was (%.3fN, %.3fE, alt=%.2f)",
+                 "rewrite WP1 to current UAV pos (%.7fN, %.7fE, alt=%.2f); "
+                 "original WP1 was (%.7fN, %.7fE, alt=%.2f)",
                  d_wp2, d_wp1,
-                 cur_x, cur_y, current_pose_.pose.position.z,
+                 wp1_lat, wp1_lon, wp1_alt,
                  wp1.x, wp1.y, wp1.z);
-        wp1.x = cur_x;
-        wp1.y = cur_y;
-        // wp1.z 不动 — 交给 applyAttackPreDescentToWp1() 按新 horizontal 重算
+        wp1.x = wp1_lat;
+        wp1.y = wp1_lon;
+        // wp1.z 也覆盖 — 旧代码 "不动 z" 是基于"WP1 是 65m 目标观测点,留给 pre-descent
+        //   往下压"的设计,但 rewrite 已经把 WP1 移到 UAV 当前位置,UAV 当前高就是新 WP1.z,
+        //   让 applyAttackPreDescentToWp1 看到的是真实水平距离而不是夹了 65m 残值。
+        wp1.z = wp1_alt;
     }
     //=======高度下降===========//
 
