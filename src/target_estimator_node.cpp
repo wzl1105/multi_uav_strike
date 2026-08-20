@@ -617,7 +617,7 @@ public:
     //=============一定打击=========//
     void updateFirstWaypointLatch() {
         if (search_area_first_waypoint_reached_ || !current_skill_executing_ ||
-            current_skill_type_ != 102 ||
+            (current_skill_type_ != 102 && current_skill_type_ != 105) ||
             !waypoint_status_received_) {
             return;
         }
@@ -626,8 +626,14 @@ public:
             latest_waypoint_status_.skill_idx >= 1) {
             search_area_first_waypoint_reached_ = true;
             cluster_skill_active_ = true;
-            ROS_INFO("[TargetClusterer] Search-area first-waypoint clustering gate opened: "
+            // skill 102:搜索区第一个航点到达 (开始允许聚类)
+            // skill 105:WP1 到达 (skill_idx 0=WP1, 1=WP2;idx>=1 表示已过 WP1)
+            //   起飞直接发 105 场景下,没有 102 提前开 gate,
+            //   必须靠 WP1 到达来开,否则 guidance 全程没 cluster 输入。
+            const char* tag = (current_skill_type_ == 102) ? "Search" : "Attack";
+            ROS_INFO("[TargetClusterer] %s-area first-waypoint clustering gate opened: "
                      "skill_id=%s skill_idx=%u/%u",
+                     tag,
                      current_skill_id_.c_str(),
                      latest_waypoint_status_.skill_idx,
                      latest_waypoint_status_.skill_total);

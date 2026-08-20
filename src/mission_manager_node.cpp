@@ -6941,6 +6941,20 @@ public:
         wp2_fallback_pose_.pose.orientation.w = 1.0;
         wp2_fallback_pose_.header.frame_id = viz_frame_;
 
+        // === 2026-08-20: 必须先更新 guidance_speed_ 再 startGuidanceApproach() ===
+        //   uav0_strike_10-54-22 bag 实测:skill 105 task_speed=15.0,WP1 到达后
+        //   startGuidanceApproach 内部读 guidance_speed_ 默认 10.0 → guidance 起飞
+        //   用 10 m/s 而不是 attack_speed 15.0。SEARCH_TRACK 路径 (L3934/L4107)
+        //   在 triggerStrike 前显式设 guidance_speed_ = task_speed;这条
+        //   enterGuidanceForAttackWp1toWp2 路径漏了,补上。
+        //   skill 105:用 std::min 钳到 attack_max_speed_ (=40 m/s 默认)
+        guidance_speed_ = std::min(static_cast<double>(sr.msg.task_speed),
+                                   attack_max_speed_);
+        ROS_WARN("[MissionManager] enterGuidanceForAttackWp1toWp2: guidance_speed_ "
+                 "set to %.2f m/s (task_speed=%.2f, attack_max=%.2f)",
+                 guidance_speed_, static_cast<double>(sr.msg.task_speed),
+                 attack_max_speed_);
+
         // === startGuidanceApproach() (无 cluster lock 守门) ===
         attack_strike_phase_active_ = true;
         startGuidanceApproach();  // 内部设 is_guidance_active_=true, 发 enable=true

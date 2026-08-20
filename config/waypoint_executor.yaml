@@ -86,7 +86,29 @@ vel_slew_max_vert_accel: 4.0    # m/s²,垂直速度斜坡上限
 #   已经对齐,无阶跃切换。154° 转弯变成"接近过程里慢慢转",UAV 不再
 #   在 WP1 瞬间换向。
 #   仅 attack (skill 105) 且下一段存在时启用,不影响搜索模式。
-pre_align_radius: 30.0           # m,WP1 预转向触发半径
+pre_align_radius: 30.0           # m,WP1 预转向触发半径 (默认/搜索)
+# === 2026-08-20: Attack (skill 105) 专用预转向半径 ===
+#   接 105 skill 时把 pre_align_radius 临时扩大到 attack_pre_align_radius,
+#   给大角度转弯(典型 100°+)留 3.3s 缓冲(15 m/s × 1 rad/s yaw_rate
+#   可转 ~190°,足够覆盖 154° 转弯无残差)。
+#   80m 偏大,实测"提前转弯太多",缩到 50m 折中。搜索模式继续用 30m,
+#   过大会把 blend 提前到还不知道下一段方向的段首,反而引入扰动。
+attack_pre_align_radius: 50.0    # m,Attack (skill 105) 临时扩大半径
+
+# === 2026-08-20: Attack WP1 放宽到达 + 小圆弧进入 (治本位置过冲) ===
+#   attack_wp1_arrival_threshold: 飞向 WP1 (skill 105 SKILL_AREA idx=0) 时改用
+#     水平距离判定。uav0_strike_10-36-36 实测 3m 时,pre_align 区 (50m) bearing
+#     预转会让 yaw 朝 WP1→WP2 偏 → PX4 内部可能有 cross-track 修正 → UAV
+#     在 ~20m 距离减速 / 摇摆,偶尔进不了 3m 圈就停摆。
+#     放宽到 5m:提前 0.33s (15 m/s) 触发 idx++ 切到 WP2 段,L1 自然指向 WP2,
+#     视觉上"基本贴 WP1 拐弯",精度仍优于 8m+ (那个距离像绕开 WP1 直飞 WP2)。
+#     WP2 (idx=1) 继续用严格 1m 3D 距离,打击精度不放松。
+#   attack_wp1_arc_radius: 接近 WP1 < 此距时把 bearing 直接强制朝 WP1→WP2 方向,
+#     默认 5m,覆盖 pre_align 的 smoothstep 渐进 blend,在最后 5m 给干净的对准。
+#     不动 vx/vy (避免强制降速),只在 bearing 上覆盖。
+#     仅 skill 105 SKILL_AREA idx=0 启用,不影响其他模式/WP2/搜索航线。
+attack_wp1_arrival_threshold: 8.0  # m,Attack WP1 水平到达阈值 (10-36-36: 3→5)
+attack_wp1_arc_radius: 5.0         # m,Attack WP1 小圆弧进入触发半径
 
 # 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
 lidar_building_avoidance_enabled: false

@@ -278,7 +278,26 @@ private:
     //   方向漂 75m。修法:距离 < pre_align_radius_ 起,blend desired_yaw
     //   朝下一段方向,到达 WP1 时 desired_yaw 已经对齐,无阶跃切换。
     //   仅 attack (skill 105) 末段(WP1→WP2)启用,不影响搜索模式。
-    double pre_align_radius_;   // m,WP1 预转向触发半径
+    double pre_align_radius_;   // m,WP1 预转向触发半径 (默认/搜索)
+    double attack_pre_align_radius_;  // m,Attack (skill 105) 专用预转向半径
+        // === 2026-08-20: 加 attack 专用半径 ===
+        //   默认 30m 在 attack 大角度转弯时不够:15 m/s + 1 rad/s yaw_rate
+        //   只剩 2s 转弯时间,~57° 残差,需要再扩。
+        //   搜索模式 WP1→WP2 通常直飞,继续用 30m 即可,过大会把 blend 提前到
+        //   还不知道下一段方向的段首,反而引入扰动。
+    // === 2026-08-20: Attack WP1 放宽到达阈值 (治本位置过冲) ===
+    //   飞向 WP1 (skill 105 SKILL_AREA idx==0) 时用 attack_wp1_arrival_threshold_
+    //   (默认 3m) 替代全局 arrival_threshold_ (1m);且只用水平距离 dist_h_check
+    //   不用 3D —— WP1 高度可能跟当前差几米,3D 距离永远到不了 1m,UAV 穿过 WP1 才
+    //   标记到达 → L1 反向拉回 → 位置过冲。WP2 继续用严格阈值(打击精度要 1m 内)。
+    double attack_wp1_arrival_threshold_;  // m,Attack WP1 水平到达阈值
+    // === 2026-08-20: Attack WP1 小圆弧进入 ===
+    //   接近 WP1 < attack_wp1_arc_radius_ (默认 5m) 时,把 bearing 直接强制朝
+    //   WP1→WP2 方向,避免 L1 切线 + pre_align 渐进 blend 的"过 WP1 才转"。
+    //   只动 bearing 不动 vx/vy:不强制降速,跟用户"前面高速后面也高速,这里
+    //   使劲降速就有点怪"一致。P-control 区间 (< final_approach_threshold_)
+    //   同样 override,避免 2.5m 处 bearing 跳回朝 WP1。
+    double attack_wp1_arc_radius_;  // m,Attack WP1 小圆弧进入触发半径
 
     // 最后一个航点 P-controller 增益（用于位置保持，避免震荡）
     double hold_kp_;
@@ -346,7 +365,10 @@ public:
         yaw_deadband_(0.05),
         vel_slew_max_horiz_accel_(8.0),   // 水平斜坡上限 8 m/s² — 19 m/s 跳变约 2.4s 铺平
         vel_slew_max_vert_accel_(4.0),    // 垂直斜坡上限 4 m/s²
-        pre_align_radius_(30.0),          // WP1 预转向触发半径 (m)
+        pre_align_radius_(30.0),          // WP1 预转向触发半径 (m, 默认/搜索)
+        attack_pre_align_radius_(50.0),   // Attack (skill 105) 预转向触发半径 (m)
+        attack_wp1_arrival_threshold_(3.0),  // Attack WP1 水平到达阈值 (m)
+        attack_wp1_arc_radius_(5.0),         // Attack WP1 小圆弧进入半径 (m)
         current_work_mode_("SEARCH_ONLY"),
         segment_phase_(SegmentPhase::IDLE),
         arrive_idx_(0),
@@ -453,6 +475,22 @@ public:
         nh_private_.param<double>("vel_slew_max_vert_accel",
                                   vel_slew_max_vert_accel_, 4.0);
         nh_private_.param<double>("pre_align_radius", pre_align_radius_, 30.0);
+        // === 2026-08-20: Attack 专用预转向半径 ===
+        //   skill 105 大角度转弯(典型 100°+)需要更早 blend yaw。50m 在 15 m/s
+        //   下 = 3.3s,1 rad/s yaw_rate 可转 ~190°,154° 转弯无残差。80m 偏大
+        //   (用户反馈"提前转弯太多"),50m 是个折中:保留转弯缓冲但不显得过早。
+        //   搜索模式继续用 30m。
+        nh_private_.param<double>("attack_pre_align_radius",
+                                  attack_pre_align_radius_, 50.0);
+        // === 2026-08-20: Attack WP1 放宽到达 + 小圆弧 ===
+        //   attack_wp1_arrival_threshold: WP1 (skill 105 idx=0) 用水平距离判定,
+        //     默认 3m。WP2 继续用 1m 3D 距离,精度不放松。
+        //   attack_wp1_arc_radius: < 此距把 bearing 强制朝 WP1→WP2 方向,
+        //     默认 5m。不动 vx/vy,避免"前面高速后面也高速,这里使劲降速"。
+        nh_private_.param<double>("attack_wp1_arrival_threshold",
+                                  attack_wp1_arrival_threshold_, 3.0);
+        nh_private_.param<double>("attack_wp1_arc_radius",
+                                  attack_wp1_arc_radius_, 5.0);
         nh_private_.param<bool>("lidar_building_avoidance_enabled",
                                 lidar_building_avoidance_enabled_, false);
         nh_private_.param<double>("lidar_climb_rate", lidar_climb_rate_, 1.0);
@@ -974,14 +1012,24 @@ public:
             const Waypoint& tg = (*cur_queue)[*cur_idx];
             double dx_t = tg.ned_x - current_ned_x_;
             double dy_t = tg.ned_y - current_ned_y_;
-            // 到达判定必须与下方实际发送给飞控的高度目标一致。当前 Attack
-            // 已按 WP2 原始高度飞行，因此这里也必须使用同一个原始高度。
-            double arrival_target_z = tg.ned_z;
-            arrival_target_z += lidar_altitude_offset_;
-            double dz_t = arrival_target_z - current_ned_z_;
-            double dist_h_check = std::sqrt(dx_t*dx_t + dy_t*dy_t);
-            double dist_to_target_check = std::sqrt(dist_h_check*dist_h_check + dz_t*dz_t);
-            if (dist_to_target_check >= arrival_threshold_) {
+            // === 2026-08-20: Attack WP1 放宽到达阈值 (水平距离) ===
+            //   skill 105 SKILL_AREA idx=0 (飞向 WP1) 时,改用 attack_wp1_arrival_threshold_
+            //   (默认 3m) + 仅水平距离判定。WP1 高度可能差几米,3D 距离到不了 1m → 过冲。
+            //   WP2 (idx=1) 继续用 arrival_threshold_ + 3D 距离,精度不放松。
+            const bool is_attack_wp1 = (active_skill_type_ == 105 &&
+                                        segment_phase_ == SegmentPhase::SKILL_AREA &&
+                                        *cur_idx == 0);
+            const double arrival_target_z = tg.ned_z + lidar_altitude_offset_;
+            const double dz_t = arrival_target_z - current_ned_z_;
+            const double dist_h_check = std::sqrt(dx_t*dx_t + dy_t*dy_t);
+            const double dist_to_target_check = std::sqrt(dist_h_check*dist_h_check + dz_t*dz_t);
+            const double effective_arrival_thresh = is_attack_wp1
+                                                   ? attack_wp1_arrival_threshold_
+                                                   : arrival_threshold_;
+            const double arrival_dist = is_attack_wp1
+                                       ? dist_h_check
+                                       : dist_to_target_check;
+            if (arrival_dist >= effective_arrival_thresh) {
                 // 未到达,跳出循环算新段控制
                 break;
             }
@@ -1074,8 +1122,27 @@ public:
                 vx = 0.0;
                 vy = 0.0;
             }
-            // bearing 取直接朝航点(避免段方向偏差,支持在航点上 hover)
-            bearing = atan2(dy_to_target, dx_to_target);
+            // === 2026-08-20: Attack WP1 bearing override ===
+            //   skill 105 飞 WP1 时,bearing 仍朝 WP1→WP2 方向 (而不是直接朝 WP1),
+            //   避免 final_approach_threshold=2.5m 处 bearing 从 arc 切回朝 WP1 引起的跳变。
+            //   velocity 仍走 P-control (朝 WP1 收敛),bearing 朝 WP2 — 让 UAV
+            //   接近 WP1 时已经朝 WP2 方向 yawed,无 WP1 附近 yaw-rate 尖峰。
+            if (active_skill_type_ == 105 &&
+                segment_phase_ == SegmentPhase::SKILL_AREA &&
+                *cur_idx == 0 &&
+                *cur_idx + 1 < cur_queue->size()) {
+                const Waypoint& wp_next = (*cur_queue)[*cur_idx + 1];
+                const double ndx = wp_next.ned_x - target_wp.ned_x;
+                const double ndy = wp_next.ned_y - target_wp.ned_y;
+                if (std::hypot(ndx, ndy) > 0.5) {
+                    bearing = std::atan2(ndy, ndx);
+                } else {
+                    bearing = atan2(dy_to_target, dx_to_target);
+                }
+            } else {
+                // bearing 取直接朝航点(避免段方向偏差,支持在航点上 hover)
+                bearing = atan2(dy_to_target, dx_to_target);
+            }
         } else {
             // === Lookahead-L1 控制(借鉴 PX4 mc_pos_control::PositionControl) ===
             // 参考 PX4 旋翼外环: 飞机朝 lookahead 点飞,速度幅值由 v² ≤ 2·a·d 限速
@@ -1312,23 +1379,62 @@ public:
         //   仅在 attack (skill 105) 且下一段存在(非终段)时启用,
         //   不影响搜索 / gather / return 模式。
         //   注意:不会影响压线 — 只 blend bearing,不动 vx/vy/vz。
+        // === 2026-08-20: Attack 专用预转向半径(临时扩大)===
+        //   接 105 skill 时预转向半径从 30m 临时扩到 attack_pre_align_radius_
+        //   (默认 50m),给大角度转弯留 3.3s 缓冲(15 m/s × 1 rad/s yaw_rate
+        //   可转 ~190°,154° 转弯无残差);不影响搜索模式。
+        // === 2026-08-20: 撤回 WP1 速度方向旋转 (10-36-36 bag 实测副作用) ===
+        //   uav0_strike_10-36-36 bag:在 pre_align (50m) 内同步旋转 vx/vy 会让
+        //   UAV 在 25-30m 处卡死悬停 — 纯 pursuit(指 WP1 北向) + 旋转(指 WP2 东向)
+        //   部分对消,|v| 衰减到 0,UAV 永远到不了 attack_wp1_arrival_threshold (3m)
+        //   到达阈值,idx 不++,停在 d_wp1≈25m 处悬停。
+        //   修法:撤回 vx/vy 旋转,只保留 bearing blend (yaw 朝向预转)。
+        //   高速入 WP1 → attack_wp1_arrival_threshold (3m) 触发 → idx++ 切到
+        //   WP2 段 → L1 + 3D pursuit 自然指向 WP2 (=WP1→WP2 方向),无 jerk 无 overshoot。
+        //   arc_radius (5m) 块保留作为 bearing 兜底,L1 自然接管轨迹。
         if (active_skill_type_ == 105 &&
             segment_phase_ == SegmentPhase::SKILL_AREA &&
+            *cur_idx + 1 < cur_queue->size()) {
+            const double align_radius = (active_skill_type_ == 105)
+                                        ? attack_pre_align_radius_
+                                        : pre_align_radius_;
+            if (dist_h < align_radius) {
+                const Waypoint& wp_next = (*cur_queue)[*cur_idx + 1];
+                const double ndx = wp_next.ned_x - target_wp.ned_x;
+                const double ndy = wp_next.ned_y - target_wp.ned_y;
+                if (std::hypot(ndx, ndy) > 0.5) {
+                    const double next_bearing_ned = std::atan2(ndy, ndx);
+                    // Smoothstep blend:t=0 at align_radius, t=1 at WP1
+                    const double t = 1.0 - std::min(1.0, dist_h / align_radius);
+                    const double blend = t * t * (3.0 - 2.0 * t);
+                    // Angular wrap 差值,保证走最短路径
+                    double diff = next_bearing_ned - bearing;
+                    while (diff >  M_PI) diff -= 2.0 * M_PI;
+                    while (diff < -M_PI) diff += 2.0 * M_PI;
+                    bearing += blend * diff;
+                }
+            }
+        }
+
+        // === 2026-08-20: Attack WP1 小圆弧进入 (治本位置过冲) ===
+        //   接 105 skill 飞向 WP1 (SKILL_AREA idx=0) 时,接近 WP1 < attack_wp1_arc_radius_
+        //   (默认 5m) 起,bearing 直接强制朝 WP1→WP2 方向 — 覆盖 pre_align 的 smoothstep
+        //   渐进 blend,在最后 5m 给一个干净的"对准出射方向"。
+        //   不动 vx/vy (速度仍由 L1 控制沿入射段方向),避免"前面高速后面也高速,
+        //   这里使劲降速就有点怪"。UAV 在 5m~2.5m 区间会有短暂 side-slip,但
+        //   此时已非常接近 WP1,3m 到达阈值马上触发,idx++ 进入 WP1→WP2 段。
+        //   仅 skill 105 SKILL_AREA idx=0 启用,不影响其他模式/WP2。
+        if (active_skill_type_ == 105 &&
+            segment_phase_ == SegmentPhase::SKILL_AREA &&
+            *cur_idx == 0 &&
             *cur_idx + 1 < cur_queue->size() &&
-            dist_h < pre_align_radius_) {
+            dist_h < attack_wp1_arc_radius_) {
             const Waypoint& wp_next = (*cur_queue)[*cur_idx + 1];
             const double ndx = wp_next.ned_x - target_wp.ned_x;
             const double ndy = wp_next.ned_y - target_wp.ned_y;
             if (std::hypot(ndx, ndy) > 0.5) {
-                const double next_bearing_ned = std::atan2(ndy, ndx);
-                // Smoothstep blend:t=0 at pre_align_radius_, t=1 at WP1
-                const double t = 1.0 - std::min(1.0, dist_h / pre_align_radius_);
-                const double blend = t * t * (3.0 - 2.0 * t);
-                // Angular wrap 差值,保证走最短路径
-                double diff = next_bearing_ned - bearing;
-                while (diff >  M_PI) diff -= 2.0 * M_PI;
-                while (diff < -M_PI) diff += 2.0 * M_PI;
-                bearing += blend * diff;
+                // 直接覆盖 pre_align 的 blend 结果,圆弧 zone 内 bearing 就是 WP1→WP2 方向
+                bearing = std::atan2(ndy, ndx);
             }
         }
 
