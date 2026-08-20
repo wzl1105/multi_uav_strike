@@ -426,6 +426,18 @@ private:
     ros::Time      last_gimbal_vel_time_;              // 上一次收到 angular velocity 的时间(用于 dt 积分)
     ros::Subscriber gimbal_ang_vel_sub_;
 
+    // === 2026-08-20: 云台用户角度指令(/tzs/cmd/gimbal_attitude) ===
+    //   starling_bridge 把 MAVLINK_MSG_ID_GIMBAL_MANAGER_SET_ATTITUDE(#282) 的 q[4] 解为
+    //   Quaternion 发到这里。优先级在角速度之下:rate > angle > default。
+    //   内部约定 current_gimbal_pitch_ 正值=下视;quaternion 是绕 body Y 轴的 NED pitch,
+    //   NED pitch 正值=机头下俯(即"下视"),与内部约定一致,无需额外取负。
+    //   angle_recent 阈值:5 s 内视为有效(GS 一拍 ~50 ms,但网络/丢包/优先级翻转要留余量)。
+    ros::Subscriber gimbal_attitude_sub_;
+    geometry_msgs::Quaternion latest_gimbal_attitude_cmd_;
+    ros::Time      latest_gimbal_attitude_stamp_;
+    bool           gimbal_attitude_cmd_valid_ = false;
+    static constexpr double GIMBAL_ANGLE_CMD_STALE_SEC = 5.0;
+
     // ============== 定时器 ==============
     ros::Timer mission_timer_;
     ros::Timer mission_state_timer_;   // Phase 2: 1Hz MissionState 定频上报
@@ -1208,6 +1220,14 @@ public:
         //   在 gimbalCommandTimerCallback 里叠加到 base pitch。
         gimbal_ang_vel_sub_ = nh_.subscribe("tzs/cmd/gimbal_angular_velocity", 10,
                                             &MissionManager::gimbalAngularVelocityCallback, this);
+
+        // === 2026-08-20: 云台用户角度输入 ===
+        // starling_bridge 在 GIMBAL_MANAGER_SET_ATTITUDE 角速度全 NaN 且 q[4] 有效时
+        //   把 q[0..3] 作为 geometry_msgs/Quaternion 发布。本节点订阅后存最新一帧 + 时间戳,
+        //   在 gimbalCommandTimerCallback 里按"rate > angle > base"优先级叠加。
+        //   注意:这一帧 GS 是绝对角度指令,会覆盖 base + user_offset 的相对量。
+        gimbal_attitude_sub_ = nh_.subscribe("tzs/cmd/gimbal_attitude", 10,
+                                             &MissionManager::gimbalAttitudeCallback, this);
 
         // ===== 弹射起飞流程(协议 TODO: skill_type=100 = 弹射, 106 = 地面) =====
         // 弹射指令触发(由外部弹射控制节点发,本节点不实现发端)
@@ -7185,6 +7205,18 @@ public:
      *     - strike 已触发:朝 primary cluster(用 computePitchDegToPrimaryCluster)
      *     - WP1 已达 + 延时已过:朝 WP2(用 computePitchDegToWp2)
      *     - 其他(刚进 IN_TASK / 延时内):attack_gimbal_look_default_pitch_deg_(默认 0 水平)
+     *
+     *   2026-08-20 新增(/tzs/cmd/gimbal_attitude 角度指令):
+     *     - 状态机新增飞手接管感知:mode != OFFBOARD 时 LOCKED 仅在 GROUND_IDLE 生效,
+     *       RETURNING / TAKING_OFF-not-complete 不锁(用户口径:除起飞前,只要不在 OFFBOARD 都跟)
+     *     - 优先级 rate > angle > base+offset:
+     *       角速度最新(rate_recent):base + offset (现有逻辑)
+     *       角度最新且 rate 不在(只有 angle):覆盖 base + offset
+     *       都没有:base + offset(无 GS 输入,保留用户预调过的偏移)
+     *     - Strike 抑制(105 IN_TASK 且 (attack_strike_phase_active_ || direct_look_active_)
+     *       且 OFFBOARD 自主):用 strike 默认角,不跟 GS 角度/角速度
+     *       飞手接管立即绕过抑制,跟 GS 指令
+     *     - angle 跟随时清零 gimbal_user_offset_deg_(绝对指令不留历史偏移)
      */
     void gimbalCommandTimerCallback(const ros::TimerEvent&) {
         if (gimbal_command_pub_.getNumSubscribers() == 0) return;
@@ -7214,24 +7246,36 @@ public:
             }
         }
 
+        // === 2026-08-20:飞手接管检测 (mavros state mode) ===
+        //   用户协议:除了起飞前要发 360 锁框架角,别的时候 mode != OFFBOARD 都可以跟
+        const bool mode_is_offboard = (current_mavros_state_.mode == "OFFBOARD");
+        const bool pilot_takeover = !mode_is_offboard;
+
         // === 2026-08-17:决定云台控制状态机 ===
-        //   LOCKED:    起飞前(GROUND_IDLE) / 降落中(RETURNING) / TAKING_OFF 但未 COMPLETE
-        //   SKILL:     102 Search IN_TASK 或 105 Attack IN_TASK
-        //   FREE:      起飞后非 SKILL 段(TRANSIT/ENTRY_PENDING/HOVERING/HOLDING/Gather IN 等)
+        //   LOCKED:    起飞前(GROUND_IDLE,无论 mode) /
+        //              RETURNING / TAKING_OFF-not-complete(仅 mode == OFFBOARD)
+        //   SKILL:     102 Search IN_TASK 或 105 Attack IN_TASK(仅 OFFBOARD 路径生效;
+        //              接管时新状态仍按此规则计算,实际由 isStrikeActiveAutonomous 抑制 strike)
+        //   FREE:      其它 — 接管或 OFFBOARD 非 LOCKED/SKILL 阶段
         GimbalControlState new_state = GimbalControlState::FREE_FOLLOW_USER;
-        if (current_phase_ == MissionPhase::PHASE_GROUND_IDLE ||
-            current_phase_ == MissionPhase::PHASE_RETURNING) {
+        if (current_phase_ == MissionPhase::PHASE_GROUND_IDLE) {
+            // 起飞前无论 mode 都锁 360 (锁框架角,用户协议)
             new_state = GimbalControlState::LOCKED_AT_ZERO;
-        } else if (current_phase_ == MissionPhase::PHASE_TAKING_OFF &&
-                   takeoff_state_ != TakeoffState::TAKEOFF_COMPLETE) {
-            new_state = GimbalControlState::LOCKED_AT_ZERO;
-        } else if (current_skill_index_ < skill_queue_.size()) {
-            const auto& sr = skill_queue_[current_skill_index_];
-            if (sr.state == SkillState::IN_TASK &&
-                (sr.msg.skill_type == 102 || sr.msg.skill_type == 105)) {
-                new_state = GimbalControlState::SKILL_FOLLOW_USER;
+        } else if (mode_is_offboard) {
+            // 仅 OFFBOARD 自主阶段保留 RETURNING / TAKING_OFF-not-complete 锁
+            if (current_phase_ == MissionPhase::PHASE_RETURNING ||
+                (current_phase_ == MissionPhase::PHASE_TAKING_OFF &&
+                 takeoff_state_ != TakeoffState::TAKEOFF_COMPLETE)) {
+                new_state = GimbalControlState::LOCKED_AT_ZERO;
+            } else if (current_skill_index_ < skill_queue_.size()) {
+                const auto& sr = skill_queue_[current_skill_index_];
+                if (sr.state == SkillState::IN_TASK &&
+                    (sr.msg.skill_type == 102 || sr.msg.skill_type == 105)) {
+                    new_state = GimbalControlState::SKILL_FOLLOW_USER;
+                }
             }
         }
+        // pilot_takeover && phase != GROUND_IDLE → new_state = FREE_FOLLOW_USER (默认)
 
         // === 状态切换副作用:LOCKED 进入时清零 user_offset ===
         if (new_state != current_gimbal_state_) {
@@ -7251,18 +7295,48 @@ public:
 
         std_msgs::Float32 msg;
         if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
-            // 起飞前 / 降落中:360 度 sentinel,框架锁死 0 度(用户协议)。
-            // gimbal_simulator 看到 360 → desired_pitch=0;
-            // 真机 gimbal_control_node 收到 360 → 锁死框架角为 0。
+            // 起飞前 / (OFFBOARD 自主) 降落中 / TAKING_OFF-not-complete:
+            // 360 度 sentinel,框架锁死 0 度(用户协议)。
             msg.data = 360.0f;
         } else {
-            // FREE 或 SKILL:base + user_offset,clamp 到 [-90, 90] 度
+            // === 选取 base:SKILL 用任务默认(朝 cluster/WP2/search),
+            //   FREE 用 gimbal_pitch_default_(非任务段用 0°) ===
             double base_deg = 0.0;
             if (current_gimbal_state_ == GimbalControlState::SKILL_FOLLOW_USER) {
-                base_deg = current_gimbal_pitch_;  // 正值=下视,度,advanceSkillStateMachine 已夹 [0,90]
+                base_deg = current_gimbal_pitch_;
+            } else {
+                base_deg = gimbal_pitch_default_;
             }
-            double final_deg = base_deg + gimbal_user_offset_deg_;
-            // 防止 base + offset 越界(物理云台行程)
+
+            double final_deg = base_deg;
+
+            if (isStrikeActiveAutonomous()) {
+                // === 105 / attack_cmd 打击中(OFFBOARD 自主):不跟 GS,纯 strike 默认角 ===
+                //   gimbal_user_offset_deg_ 不参与(预打击阶段的偏移会污染 strike 朝向)
+                final_deg = base_deg;
+            } else {
+                // === 优先级:rate > angle > base+offset(2026-08-20) ===
+                const ros::Time now = ros::Time::now();
+                const bool rate_recent = !last_gimbal_vel_time_.isZero() &&
+                                         (now - last_gimbal_vel_time_).toSec() < 0.5;
+                const bool angle_recent = gimbal_attitude_cmd_valid_ &&
+                                          !latest_gimbal_attitude_stamp_.isZero() &&
+                                          (now - latest_gimbal_attitude_stamp_).toSec() <
+                                              GIMBAL_ANGLE_CMD_STALE_SEC;
+                if (rate_recent) {
+                    // 角速度最新一手 GS 指令:base + offset (offset 由
+                    //   gimbalAngularVelocityCallback 持续积分,这里直接用)
+                    final_deg = base_deg + gimbal_user_offset_deg_;
+                } else if (angle_recent) {
+                    // 角度指令是绝对值,覆盖 base + offset
+                    final_deg = quaternionToBodyPitchDeg(latest_gimbal_attitude_cmd_);
+                    gimbal_user_offset_deg_ = 0.0;  // 清零:绝对指令不留历史偏移
+                } else {
+                    // 没有 GS 输入:base + offset(用户预调过的偏移保留)
+                    final_deg = base_deg + gimbal_user_offset_deg_;
+                }
+            }
+
             final_deg = std::max(-90.0, std::min(90.0, final_deg));
             // 地面站发送45度，云台需要-45完成下偏
             msg.data = -static_cast<float>(final_deg);
@@ -7288,6 +7362,8 @@ public:
      *   geometry_msgs::Twist 发到这里。本 callback 把 angular.y 积分成角度偏移:
      *     - dt 用 ros::Time 计算;首条消息仅初始化时间戳不积分
      *     - LOCKED_AT_ZERO 期间不积分(但仍更新时间戳避免 exit LOCKED 时 dt 爆炸)
+     *     - 2026-08-20:105/attack_cmd 打击中(OFFBOARD 自主)不积分 — 打击时云台必须锁
+     *       住目标,GS 推杆不能把云台晃走。飞手接管 (mode != OFFBOARD) 时绕过该抑制。
      *     - dt > 1s 视为异常(长 gap)跳过此次积分
      *     - 内部约定 current_gimbal_pitch_ 正值=下视;starling_bridge 注释
      *       angular.y 正=向上,所以积分时取负号使"上推杆"→ gimbal 上仰
@@ -7306,6 +7382,12 @@ public:
         if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
             return;
         }
+        // === 2026-08-20: 105/attack_cmd 打击中不积分手柄角速度 ===
+        //   打击过程中云台必须跟目标,GS 推杆杆不能把云台晃走。
+        //   飞手接管 (mode != OFFBOARD) 时绕过该抑制,允许手动控。
+        if (isStrikeActiveAutonomous()) {
+            return;
+        }
         if (dt <= 0.0 || dt > 1.0) {
             // 异常 dt(首条 / 长时间无消息 / 时间倒回)
             return;
@@ -7315,6 +7397,58 @@ public:
         gimbal_user_offset_deg_ += (-msg->angular.y) * dt * 180.0 / M_PI;
         // 钳位到云台物理行程
         gimbal_user_offset_deg_ = std::max(-90.0, std::min(90.0, gimbal_user_offset_deg_));
+    }
+
+    /**
+     * 云台用户角度回调(2026-08-20)
+     *   starling_bridge 把 MAVLINK_MSG_ID_GIMBAL_MANAGER_SET_ATTITUDE(#282) 的 q[4] 解为
+     *   geometry_msgs::Quaternion 发到这里。callback 只缓存最新一帧 + 时间戳,
+     *   实际下发在 gimbalCommandTimerCallback 里按"rate > angle > default"优先级执行。
+     *   注:此 callback 不直接 publish,避免订阅与发布线程间共享 current_gimbal_pitch_ 状态
+     *   时产生竞争;所有状态决策集中在 5 Hz timer tick 里读。
+     */
+    void gimbalAttitudeCallback(const geometry_msgs::Quaternion::ConstPtr& msg) {
+        latest_gimbal_attitude_cmd_ = *msg;
+        latest_gimbal_attitude_stamp_ = ros::Time::now();
+        gimbal_attitude_cmd_valid_ = true;
+    }
+
+    /**
+     * 105 / attack_cmd 打击中 & 当前是 OFFBOARD 自动模式(2026-08-20)
+     *   用于决定 gimbal 是否跟随 GS 角度 / 角速度指令:
+     *     - 105 IN_TASK 且 (attack_strike_phase_active_ || direct_look_active_)
+     *       表示当前正在走打击流程(attack_cmd 进了 IN_TASK 即开始算,cluster 锁定后持续)
+     *     - mode == OFFBOARD 表示这是自主阶段;飞手接管后此函数返回 false,
+     *       gimbal 立即恢复跟 GS 指令
+     *   return true → 不跟随用户指令,云台用 strike 默认(朝 primary cluster / WP2)
+     *   return false → 跟用户指令(rate > angle > base)
+     */
+    bool isStrikeActiveAutonomous() const {
+        if (current_mavros_state_.mode != "OFFBOARD") {
+            return false;  // 飞手接管或还没进 OFFBOARD,放行 GS 指令
+        }
+        if (current_skill_index_ >= skill_queue_.size()) {
+            return false;
+        }
+        const SkillRuntime& sr = skill_queue_[current_skill_index_];
+        if (sr.msg.skill_type != 105 || sr.state != SkillState::IN_TASK) {
+            return false;
+        }
+        return attack_strike_phase_active_ || sr.direct_look_active_;
+    }
+
+    /**
+     * 从 quaternion 提取绕 body Y 轴的 NED pitch(度)。
+     *   ZYX Euler 约定:pitch = asin(2*(w*y - z*x))
+     *   NED body frame 下,正向 pitch = 机头下俯,语义与 current_gimbal_pitch_ 一致(正=下视)。
+     *   钳 sinp 到 [-1, 1] 避免 asin 因数值误差返回 NaN。
+     */
+    double quaternionToBodyPitchDeg(const geometry_msgs::Quaternion& q) const {
+        const double w = q.w, x = q.x, y = q.y, z = q.z;
+        double sinp = 2.0 * (w * y - z * x);
+        if (sinp > 1.0) sinp = 1.0;
+        if (sinp < -1.0) sinp = -1.0;
+        return std::asin(sinp) * 180.0 / M_PI;
     }
 
     std::string taskStatusToString() {
