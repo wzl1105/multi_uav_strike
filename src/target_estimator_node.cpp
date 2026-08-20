@@ -420,9 +420,20 @@ public:
                 c.is_promoted = true;
                 emitClusterEvent(c);
             }
-            if (!det.img_data.empty()) {
+            // === 2026-08-20: 仅在新检测置信度高于历史最佳时覆盖 img_data ===
+            //   聚类过程中目标可能在视野边缘 → 半身子被 YOLO 识别 → 置信度偏低,
+            //   之前的全身子高分图被覆盖丢失,GS 显示的就是半拉身子。
+            //   改成只在 det.confidence > c.best_confidence 时覆盖,聚类结束后
+            //   c.img_data 自然停留在整个生命周期内看到过的最清晰那张。
+            //   GS 上行靠 mission_manager 的 reported_to_gs_ dedup 防止重复刷图。
+            if (!det.img_data.empty() && det.confidence > c.best_confidence) {
                 c.img_data   = det.img_data;
                 c.img_format = 1;  // JPEG(与 gimbal_simulator 输出一致)
+                ROS_INFO_THROTTLE(2.0,
+                    "[TargetClusterer] Cluster[%lu] label=%s image upgraded "
+                    "(conf %.2f -> %.2f, img_bytes=%zu)",
+                    c.id, c.label.c_str(),
+                    c.best_confidence, det.confidence, det.img_data.size());
             }
             return;
         }
