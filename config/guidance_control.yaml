@@ -147,8 +147,50 @@ track_altitude: 30.0
 track_horiz_dist: 8.0
 track_P: 1.0
 track_I: 0.1
+# === 2026-08-23: TRACK 模式 chase 速度最大上限 (CAP), 不是 chase 速度本身 ===
+#   0.5 → 20.0:动目标 chase 需要 UAV 速度能追上 (用户口径 ≤17 m/s + 18% 余量)。
+#   **注意**:uav_speed 是 chase **最大速度上限 (CAP)**,不是 chase 速度本身。
+#   实际 chase 速度由 computeTrackVelocity 的 P-control 自然计算:
+#     - 目标动 → KF lead_pose 让 horiz_dist 偏大 → chase 加速
+#     - 目标静 → horiz_dist 趋向 stand-off (track_horiz_dist=8m) → chase 减速到悬停
+#   设 20 m/s 是给 17 m/s 动目标留 18% 余量,UAV 不会真以 20 m/s 飞,
+#   除非目标持续以 17 m/s 远离 stand-off。
 # TRACK 模式专属速度上限（节点专属，不放 common.yaml）
-uav_speed: 0.5
+uav_speed: 20.0
 # 距离→速度的连续斜率：每超出 stand-off 1m 速度增加多少 m/s
 # 用于消除接近目标时的硬切换（值越小接近越平缓）
 track_k_approach: 0.5
+# === 2026-08-23: 动目标 chase lead-bearing 兜底 ===
+#   horiz_dist < 此值时 bearing 用 last_valid_target_bearing_nwu_ (sticky),
+#   避免 atan2(0,0)=0 让 yaw 突然跳北
+track_horiz_min_for_yaw_track_m: 5.0
+
+# === 2026-08-24: chase 重构 — v_cmd = filtered_target_vel + K_p * (lead - uav) ===
+#   旧版径向 P-control + body-frame 钳位(no_backward + yaw_threshold)在
+#   大 yaw_err (>90°) 时把速度衰减到 ~3 m/s,动目标永远追不上。
+#   新版直接在 NWU 世界坐标系下:
+#     v_cmd = tv_filt + chase_K_p * (lead_pose - uav)
+#     lead_pose = target_pose + tv_filt * lead_t
+#     lead_t = clamp(horiz / (track_max_speed + 1), lead_min, lead_max)
+#     |v_cmd| clamp 到 track_max_speed_,不再切 body-frame。
+#   chase_K_p: 位置 P 增益,经验 0.5。动目标 K_p 太小追不上、太大会震荡
+#              (与 KF 滤波速度共同决定 chase 稳态速度)。
+#   chase_lead_min/max: lead_t 钳位 [0.2, 1.5]s,与 target_estimator motion_lead 对齐。
+#   chase_yaw_horiz_min_m: horiz < 1m 时 yaw_rate=0 防 atan2(0,0) 跳变
+#                          (不锁 desired_yaw,滑过目标下方时 yaw 自然恢复)。
+chase_K_p: 0.5
+chase_lead_min: 0.2
+chase_lead_max: 1.5
+chase_yaw_horiz_min_m: 1.0
+# chase 用的目标速度 OneEuro LPF(独立于 vel_filter_,因为 chase 需要更跟手)。
+# 默认 1.0Hz/0.005/1.0Hz,比 vel_filter_ 更跟手 → KF 速度变化能反映到 chase。
+chase_vel_filter_min_cutoff_hz: 1.0
+chase_vel_filter_beta: 0.005
+chase_vel_filter_d_cutoff_hz: 1.0
+# === 2026-08-24: chase 打击锥半角 — 锥外 P-control + 锥内纯速度 ===
+#   锥半径 = altitude × cot(strike_angle),30m 高 + 30° 角 → 半径 52m
+#     - 锥外:horiz_err = horiz - tolerance > 0 → 朝目标方向 K_p × excess
+#     - 锥内:horiz_err = 0 → 只跟目标速度,不收位置(不再冲向目标正上方)
+#   strike_angle 是相机下视角 (从水平往下),用户口径"30° 打击角"对应
+#   cot=1.732。低空(<2m)夹紧到 2m 防止除零/异常。
+track_strike_angle_deg: 30.0
