@@ -360,6 +360,13 @@ private:
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
     bool waiting_for_waypoint_velocity_handoff_ = false;
     bool waiting_for_guidance_velocity_handoff_ = false;
+    // === 2026-08-25 fix: TRACK 锁目标时不 yield waypoint_executor,导致 chase
+    //   输出在 yield latch → velocity_active 回调之间的 race window 被段速度覆盖
+    //   (uav0_strike_2026-08-25-00-56-33_0.bag: chase yaw_rate 应 +0.78,bag +0.047)。
+    //   修法:在 startGuidanceApproach() 顶部无条件 yield,加这个 latch 防止同一 guidance
+    //   会话内重复发 yield;disableGuidance() 集中清掉,让下次会话能重新 yield。
+    //   (替代了原 STRIKE 路径 L3253-3257 手动 yield,统一对称 STRIKE/TRACK)。
+    bool guidance_has_control_yielded_ = false;
     // === 2026-08-19: armVehicle(true) 同步写 armed=true (L5323) 后,mavros/state cb
     //   可能在 1 秒内报 armed=false (PX4 还没回报 armed=true),触发下面 1591 行的
     //   disarm 守卫 → TAKING_OFF 被错误重置 → PX4 卡 AUTO.RTL (uav0_strike_19-17-36.bag)。
@@ -1410,8 +1417,19 @@ public:
     }
 
     void targetEstPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        if (!current_target_.is_locked) {
-            // 未锁定:仍然 reset filter 避免下次锁定时初值残留
+        // === 2026-08-24 fix: TRACK 锁定也要喂 current_target_.pose ===
+        //   原版只检查 current_target_.is_locked (只在 triggerStrike() 设 true),
+        //   SEARCH_TRACK 锁目标 (tracked_target_.is_valid + lock_state==LOCKED_WAIT_CONFIRM)
+        //   不动 is_locked → filter 早退 → current_target_.pose 停在 init (0,0,0) = HOME
+        //     → gimbalCommandTimerCallback L7389 调 computePitchDegToPrimaryCluster()
+        //       算的是 "UAV 朝 HOME 的 pitch" 而不是真实 cluster
+        //   (uav0_strike_2026-08-24-18-22-21_0.bag: bag 几何 pitch +22~30° vs cmd
+        //    -16~-19°,差 14°;实算 cmd 完全对应 cluster=HOME 几何,diff<0.05°)。
+        //   STRIKE 路径不受影响 (is_locked=true 走原 smoothing 路径)。
+        const bool track_locked = tracked_target_.is_valid &&
+                                  tracked_target_.lock_state == TrackLockState::LOCKED_WAIT_CONFIRM;
+        if (!current_target_.is_locked && !track_locked) {
+            // 未锁定 (STRIKE + TRACK 都未锁):reset filter 避免下次锁定时初值残留
             target_smooth_x_.reset();
             target_smooth_y_.reset();
             target_smooth_z_.reset();
@@ -3231,20 +3249,10 @@ public:
                     }
                 }
                 ROS_WARN("[MissionManager] AttackCmd action=0 (打) — triggering strike");
-                // === 2026-08-19 Fix B: STRIKE 接管前 yield 旧 waypoint_executor 速度源 ===
-                //   背景:HOLDING 之后 waypoint_executor 处于 stop 状态,triggerStrike →
-                //   startGuidanceApproach 只 publish enable=true,**没动 waypoint_executor**,
-                //   case 1/2 (忽略/暂存) 路径会 yield ([mission_manager_node.cpp:2940]),
-                //   case 0 缺这一步。结果:guidance 第一帧到位时 waypoint_executor 还在
-                //   is_executing_=false 状态不会主动让位,后续 guidance_velocity_active 回调
-                //   会 yield,但第一次 setpoint 交接存在 race。提前 yield 让 waypoint_executor
-                //   在 enable 之前就闭嘴,避免任何残留速度与 guidance 同时发。
-                {
-                    std_msgs::String yield_cmd;
-                    yield_cmd.data = "yield_to_guidance";
-                    waypoint_control_pub_.publish(yield_cmd);
-                    ROS_WARN("[MissionManager]   - STRIKE: yielded waypoint_executor before guidance enable");
-                }
+                // === 2026-08-25: STRIKE 路径 yield 已合并到 startGuidanceApproach() 顶部 ===
+                //   原 2026-08-19 Fix B 在 triggerStrike 前手动 yield,STRIKE 与 TRACK 不对称
+                //   (TRACK 完全不 yield → race window 重复发送)。统一在 startGuidanceApproach()
+                //   顶部加 yield (带 guidance_has_control_yielded_ latch),STRIKE/TRACK 对称。
                 triggerStrike();
                 detect_target_pub_.publish(dt);
                 {
@@ -6860,6 +6868,31 @@ public:
     bool is_spiral_complete_ = false;
 
     void startGuidanceApproach() {
+        // === 2026-08-25 fix: 在 enable=true 之前静默 waypoint_executor ===
+        //   原 STRIKE 路径在 L3253-3257 手动 yield (现已合并到此处统一处理)。
+        //   原 TRACK 路径**完全不 yield** → race window: 从 yield latch → velocity_active
+        //   回调之间的几帧到几十帧内 executor 还在朝 WP 段方向发速度,与 guidance 真速度
+        //   流并发,PX4 OFFBOARD 取最后一个发布者 → chase 输出被覆盖
+        //   (uav0_strike_2026-08-25-00-56-33_0.bag: chase yaw_rate 应 +0.78, bag +0.047)。
+        //
+        //   waypoint_executor 端 `guidance_has_control_=true` 后:
+        //     - publishVelocityCommandWithYaw 早退 (line 1648)
+        //     - publishZeroVelocity 早退 (line 1800)
+        //     - executeSegmentFlight 不再被 timer 调 (line 897)
+        //   完全无副作用,因为后续 enable=true 才到,顺序保证 (本函数 line 6902+ 才会发 enable)。
+        //
+        //   latch 由 disableGuidance() 集中清掉,让下次 startGuidanceApproach 重新 yield;
+        //   同一 guidance 会话内 startGuidanceApproach() 多次调到不会重复 yield。
+        if (!guidance_has_control_yielded_) {
+            std_msgs::String yield_cmd;
+            yield_cmd.data = "yield_to_guidance";
+            waypoint_control_pub_.publish(yield_cmd);
+            guidance_has_control_yielded_ = true;
+            ROS_WARN("[MissionManager] startGuidanceApproach: yielded waypoint_executor "
+                     "before guidance enable (work_mode=%s)",
+                     workModeToString(current_work_mode_).c_str());
+        }
+
         is_guidance_active_ = true;
         current_task_status_ = TaskStatus::GUIDANCE_APPROACH;
 
@@ -6986,6 +7019,12 @@ public:
     void disableGuidance() {
         is_guidance_active_ = false;
         waiting_for_guidance_velocity_handoff_ = false;
+        // === 2026-08-25: 让下次 startGuidanceApproach() 能重新 yield ===
+        //   与 waiting_for_guidance_velocity_handoff_ 同生命周期,
+        //   覆盖所有 disableGuidance() 调用点 (disarm/landing/new task_flow/
+        //   completeAttackStrikeIfReached/handleSearchTrack stale guard/
+        //   handleSearchStrike stale guard/attackCmd action=1/2 ignore 等)。
+        guidance_has_control_yielded_ = false;
 
         // 禁用制导
         std_msgs::Bool enable;
@@ -7370,6 +7409,24 @@ public:
                 } else {
                     current_gimbal_pitch_ = attack_gimbal_look_default_pitch_deg_;
                 }
+            } else if (sr.state == SkillState::IN_TASK && sr.msg.skill_type == 102) {
+                // === 2026-08-24: TRACK 模式持续朝 primary cluster ===
+                //   原版:GS gimbal_pitch 在进 IN_TASK 时一次性写 (line ~6218),之后冻结,
+                //   目标在 UAV 正下方时云台不会跟到 -90° (uav0_strike_2026-08-24-17-17-26_0.bag)。
+                //   用户口径"进入跟踪之后云台就不要再听地面发送的云台指令了" →
+                //   TRACK 跟 strike 一样,云台自主朝 primary cluster,不听 GS rate/angle。
+                //   已锁定 (tracked_target_.is_valid + lock_state==LOCKED_WAIT_CONFIRM):
+                //     朝 primary cluster,跟 strike 同源 (computePitchDegToPrimaryCluster 用
+                //     current_target_.pose 算 pitch,该字段在 targetEstPoseCallback 无条件更新,
+                //     TRACK 模式下也是有值的)
+                //   未锁定 (还在搜索):保留 GS 一次性写入值,云台不下摆干扰搜索视野
+                //
+                //   注意:不能用 current_target_.is_locked — 该字段只在 105 triggerStrike() 设 true,
+                //   SEARCH_TRACK 锁目标时不动它,旧版本永远进不来 → gimbal 锁在 GS 一次性值。
+                if (tracked_target_.is_valid &&
+                    tracked_target_.lock_state == TrackLockState::LOCKED_WAIT_CONFIRM) {
+                    current_gimbal_pitch_ = computePitchDegToPrimaryCluster();
+                }
             }
         }
 
@@ -7461,9 +7518,10 @@ public:
 
             double final_deg = base_deg;
 
-            if (isStrikeActiveAutonomous()) {
-                // === 105 / attack_cmd 打击中(OFFBOARD 自主):不跟 GS,纯 strike 默认角 ===
-                //   gimbal_user_offset_deg_ 不参与(预打击阶段的偏移会污染 strike 朝向)
+            if (isStrikeActiveAutonomous() || isTrackActiveAutonomous()) {
+                // === 105 打击中 / 102 锁定目标后(OFFBOARD 自主):不跟 GS,纯 base (朝 cluster) ===
+                //   gimbal_user_offset_deg_ 不参与(预打击 / 预锁定的偏移会污染目标朝向)
+                //   用户口径"进入跟踪之后云台就不要再听地面发送的云台指令了,打击过程也是一样"
                 final_deg = base_deg;
             } else {
                 // === 优先级:rate > angle > base+offset(2026-08-20) ===
@@ -7536,10 +7594,10 @@ public:
         if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
             return;
         }
-        // === 2026-08-20: 105/attack_cmd 打击中不积分手柄角速度 ===
-        //   打击过程中云台必须跟目标,GS 推杆杆不能把云台晃走。
+        // === 2026-08-20 + 2026-08-24: 105 打击中 / 102 锁目标后不积分手柄角速度 ===
+        //   自主阶段云台必须跟目标,GS 推杆不能把云台晃走。
         //   飞手接管 (mode != OFFBOARD) 时绕过该抑制,允许手动控。
-        if (isStrikeActiveAutonomous()) {
+        if (isStrikeActiveAutonomous() || isTrackActiveAutonomous()) {
             return;
         }
         if (dt <= 0.0 || dt > 1.0) {
@@ -7589,6 +7647,37 @@ public:
             return false;
         }
         return attack_strike_phase_active_ || sr.direct_look_active_;
+    }
+
+    /**
+     * 2026-08-24: TRACK 自主阶段判定 — Search(102) IN_TASK 锁目标后,云台跟 primary cluster。
+     *   与 isStrikeActiveAutonomous 配对使用:gimbalCommandTimerCallback /
+     *   gimbalAngularVelocityCallback 看到任一返回 true → 抑制 GS 角速度 / 角度指令,
+     *   云台持续朝 base (primary cluster),飞手接管 (mode != OFFBOARD) 立即放行。
+     *   - 102 IN_TASK + OFFBOARD + tracked_target_.is_valid + lock_state==LOCKED_WAIT_CONFIRM:
+     *     SEARCH_TRACK 识别到目标(等 attack_cmd),云台朝目标
+     *   - 102 IN_TASK 但未锁目标:返回 false,保留 GS 控制(进入搜索视野,GS 可调)
+     *
+     *   注意:不能用 current_target_.is_locked — 该字段只在 triggerStrike() (105 路径)
+     *   里设 true,SEARCH_TRACK 锁目标时(clusterStatesCallback line ~4073)只设
+     *   tracked_target_.is_valid = true,不动 is_locked → 旧版本 is_locked 永远 false,
+     *   gimbalCommandTimerCallback 102 IN_TASK 分支永远进不去,gimbal 锁在 GS 一次性值。
+     *   tracking_state 发布 (line ~7313) 用的是 tracked_target_.is_valid + lock_state 判定,
+     *   这里对齐。
+     */
+    bool isTrackActiveAutonomous() const {
+        if (current_mavros_state_.mode != "OFFBOARD") {
+            return false;
+        }
+        if (current_skill_index_ >= skill_queue_.size()) {
+            return false;
+        }
+        const SkillRuntime& sr = skill_queue_[current_skill_index_];
+        if (sr.msg.skill_type != 102 || sr.state != SkillState::IN_TASK) {
+            return false;
+        }
+        return tracked_target_.is_valid &&
+               tracked_target_.lock_state == TrackLockState::LOCKED_WAIT_CONFIRM;
     }
 
     /**
