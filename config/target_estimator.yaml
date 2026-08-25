@@ -58,7 +58,30 @@ ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全�
                               # EMA 直接作用于 cand 世界坐标 (米),相机机动零滞后。
                               # 0.3 + 10Hz → 时间常数 ≈ 0.23s,稳态世界噪声衰减 ~70%。
                               # 像素噪声大时降到 0.1~0.2;车辆/高速场景调到 0.4~0.5。
+                              # === 2026-08-23: KF 替换 EMA ===
+                              # 本参数现已不再被 processSingleDetection 使用 (KF 接管);
+                              # 保留以防外部工具/老 config 仍依赖,无副作用。
 target_z_prior: 0.0           # 反投影 z 假设(地面目标 = 0;空中目标可设 UAV 当前高度)
+
+# === 2026-08-23: 动目标 KF + 模式分类 ===
+#   4-state CV Kalman Filter [x, y, vx, vy] 替换原 2D EMA, 17 m/s 目标滞后从 3.97m 降到 0。
+#   静目标零回归: motion_class_=STATIC 时 Q_vel=0.01, 速度自然衰减到 0, 等效位置 EMA。
+#   lead_pose = KF + v*lead_time 让 chase 不滞后 (lead_time = clamp(horiz/closing, 0.2, 1.5)s)。
+motion_cold_start_grace_sec: 1.0     # 聚类创建后强制 STATIC 时长 (防初始噪声)
+motion_speed_enter: 2.0              # |v| > enter 连续 enter_frames 升 DYNAMIC (m/s)
+motion_speed_exit: 0.3               # |v| < exit  连续 exit_frames  降 STATIC  (m/s)
+motion_enter_frames: 3               # 升 DYNAMIC 所需连续帧数
+motion_exit_frames: 30               # 降 STATIC  所需连续帧数
+motion_lead_min: 0.2                 # lead_time 下限 (秒)
+motion_lead_max: 1.5                 # lead_time 上限 (秒)
+motion_max_speed: 30.0               # 发散保护: |v| > max → resetVelocity + STATIC (m/s)
+kf_q_pos: 1.0                        # KF 位置过程噪声 std (m)
+kf_q_vel_static: 0.01                # 静态目标速度过程噪声 std (m/s, 极小 → 衰减到 0)
+kf_q_vel_dynamic: 2.0                # 动态目标速度过程噪声 std (m/s)
+kf_r_meas: 2.0                       # YOLO 世界投影测量噪声 std (m)
+uav_velocity_lpf_alpha: 0.5          # UAV 速度缓存 LPF alpha (一阶 IIR)
+kf_predict_freq: 50.0                # KF 高频 predict timer 频率 (Hz, 应 >> YOLO 频率)
+cluster_stale_freeze_sec: 3.0        # cluster 多久无观测 → reset velocity 强制 STATIC (秒)
 
 # ---- 图像/位姿时间对齐 ----
 # camera/pose 按时间缓存；每条 YoloDetection 使用与 stamp_us 时间差最小的样本。

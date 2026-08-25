@@ -32,10 +32,12 @@
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TwistStamped.h>  // 2026-08-23: 动目标 KF 速度输出
 #include <mavros_msgs/HomePosition.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/UInt64.h>
+#include <std_msgs/String.h>      // === 2026-08-24: /guidance/mode 订阅 ===
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -54,6 +56,10 @@
 #include <Eigen/Geometry>
 #include <tf/transform_datatypes.h>
 
+// === 2026-08-23: 动目标 KF (4-state CV) ===
+//   替换 2D EMA 让 chase 在 ≤17 m/s 动目标下不滞后。
+#include <multi_uav_strike/target_motion_kf.hpp>
+
 #include <cmath>
 #include <cctype>
 #include <deque>
@@ -66,6 +72,10 @@
 
 class TargetClusterer {
 public:
+    // === 2026-08-23: 动目标 KF 模式分类 ===
+    //   提到 class 作用域外 (但仍在 class 内), 便于 TargetCluster 字段直接引用。
+    enum class MotionClass { UNKNOWN, STATIC, DYNAMIC };
+
     // ===== 单个目标集群 =====
     struct TargetCluster {
         uint64_t  id              = 0;
@@ -113,6 +123,20 @@ public:
         float     image_height    = 0.0f;
         Eigen::Vector3d image_world_ray_nwu{0.0, 0.0, -1.0};
         //===================制导修改====================
+
+        // === 2026-08-23: 动目标 KF + 模式分类 (替代 2D EMA) ===
+        //   静目标 (Q_vel→0): KF 速度衰减到 0, 等效位置 EMA, 行为零回归
+        //   动目标 (Q_vel=2.0): KF 跟踪速度, lead pose 让 chase 不滞后
+        multi_uav_strike::TargetMotionKF kf_;
+        ros::Time                       kf_last_time_;          // 上次 YOLO update 时刻
+        ros::Time                       kf_init_time_;          // 聚类创建时刻, 用于 cold-start grace
+        // === 2026-08-24: 高频 KF 预测 (50Hz), YOLO 检测之间持续推进 ===
+        //   KF 不能只在 10Hz YOLO 检测时 predict, 否则 FOV 丢失瞬间 KF 冻结,
+        //   target 出视野后 cluster.ned_x/y 停在最后位置, chase 完全失去预测能力。
+        ros::Time                       kf_last_predict_time_;  // 上次 predict 时刻 (timer/YOLO 同步)
+        MotionClass                     motion_class_ = MotionClass::UNKNOWN;
+        int                             motion_dynamic_evidence_ = 0;  // 连续 v > enter 帧数
+        int                             motion_static_evidence_  = 0;  // 连续 v < exit 帧数
     };
 
     struct CameraPoseSample {
@@ -164,6 +188,26 @@ public:
         //   30m = 典型 car 视野远端,既能保留 cluster 又不因为视距太远导致 merge_radius 失配。
         //   防御性兜底(实飞也保留),真实场景云台物理朝下,几乎用不到。
         p.param<double>("fallback_proj_distance", fallback_proj_distance_, 30.0);
+        // === 2026-08-23: 动目标 KF + 模式分类参数 ===
+        //   cold-start grace: 聚类创建后 N 秒内强制 STATIC, 防初始噪声触发 DYNAMIC
+        p.param<double>("motion_cold_start_grace_sec", motion_cold_start_grace_sec_, 1.0);
+        //   迟滞门槛: 进入 DYNAMIC 需 |v| > motion_speed_enter 连续 motion_enter_frames 帧
+        p.param<double>("motion_speed_enter", motion_speed_enter_, 2.0);
+        p.param<double>("motion_speed_exit",  motion_speed_exit_,  0.3);
+        p.param<int>   ("motion_enter_frames", motion_enter_frames_, 3);
+        p.param<int>   ("motion_exit_frames",  motion_exit_frames_,  30);
+        //   前导时间上下限 (lead_pose = KF + v*lead_time)
+        p.param<double>("motion_lead_min", motion_lead_min_, 0.2);
+        p.param<double>("motion_lead_max", motion_lead_max_, 1.5);
+        //   KF 速度发散保护: |v| > motion_max_speed_ 时 reset velocity 强制 STATIC
+        p.param<double>("motion_max_speed", motion_max_speed_, 30.0);
+        //   KF 噪声参数
+        p.param<double>("kf_q_pos",          kf_q_pos_,          1.0);
+        p.param<double>("kf_q_vel_static",   kf_q_vel_static_,   0.01);
+        p.param<double>("kf_q_vel_dynamic",  kf_q_vel_dynamic_,  2.0);
+        p.param<double>("kf_r_meas",         kf_r_meas_,         2.0);
+        //   速度缓存 LPF (computeClosingSpeed 用)
+        p.param<double>("uav_velocity_lpf_alpha", uav_velocity_lpf_alpha_, 0.5);
         // Detection timestamps are matched to the nearest full camera pose.
         // The warning threshold is diagnostic only: a large time delta never
         // rejects an observation as long as the pose buffer is non-empty.
@@ -178,6 +222,14 @@ public:
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
         p.param<double>("cleanup_freq",        cleanup_freq_,        1.0);
+        // === 2026-08-24: KF 高频预测频率 ===
+        //   KF 持续 predict 频率 (Hz), 应显著高于 YOLO 频率 (10Hz)。
+        //   50Hz = YOLO 5x 频率, 每次 YOLO 间隔 (0.1s) 内 5 次 predict,
+        //   既保证动目标出 FOV 后 cluster.ned_x/y 跟随 KF 速度连续推进,
+        //   又不浪费 CPU 在 STATIC 目标上。
+        p.param<double>("kf_predict_freq", kf_predict_freq_, 50.0);
+        // === 2026-08-24: stale_freeze 阈值 (cluster 长时间无观测视为丢失) ===
+        p.param<double>("cluster_stale_freeze_sec", cluster_stale_freeze_sec_, 3.0);
         // marker 颜色
         p.param<double>("est_marker_r", est_marker_r_, 1.0);
         p.param<double>("est_marker_g", est_marker_g_, 1.0);
@@ -223,6 +275,21 @@ public:
         //   mission_manager 在 Attack(105) push 时一次性 latched publish。
         attack_wp2_sub_     = nh_.subscribe("attack_wp2_gps", 1,
                                             &TargetClusterer::attackWp2Callback, this);
+        // === 2026-08-24: 订阅 /guidance/mode — TRACK 模式禁用 YOLO yaw_rate 门控 ===
+        //   跟踪动目标时 chase yaw_rate 持续偏高(0.27~0.46 rad/s),如果保留
+        //   max_cluster_yaw_rate_rad_s=0.2 门控,YOLO batch 会被反复 skip,
+        //   cluster 持续 stale → primary 切换 → chase 输出衰减 → 跟丢。
+        //   修法:TRACK 模式 (mode=="track") 直接绕过 yaw_rate 检查,
+        //   让 YOLO/cluster 在跟踪过程中保持开启。
+        //   waypoint / SEARCH 阶段 mode=="strike" 或 guidance 未 enable 时门控照常生效。
+        guidance_mode_sub_  = nh_.subscribe("guidance/mode", 10,
+                                            &TargetClusterer::guidanceModeCallback, this);
+        // === 2026-08-24: 订阅 /guidance/enable — 区分 tracked target (橙) vs primary (紫) ===
+        //   guidance enable=true && mode in {track,strike} → primary 是当前 UAV 正在
+        //   chase/strike 的目标,显示橙色大球;enable=false 时 primary 只是候选,显示紫色。
+        //   waypoint / SEARCH 阶段 enable=false,候选 primary 显示紫色等 GS 接管。
+        guidance_enable_sub_ = nh_.subscribe("guidance/enable", 10,
+                                             &TargetClusterer::guidanceEnableCallback, this);
 
         // 发布
         // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
@@ -237,6 +304,9 @@ public:
                                     "cluster_states", 10);
         target_est_pose_pub_    = nh_.advertise<geometry_msgs::PoseStamped>(
                                     "target_estimated_pose", 10);
+        // === 2026-08-23: 激活死 topic — 主目标 KF 速度 ===
+        target_est_twist_pub_ = nh_.advertise<geometry_msgs::TwistStamped>(
+                                    "target_estimated_twist", 10);
         target_est_marker_pub_  = nh_.advertise<visualization_msgs::MarkerArray>(
                                     "target_estimated_marker", 10);
         // === 2026-07-16: 原始单帧识别标记(红色小点,瞬时显示)===
@@ -254,6 +324,11 @@ public:
                                         &TargetClusterer::statesTimerCb, this);
         cleanup_timer_= nh_.createTimer(ros::Duration(1.0 / cleanup_freq_),
                                         &TargetClusterer::cleanupTimerCb, this);
+        // === 2026-08-24: KF 高频 predict (默认 50Hz) ===
+        //   在 YOLO 检测之间持续推进 KF 状态, 让 c.ned_x/y 跟随 KF 速度连续外推,
+        //   解决动目标出 FOV 后 cluster 位置冻结的根因。
+        kf_predict_timer_ = nh_.createTimer(ros::Duration(1.0 / kf_predict_freq_),
+                                            &TargetClusterer::kfPredictTimerCb, this);
 
         ROS_INFO("[TargetClusterer] initialized. merge_radius=%.1fm ttl=%.1fs ema_alpha=%.2f "
                  "z_prior=%.1f image=%dx%d fov=(%.1f,%.1f)deg focal=(%.1f,%.1f)",
@@ -286,7 +361,13 @@ public:
                 frame.frame_seq, detectionStamp(frame).toSec());
             return;
         }
-        if (std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
+        // === 2026-08-24: TRACK 模式绕过 yaw_rate 门控 ===
+        //   跟踪动目标时 chase yaw_rate 持续 0.27~0.46 rad/s,默认 0.2 阈值会被
+        //   频繁触发,YOLO batch 反复 skip → cluster stale → primary 切换 →
+        //   chase 输出衰减 → 跟丢。TRACK 模式直接放行,waypoint/SEARCH 阶段
+        //   保留门控(防 yaw 突变 bbox 抖被聚类)。
+        if (!guidance_mode_is_track_ &&
+            std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
             max_cluster_yaw_rate_rad_s_ + 1e-9) {
             ROS_WARN_THROTTLE(1.0,
                 "[TargetClusterer] Skip YOLO batch: yaw rate too high "
@@ -325,6 +406,8 @@ public:
         const uint64_t observation_stamp_us = det.stamp_us != 0
             ? det.stamp_us
             : matched_camera_pose.stamp.toNSec() / 1000ULL;
+        // === 2026-08-23: KF predict 需要 dt, 用 camera_pose 时间戳 (与 GPS 同源) ===
+        const ros::Time observation_time = matched_camera_pose.stamp;
 
         std::lock_guard<std::mutex> g(clusters_mtx_);
         // === 2026-07-31: 归一化 label (YOLO 数字串 → 语义串) ===
@@ -392,18 +475,15 @@ public:
         if (!cand_valid) return;
 
         if (nearest_id != 0) {
-            // 命中已有 cluster:在世界空间做 EMA (Plan B)
-            //   用 cand_tx/cand_ty (本帧原始投影) 作为输入 — 真实目标位置就稳定在那里,
-            //   与相机如何转动无关,直接收敛到真值,无几何滞后。
+            // === 2026-08-23: 替换 2D EMA 为 4-state KF (Plan B + KF) ===
+            //   静目标 (Q_vel→0): KF 速度衰减到 0, 等效位置 EMA, 行为零回归
+            //   动目标 (Q_vel=2.0): KF 跟踪速度, lead pose 让 chase 不滞后
             TargetCluster& c = clusters_[nearest_id];
-            if (!c.world_ema_valid) {
-                c.ned_x = cand_tx;
-                c.ned_y = cand_ty;
-                c.world_ema_valid = true;
-            } else {
-                c.ned_x = ema_alpha_ * cand_tx + (1.0 - ema_alpha_) * c.ned_x;
-                c.ned_y = ema_alpha_ * cand_ty + (1.0 - ema_alpha_) * c.ned_y;
-            }
+            updateClusterKF(c, cand_tx, cand_ty, observation_time);
+            // 把 KF 输出写回 cluster 字段 (下游继续用 c.ned_x/y)
+            const auto state = c.kf_.getState();
+            c.ned_x = state.x;
+            c.ned_y = state.y;
             c.ned_alt = cand_tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = observation_stamp_us;
@@ -447,6 +527,12 @@ public:
         nc.ned_y           = cand_ty;
         nc.ned_alt         = cand_tz;
         nc.world_ema_valid = true;
+        // === 2026-08-23: KF 首帧 init (替代 world_ema_valid=true) ===
+        nc.kf_.init(cand_tx, cand_ty);
+        nc.kf_last_time_         = observation_time;
+        nc.kf_last_predict_time_ = observation_time;  // === 2026-08-24: 高频 KF predict 同步时间戳 ===
+        nc.kf_init_time_         = observation_time;
+        nc.motion_class_   = MotionClass::UNKNOWN;  // grace 期内强制 STATIC
         nc.best_confidence = det.confidence;
         nc.first_seen_us   = observation_stamp_us;
         nc.last_seen_us    = observation_stamp_us;
@@ -849,6 +935,36 @@ public:
         }
     }
 
+    // === 2026-08-24: 订阅 /guidance/mode — TRACK 模式禁用 YOLO yaw_rate 门控 ===
+    //   跟踪动目标时 chase yaw_rate 持续偏高 (0.27~0.46 rad/s),超过默认
+    //   max_cluster_yaw_rate_rad_s=0.2 → YOLO batch 持续被丢 → cluster stale →
+    //   primary 切换 → chase 输出衰减 → 跟丢。
+    //   修法:mode=="track" 时 guidance_mode_is_track_=true,yoloBatchCallback
+    //   跳过 yaw_rate 检查。waypoint/SEARCH/strike 阶段 mode="strike" 或
+    //   未启动时,门控照常生效,避免 yaw 突变带来的 bbox 抖动被聚类。
+    void guidanceModeCallback(const std_msgs::String::ConstPtr& msg) {
+        const bool now_track = (msg->data == "track");
+        if (now_track != guidance_mode_is_track_) {
+            ROS_WARN("[TargetClusterer] guidance_mode -> '%s' → YOLO yaw_rate gate %s",
+                     msg->data.c_str(),
+                     now_track ? "BYPASSED (track mode)" : "ACTIVE (waypoint/search)");
+            guidance_mode_is_track_ = now_track;
+        }
+        current_guidance_mode_ = msg->data;
+    }
+
+    // === 2026-08-24: 订阅 /guidance/enable — 用于 marker 颜色分级 ===
+    //   enable=true && mode in {track,strike} → primary 是 UAV 当前 chase/strike 的目标
+    //   → 显示橙色大球;否则 primary 只是 GS 候选,显示紫色。
+    void guidanceEnableCallback(const std_msgs::Bool::ConstPtr& msg) {
+        if (msg->data != is_guidance_enable_) {
+            ROS_WARN("[TargetClusterer] guidance/enable -> %s → primary marker %s",
+                     msg->data ? "TRUE" : "FALSE",
+                     msg->data ? "ORANGE (tracked)" : "PURPLE (candidate)");
+            is_guidance_enable_ = msg->data;
+        }
+    }
+
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         if (use_sim_) {
             current_uav_pose_.pose.position.x =  msg->pose.position.x;
@@ -882,6 +998,28 @@ public:
         is_uav_pose_received_ = true;
         updateYawRateSample();
 
+        // === 2026-08-23: 缓存 UAV 速度 (pose-delta + 一阶 IIR 平滑) ===
+        //   computeClosingSpeed 用了这个,给 lead_pose 算 horiz/closing_speed。
+        //   一阶 IIR (uav_velocity_lpf_alpha_) 把位姿 jitter 滤掉;
+        //   50Hz mavros pose → 0.5 alpha 时间常数 ≈ 0.02s,响应够用且不抖。
+        if (last_uav_velocity_stamp_.isValid() &&
+            last_uav_velocity_stamp_ != msg->header.stamp) {
+            const double dt = (msg->header.stamp - last_uav_velocity_stamp_).toSec();
+            if (dt > 1e-4 && dt < 1.0) {
+                const Eigen::Vector3d pos(
+                    current_uav_pose_.pose.position.x,
+                    current_uav_pose_.pose.position.y,
+                    current_uav_pose_.pose.position.z);
+                const Eigen::Vector3d inst_v = (pos - last_uav_velocity_pos_) / dt;
+                const double a = uav_velocity_lpf_alpha_;
+                current_uav_velocity_nwu_ = a * inst_v + (1.0 - a) * current_uav_velocity_nwu_;
+            }
+        }
+        last_uav_velocity_pos_ = Eigen::Vector3d(
+            current_uav_pose_.pose.position.x,
+            current_uav_pose_.pose.position.y,
+            current_uav_pose_.pose.position.z);
+        last_uav_velocity_stamp_ = msg->header.stamp;
     }
 
     void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
@@ -926,11 +1064,19 @@ public:
         state.targets.reserve(clusters_.size());
         markers.markers.reserve(clusters_.size());
 
+        // === 2026-08-23: classifyMotion 先跑一遍 (mutex 已锁, mutate 安全) ===
+        const ros::Time now_stamp = ros::Time::now();
+        for (auto& kv : clusters_) {
+            classifyMotion(kv.second, now_stamp);
+        }
+
         // === 2026-07-16: state.targets 仍只发 promoted (下游 API) ===
         //   markers 同时画 promoted + tentative (RViz 可视化区分)
         for (const auto& kv : clusters_) {
             const TargetCluster& c = kv.second;
 
+            // === 2026-08-23: KF 集成后清理 (合并重复 if,原版双层 if (c.is_promoted) 是死代码) ===
+            //   原版 promoted/tentative 各一个 if + else,经 iter_07 编辑丢失 } 闭合,这里合成单层。
             if (c.is_promoted) {
                 multi_uav_strike::ClusterTarget t;
                 t.cluster_id    = c.id;
@@ -967,7 +1113,25 @@ public:
         if (primary_cluster_id_ != 0) {
             auto it = clusters_.find(primary_cluster_id_);
             if (it != clusters_.end() && it->second.is_promoted) {
-                primary = &it->second;
+                // === 2026-08-24: stale_freeze 配套 — primary cluster stale 时不锁 ===
+                //   lsu_age > cluster_stale_freeze_sec_ 的 cluster KF 已 reset velocity,
+                //   位置冻结在最后观测点,再 chase 只会追历史位置 → 鬼影。
+                //   这里把 primary_cluster_id_ 清空, 让下面 fallback 重新选最高置信度。
+                if (it->second.last_seen_us != 0) {
+                    const double lsu_age = (now_stamp.toNSec() / 1000ULL -
+                                            it->second.last_seen_us) * 1e-6;
+                    if (lsu_age > cluster_stale_freeze_sec_) {
+                        ROS_WARN_THROTTLE(2.0,
+                            "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs), "
+                            "release lock and fallback to highest confidence",
+                            it->second.id, lsu_age, cluster_stale_freeze_sec_);
+                        primary_cluster_id_ = 0;  // 清掉, 让 GS 重新指定或 fallback
+                    } else {
+                        primary = &it->second;
+                    }
+                } else {
+                    primary = &it->second;
+                }
             }
         }
         if (primary == nullptr) {
@@ -993,6 +1157,16 @@ public:
                     for (const auto& kv : clusters_) {
                         const TargetCluster& c = kv.second;
                         if (!c.is_promoted) continue;
+                        // === 2026-08-24: stale promoted cluster 不参与 fallback 候选 ===
+                        //   uav0_strike_2026-08-24-17-04-42_0.bag 复盘:primary 9 stale 后
+                        //   primary_cluster_id_ 清零,fallback 仍按"最高 confidence"选 stale
+                        //   cluster,chase 拿去追 KF 冻结位置 → 鬼影。这里跟 line 1123 一致
+                        //   用 cluster_stale_freeze_sec_ 阈值过滤掉 stale 候选。
+                        if (c.last_seen_us != 0) {
+                            const double lsu_age = (now_stamp.toNSec() / 1000ULL -
+                                                    c.last_seen_us) * 1e-6;
+                            if (lsu_age > cluster_stale_freeze_sec_) continue;
+                        }
                         const double dx = c.ned_x - wp2_n;
                         const double dy = c.ned_y - wp2_nwu_y;
                         const double dist_sq = dx*dx + dy*dy;
@@ -1022,6 +1196,14 @@ public:
                 for (const auto& kv : clusters_) {
                     const TargetCluster& c = kv.second;
                     if (!c.is_promoted) continue;
+                    // === 2026-08-24: stale promoted cluster 不参与 fallback 候选 ===
+                    //   同 WP2 fallback:stale cluster KF velocity 已 reset,位置冻结,
+                    //   当 fallback primary 会被 chase 当活动目标追 → 鬼影。
+                    if (c.last_seen_us != 0) {
+                        const double lsu_age = (now_stamp.toNSec() / 1000ULL -
+                                                c.last_seen_us) * 1e-6;
+                        if (lsu_age > cluster_stale_freeze_sec_) continue;
+                    }
                     if (primary == nullptr || c.best_confidence > primary->best_confidence) {
                         primary = &c;
                     }
@@ -1031,6 +1213,8 @@ public:
         if (primary != nullptr) {
             publishPrimaryGps(*primary);
             publishPrimaryPose(*primary);
+            // === 2026-08-23: KF 速度 (动目标 lead pose 配套) ===
+            publishPrimaryTwist(*primary);
             //===================制导修改====================
             publishPrimaryImageTarget(*primary);
             //===================制导修改====================
@@ -1091,6 +1275,31 @@ private:
     double cleanup_freq_     = 1.0;
     double est_marker_r_ = 1.0, est_marker_g_ = 1.0, est_marker_b_ = 0.0, est_marker_a_ = 1.0;
 
+    // === 2026-08-23: 动目标 KF + 模式分类 yaml 参数 ===
+    //   cold-start grace: 聚类创建后 N 秒内强制 STATIC, 防初始噪声
+    double motion_cold_start_grace_sec_ = 1.0;
+    //   迟滞门槛
+    double motion_speed_enter_  = 2.0;   // |v| > enter 连续 enter_frames → DYNAMIC
+    double motion_speed_exit_   = 0.3;   // |v| < exit  连续 exit_frames  → STATIC
+    int    motion_enter_frames_ = 3;
+    int    motion_exit_frames_  = 30;
+    //   lead_time 上下限
+    double motion_lead_min_ = 0.2;
+    double motion_lead_max_ = 1.5;
+    //   发散保护
+    double motion_max_speed_ = 30.0;    // |v| > max → resetVelocity + STATIC
+    //   KF 过程/测量噪声
+    double kf_q_pos_         = 1.0;
+    double kf_q_vel_static_  = 0.01;    // 静目标:速度衰减到 0 (零回归)
+    double kf_q_vel_dynamic_ = 2.0;     // 动目标:跟踪真速度
+    double kf_r_meas_        = 2.0;     // YOLO 世界投影噪声 std
+    //   UAV 速度缓存 LPF (computeClosingSpeed 用)
+    double uav_velocity_lpf_alpha_ = 0.5;
+    //   KF predict 频率
+    double kf_predict_freq_ = 50.0;
+    //   stale_freeze 阈值 (lsu_age > sec → 强制 STATIC + reset velocity)
+    double cluster_stale_freeze_sec_ = 3.0;
+
     // 相机几何
     int    image_width_  = 1920;
     int    image_height_ = 1080;
@@ -1108,6 +1317,8 @@ private:
     ros::Subscriber primary_target_sub_;
     ros::Subscriber mission_state_sub_;
     ros::Subscriber waypoint_status_sub_;
+    ros::Subscriber guidance_mode_sub_;             // /guidance/mode → TRACK 时绕过 yaw_rate 门控
+    ros::Subscriber guidance_enable_sub_;            // /guidance/enable → 区分 tracked (橙) vs primary (紫)
 
     ros::Publisher cluster_event_pub_;
     ros::Publisher cluster_states_pub_;
@@ -1119,11 +1330,21 @@ private:
     //===================制导修改====================
     ros::Publisher primary_image_target_pub_;
     //===================制导修改====================
+    // === 2026-08-23: 激活死 topic — KF 速度 (动目标 lead-bearing 用) ===
+    ros::Publisher target_est_twist_pub_;
     std::string viz_frame_;                      // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
     ros::Timer states_timer_;
     ros::Timer cleanup_timer_;
+    // === 2026-08-24: KF 高频 predict (50Hz), 解决动目标出 FOV 位置冻结 ===
+    ros::Timer kf_predict_timer_;
 
     geometry_msgs::PoseStamped  current_uav_pose_;
+    // === 2026-08-23: UAV 速度缓存 (pose-delta + 一阶 IIR LPF), computeClosingSpeed 用 ===
+    //   uavPoseCallback 每帧算 inst_v = (pos - last) / dt,再 LPF 平滑。
+    //   50Hz mavros pose + alpha=0.5 → 时间常数 ≈ 0.02s,够跟手又不抖。
+    Eigen::Vector3d             current_uav_velocity_nwu_{0.0, 0.0, 0.0};
+    Eigen::Vector3d             last_uav_velocity_pos_{0.0, 0.0, 0.0};
+    ros::Time                   last_uav_velocity_stamp_{0, 0};
     sensor_msgs::NavSatFix      current_gps_;
     sensor_msgs::NavSatFix      home_gps_;     // PX4 home, 锁一次作为 GPS 输出的参考原点
     bool                       is_home_locked_ = false;
@@ -1157,6 +1378,17 @@ private:
     bool waypoint_status_received_ = false;
     bool current_skill_executing_ = false;
     bool cluster_skill_active_ = false;
+    // === 2026-08-24: TRACK 模式旁路 YOLO yaw_rate 门控 ===
+    //   guidance/mode=="track" 时 chase yaw_rate 通常 0.27~0.46 rad/s,超过默认
+    //   max_cluster_yaw_rate_rad_s=0.2 → YOLO batch 持续被丢 → cluster stale →
+    //   primary 切换 → chase 输出衰减 → 跟丢。TRACK 时直接绕过门控,
+    //   waypoint/SEARCH/未启用阶段保留门控(避免搜索阶段 yaw 突变带来的 bbox 抖动被聚类)。
+    bool guidance_mode_is_track_ = false;
+    // === 2026-08-24: marker 颜色分级依据 — 是否在 chase/strike ===
+    //   guidance/enable=true && mode in {track,strike} → primary 是 UAV 当前 chase/strike 的目标
+    //   → 显示橙色大球;否则 primary 只是 GS 候选,显示紫色中等球
+    bool is_guidance_enable_      = false;
+    std::string current_guidance_mode_ = "";
     //=============一定打击=========//
     bool search_area_first_waypoint_reached_ = false;
     //=============一定打击=========//
@@ -1228,6 +1460,187 @@ private:
         primary_image_target_pub_.publish(msg);
     }
     //===================制导修改====================
+
+    // === 2026-08-23: KF predict + update 一站式包装 ===
+    //   Q_vel 根据 motion_class_ 自适应:
+    //     - STATIC  : Q_vel=0.01 → 速度衰减到 0, 等效 EMA, 零回归
+    //     - DYNAMIC : Q_vel=2.0  → 跟踪真速度
+    //     - UNKNOWN : 用 Q_vel_static 兜底(grace 期内强制 STATIC, 这里 UNKNOWN 实际上不会触发)
+    void updateClusterKF(TargetCluster& c,
+                         double meas_x, double meas_y,
+                         const ros::Time& observation_time) {
+        if (!c.kf_.isInitialized()) {
+            c.kf_.init(meas_x, meas_y);
+            c.kf_last_time_         = observation_time;
+            c.kf_last_predict_time_ = observation_time;
+            c.kf_init_time_         = observation_time;
+            c.motion_class_         = MotionClass::UNKNOWN;
+            return;
+        }
+        // === 2026-08-24: 桥接 timer predict → observation_time 的小间隔 ===
+        //   timer 在 kf_last_predict_time_ → now 之间持续推进 KF;
+        //   YOLO 到达时 KF 状态还停在 kf_last_predict_time_,
+        //   补一个 dt = observation_time - kf_last_predict_time_ 的 predict
+        //   让 update() 在最新状态上做 (避免 YOLO 帧边界上的 0~20ms 滞后)。
+        const double bridge_dt = std::max(0.0,
+            (observation_time - c.kf_last_predict_time_).toSec());
+        if (bridge_dt > 0.0) {
+            const double q_vel = (c.motion_class_ == MotionClass::DYNAMIC) ?
+                                  kf_q_vel_dynamic_ : kf_q_vel_static_;
+            c.kf_.predict(bridge_dt, kf_q_pos_, q_vel);
+        }
+        c.kf_.update(meas_x, meas_y, kf_r_meas_);
+        c.kf_last_time_         = observation_time;
+        c.kf_last_predict_time_ = observation_time;
+    }
+
+    // === 2026-08-24: KF 高频 predict timer (默认 50Hz) ===
+    //   在 YOLO 检测之间持续推进 KF 状态, 让 c.ned_x/y 跟随 KF 速度连续外推。
+    //   这是治本:动目标出 FOV 后 KF 不再冻结, chase 的 lead pose 反映真实预测位置,
+    //   UAV 不会停在"最后看到的位置"傻等。
+    //   STATIC cluster Q_vel=0.01 衰减速度, 预测对位置影响极小, 安全。
+    //   DYNAMIC cluster Q_vel=2.0, KF 状态主动外推, 与 YOLO 再次检测时无缝衔接。
+    //   写回 c.ned_x/y: 让 processSingleDetection 的 merge_radius 匹配也用最新位置。
+    void kfPredictTimerCb(const ros::TimerEvent&) {
+        std::lock_guard<std::mutex> g(clusters_mtx_);
+        const ros::Time now = ros::Time::now();
+        for (auto& kv : clusters_) {
+            TargetCluster& c = kv.second;
+            if (!c.kf_.isInitialized()) continue;
+            const double dt = (now - c.kf_last_predict_time_).toSec();
+            // 跳过过小或负 dt (时钟回退 / timer 与 updateClusterKF 同步竞争)
+            if (dt <= 0.001) continue;
+            const double q_vel = (c.motion_class_ == MotionClass::DYNAMIC) ?
+                                  kf_q_vel_dynamic_ : kf_q_vel_static_;
+            c.kf_.predict(dt, kf_q_pos_, q_vel);
+            c.kf_last_predict_time_ = now;
+            // 把 KF 当前位置写回 cluster.ned_x/y — 这是 merge 匹配用的字段
+            const auto state = c.kf_.getState();
+            c.ned_x = state.x;
+            c.ned_y = state.y;
+        }
+    }
+
+    // === 2026-08-23: 模式分类 (迟滞 + cold-start grace + 发散保护) ===
+    //   - cold-start grace: 聚类创建后 grace_sec 秒内强制 STATIC, 防初始噪声
+    //   - |v| > enter 连续 enter_frames 帧 → DYNAMIC (向上单向)
+    //   - |v| < exit  连续 exit_frames  帧 → STATIC  (向下单向, 不再升 DYNAMIC)
+    //   - |v| > max_speed (发散保护) → reset velocity, 强制 STATIC
+    // === 2026-08-24: stale_freeze ===
+    //   - lsu_age > cluster_stale_freeze_sec_ → 强制 STATIC + resetVelocity
+    //     KF 不再外推 stale 位置
+    void classifyMotion(TargetCluster& c, const ros::Time& now) {
+        if (!c.kf_.isInitialized()) {
+            c.motion_class_ = MotionClass::UNKNOWN;
+            return;
+        }
+
+        // === stale_freeze: 长时间无新观测视为 stale, KF 不再外推 ===
+        if (c.last_seen_us != 0) {
+            const double lsu_age =
+                (now.toNSec() / 1000ULL - c.last_seen_us) * 1e-6;
+            if (lsu_age > cluster_stale_freeze_sec_) {
+                // 只有从非 STATIC → STATIC 时打日志, 避免每 100ms 重复打
+                if (c.motion_class_ != MotionClass::STATIC) {
+                    ROS_WARN_THROTTLE(2.0,
+                        "[TargetClusterer] Cluster[%lu] stale (age=%.1fs > %.1fs), "
+                        "force STATIC + reset velocity (chase 解锁)",
+                        c.id, lsu_age, cluster_stale_freeze_sec_);
+                }
+                c.motion_class_           = MotionClass::STATIC;
+                c.motion_dynamic_evidence_ = 0;
+                c.motion_static_evidence_  = 0;
+                c.kf_.resetVelocity();
+                return;
+            }
+        }
+
+        // cold-start grace: 1s 内强制 STATIC
+        const double age = (now - c.kf_init_time_).toSec();
+        if (age < motion_cold_start_grace_sec_) {
+            c.motion_class_ = MotionClass::STATIC;
+            c.motion_dynamic_evidence_ = 0;
+            return;
+        }
+
+        const double v = c.kf_.getSpeed();
+
+        // 发散保护: 速度超阈值时 reset velocity + 强制 STATIC
+        if (v > motion_max_speed_) {
+            ROS_WARN_THROTTLE(2.0,
+                "[TargetClusterer] Cluster[%lu] KF speed %.1f > max %.1f, reset velocity",
+                c.id, v, motion_max_speed_);
+            c.kf_.resetVelocity();
+            c.motion_class_ = MotionClass::STATIC;
+            c.motion_dynamic_evidence_ = 0;
+            return;
+        }
+
+        // 迟滞
+        if (c.motion_class_ != MotionClass::DYNAMIC) {
+            // STATIC / UNKNOWN → 检查是否升 DYNAMIC
+            if (v > motion_speed_enter_) {
+                c.motion_dynamic_evidence_++;
+                if (c.motion_dynamic_evidence_ >= motion_enter_frames_) {
+                    c.motion_class_        = MotionClass::DYNAMIC;
+                    c.motion_static_evidence_ = 0;
+                    ROS_INFO("[TargetClusterer] Cluster[%lu] → DYNAMIC (v=%.2f m/s)",
+                             c.id, v);
+                }
+            } else {
+                c.motion_dynamic_evidence_ = 0;
+            }
+        } else {
+            // DYNAMIC → 检查是否降 STATIC (单向)
+            if (v < motion_speed_exit_) {
+                c.motion_static_evidence_++;
+                if (c.motion_static_evidence_ >= motion_exit_frames_) {
+                    c.motion_class_        = MotionClass::STATIC;
+                    c.motion_dynamic_evidence_ = 0;
+                    ROS_INFO("[TargetClusterer] Cluster[%lu] → STATIC (v=%.2f m/s)",
+                             c.id, v);
+                }
+            } else {
+                c.motion_static_evidence_ = 0;
+            }
+        }
+    }
+
+    // === 2026-08-23: 收拢速度 (UAV→target 方向上的投影) ===
+    //   用于 lead_time = clamp(horiz / closing_speed, lead_min, lead_max)
+    //   闭环:closing_speed 大 → lead 小 → UAV 不冲过头;closing_speed 小 → lead 大 → 提前补偿
+    double computeClosingSpeed(const TargetCluster& c) const {
+        if (!c.kf_.isInitialized()) return 1.0;
+        const double dx = c.ned_x - current_uav_pose_.pose.position.x;
+        const double dy = c.ned_y - current_uav_pose_.pose.position.y;
+        const double horiz = std::hypot(dx, dy);
+        if (horiz < 0.1) return 1.0;
+        const double ux = dx / horiz, uy = dy / horiz;
+        const auto st = c.kf_.getState();
+        //   UAV 速度 - 目标速度 在 UAV→target 单位向量上的投影 = 正值 = 收拢
+        const double uav_vx = current_uav_velocity_nwu_.x();
+        const double uav_vy = current_uav_velocity_nwu_.y();
+        const double rel_vx = uav_vx - st.vx;
+        const double rel_vy = uav_vy - st.vy;
+        const double closing = rel_vx * ux + rel_vy * uy;
+        return std::max(0.5, closing);
+    }
+
+    // === 2026-08-23: KF 速度发布 (动目标 lead pose 配套, 激活死 topic) ===
+    void publishPrimaryTwist(const TargetCluster& c) {
+        if (!c.kf_.isInitialized()) return;
+        geometry_msgs::TwistStamped msg;
+        msg.header.stamp = ros::Time::now();
+        msg.header.frame_id = viz_frame_;
+        const auto st = c.kf_.getState();
+        msg.twist.linear.x  = st.vx;
+        msg.twist.linear.y  = st.vy;
+        msg.twist.linear.z  = 0.0;
+        msg.twist.angular.x = 0.0;
+        msg.twist.angular.y = 0.0;
+        msg.twist.angular.z = 0.0;
+        target_est_twist_pub_.publish(msg);
+    }
 
     // ============ 工具 ============
 
@@ -1468,10 +1881,14 @@ private:
     }
 
     visualization_msgs::Marker buildMarker(const TargetCluster& c) {
-        // === 2026-07-16: 三层可视化,样式区分 promoted vs tentative ===
-        //   promoted (正式目标): 大号绿色实心球 + 立柱(任何角度都显眼)
-        //   tentative (聚类中): 黄色扁圆柱(地面上的圆环),半透明
-        // 两者用同一个 ns "clusters" + 同一个 id (c.id),状态切换时下一帧自动覆盖。
+        // === 2026-08-24: 四色四档显示,方便 RViz 一眼区分 ===
+        //   1) tracked/attack target (橙): UAV 当前 chase/strike 的目标 → 大球 8m
+        //      = primary_cluster_id && (enable && mode in {track,strike})
+        //   2) primary candidate (紫): GS 指定或最高置信度,但 UAV 还没接管 → 中球 7m
+        //      = primary_cluster_id && !tracked
+        //   3) other promoted (绿): 候选但不是 primary → 球 6m
+        //   4) tentative (黄): 还在聚类,未晋升 → 4m 扁盘
+        // 同一 ns "clusters" + 同一 id (c.id),状态切换时下一帧自动覆盖。
         visualization_msgs::Marker m;
         m.header.frame_id = viz_frame_;
         m.header.stamp    = ros::Time::now();
@@ -1480,28 +1897,61 @@ private:
         m.action = visualization_msgs::Marker::ADD;
         m.pose.position.x = c.ned_x;
         m.pose.position.y = c.ned_y;
-        m.pose.position.z = c.ned_alt + 0.3;  // 抬一点避免压在地里
+        m.pose.position.z = c.ned_alt + 0.3;
         m.pose.orientation.w = 1.0;
-        m.lifetime = ros::Duration(0.5);  // statesTimerCb 10Hz 续期,稳定可见
+        m.lifetime = ros::Duration(0.5);
 
-        if (c.is_promoted) {
+        const bool is_primary_cluster =
+            (primary_cluster_id_ != 0 && c.id == primary_cluster_id_);
+        const bool is_tracked_now =
+            is_primary_cluster && is_guidance_enable_ &&
+            (current_guidance_mode_ == "track" ||
+             current_guidance_mode_ == "strike");
+
+        // === 2026-08-24: stale cluster 视觉降权 (alpha 衰减) ===
+        //   uav0_strike_2026-08-24-17-04-42_0.bag 复盘:RViz 一堆绿球干扰判读。
+        //   promoted 但 lsu_age > cluster_stale_freeze_sec_ 的 cluster KF velocity
+        //   已 reset、位置冻结,不再是真目标,只在视觉上 faded 保留(确认它在哪儿)。
+        //   阈值与 line 1123 / fallback (新增) 共用,语义一致。
+        bool is_stale = false;
+        if (c.last_seen_us != 0) {
+            const double lsu_age = (ros::Time::now().toNSec() / 1000ULL -
+                                    c.last_seen_us) * 1e-6;
+            if (lsu_age > cluster_stale_freeze_sec_) is_stale = true;
+        }
+        const float alpha_fresh = 0.95f;
+        const float alpha_stale = 0.30f;  // stale promoted → faded (不影响 chase,仅视觉)
+        const float alpha = is_stale ? alpha_stale : alpha_fresh;
+
+        if (c.is_promoted && is_tracked_now) {
+            // === 1) tracked/attack target: 橙色大球 (直径 24m,远超橙紫区分阈值) ===
+            //   用户口径: "把橙色和紫色球都放大,直径20以上";24m 让目标在 RViz
+            //   远距也能一眼看到,不与其他绿/黄小球混淆。
             m.type = visualization_msgs::Marker::SPHERE;
-            m.scale.x = 3.5; m.scale.y = 3.5; m.scale.z = 3.5;  // === 改大到 3.5m ===
-            m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.95f;
+            m.scale.x = 24.0; m.scale.y = 24.0; m.scale.z = 24.0;
+            m.color.r = 1.0f; m.color.g = 0.55f; m.color.b = 0.0f; m.color.a = alpha;
+        } else if (c.is_promoted && is_primary_cluster) {
+            // === 2) primary candidate: 紫色大球 (直径 22m,稍小于橙以保持等级感) ===
+            m.type = visualization_msgs::Marker::SPHERE;
+            m.scale.x = 22.0; m.scale.y = 22.0; m.scale.z = 22.0;
+            m.color.r = 0.6f; m.color.g = 0.2f; m.color.b = 0.8f; m.color.a = alpha;
+        } else if (c.is_promoted) {
+            // === 3) other promoted: 绿色球 (stale 后 alpha 0.30 faded) ===
+            m.type = visualization_msgs::Marker::SPHERE;
+            m.scale.x = 6.0; m.scale.y = 6.0; m.scale.z = 6.0;
+            m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = alpha;
         } else {
-            // tentative: 黄色扁盘 (CYLINDER + 小高度 = 地面上的圆环),半透明
+            // === 4) tentative: 黄色扁盘 (CYLINDER + 小高度 = 地面圆环),半透明 ===
             m.type = visualization_msgs::Marker::CYLINDER;
-            m.scale.x = 2.5;  // 直径 (1.8 → 2.5)
-            m.scale.y = 0.2;  // 高度(扁平)
-            m.scale.z = 2.5;  // 直径
+            m.scale.x = 4.0; m.scale.y = 0.2; m.scale.z = 4.0;
             m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.55f;
         }
         return m;
     }
 
-    // === 2026-07-16: promoted 立柱 (id = c.id + 1000000 区分)===
-    //   5m 高、0.5m 直径的实心绿色圆柱,从地面垂直立起。
-    //   顶视/侧视都能一眼看到,跟红色 raw 点对比清楚。
+    // === 2026-08-24: 立柱同步四色,任何角度都能一眼看到 ===
+    //   tracked/attack = 橙色 24m 立柱;primary = 紫色 22m;other promoted = 绿色 5m;tentative 不画。
+    //   立柱高度跟球直径对齐,确保球被云台/角度挡住时仍能通过立柱识别。
     visualization_msgs::Marker buildPillar(const TargetCluster& c) {
         visualization_msgs::Marker m;
         m.header.frame_id = viz_frame_;
@@ -1512,13 +1962,43 @@ private:
         m.action = visualization_msgs::Marker::ADD;
         m.pose.position.x = c.ned_x;
         m.pose.position.y = c.ned_y;
-        m.pose.position.z = c.ned_alt + 2.5;  // 中心 = 地面 + 2.5m
         m.pose.orientation.w = 1.0;
-        m.scale.x = 0.5;   // 直径
-        m.scale.y = 5.0;   // 高度
-        m.scale.z = 0.5;   // 直径
-        m.color.r = 0.0f; m.color.g = 0.8f; m.color.b = 0.0f; m.color.a = 0.85f;
         m.lifetime = ros::Duration(0.5);
+
+        const bool is_primary_cluster =
+            (primary_cluster_id_ != 0 && c.id == primary_cluster_id_);
+        const bool is_tracked_now =
+            is_primary_cluster && is_guidance_enable_ &&
+            (current_guidance_mode_ == "track" ||
+             current_guidance_mode_ == "strike");
+
+        // === 2026-08-24: stale cluster 立柱同步 faded,与 buildMarker 配色逻辑对齐 ===
+        bool is_stale = false;
+        if (c.last_seen_us != 0) {
+            const double lsu_age = (ros::Time::now().toNSec() / 1000ULL -
+                                    c.last_seen_us) * 1e-6;
+            if (lsu_age > cluster_stale_freeze_sec_) is_stale = true;
+        }
+        const float alpha_fresh = 0.9f;
+        const float alpha_stale = 0.25f;  // stale 立柱基本透明,让 fresh 立柱显眼
+        const float alpha = is_stale ? alpha_stale : alpha_fresh;
+
+        if (is_tracked_now) {
+            // 橙色 24m 立柱 (球直径对齐)
+            m.pose.position.z = c.ned_alt + 12.0;
+            m.scale.x = 0.7; m.scale.y = 24.0; m.scale.z = 0.7;
+            m.color.r = 1.0f; m.color.g = 0.55f; m.color.b = 0.0f; m.color.a = alpha;
+        } else if (is_primary_cluster) {
+            // 紫色 22m 立柱
+            m.pose.position.z = c.ned_alt + 11.0;
+            m.scale.x = 0.6; m.scale.y = 22.0; m.scale.z = 0.6;
+            m.color.r = 0.6f; m.color.g = 0.2f; m.color.b = 0.8f; m.color.a = alpha;
+        } else {
+            // 其他 promoted: 绿色 5m 立柱(stale 后 alpha 0.25 faded)
+            m.pose.position.z = c.ned_alt + 2.5;
+            m.scale.x = 0.5; m.scale.y = 5.0; m.scale.z = 0.5;
+            m.color.r = 0.0f; m.color.g = 0.8f; m.color.b = 0.0f; m.color.a = alpha;
+        }
         return m;
     }
 
@@ -1611,8 +2091,24 @@ private:
         geometry_msgs::PoseStamped msg;
         msg.header.stamp = ros::Time::now();
         msg.header.frame_id = viz_frame_;  // 本机 local 帧,由 static TF 偏移到世界 map
-        msg.pose.position.x = c.ned_x;
-        msg.pose.position.y = c.ned_y;
+        // === 2026-08-23: 动目标 lead pose (KF + v*lead_time) ===
+        //   STATIC / UNKNOWN: 直接用 KF 输出 (c.ned_x/y), 等效旧版 EMA 行为
+        //   DYNAMIC:          c.kf + 收拢速度反算的 lead_time, UAV 不从目标后面飞过
+        double pub_x = c.ned_x;
+        double pub_y = c.ned_y;
+        if (c.motion_class_ == MotionClass::DYNAMIC && c.kf_.isInitialized()) {
+            const double closing = computeClosingSpeed(c);
+            const double dx = c.ned_x - current_uav_pose_.pose.position.x;
+            const double dy = c.ned_y - current_uav_pose_.pose.position.y;
+            const double horiz = std::hypot(dx, dy);
+            double lead_time = (closing > 0.5) ? (horiz / closing) : motion_lead_min_;
+            // clamp [lead_min, lead_max]
+            if (lead_time < motion_lead_min_) lead_time = motion_lead_min_;
+            if (lead_time > motion_lead_max_) lead_time = motion_lead_max_;
+            c.kf_.getPositionWithLead(lead_time, pub_x, pub_y);
+        }
+        msg.pose.position.x = pub_x;
+        msg.pose.position.y = pub_y;
         msg.pose.position.z = c.ned_alt;
         msg.pose.orientation.w = 1.0;  // 单位四元数(目标无朝向)
         target_est_pose_pub_.publish(msg);
