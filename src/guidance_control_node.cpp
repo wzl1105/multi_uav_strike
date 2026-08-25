@@ -93,6 +93,10 @@ private:
     bool mavros_connected_ = false;
     bool mavros_armed_ = false;
     uint8_t current_mission_phase_ = 0;
+    // === 2026-08-25: GS attack_cmd action=0 (打) 接收标志, 末段 chase gate ===
+    //   missionStateCallback 同步自 mission_manager;helper 顶部 guard,
+    //   TRACK 阶段 GS 未发攻击指令时不下沉 (用户口径"接收到 attackCmd 之后才要")
+    bool attack_cmd_received_ = false;
 
     // 使能控制：SEARCH_ONLY 模式下 guidance 不工作
     bool is_enabled_;
@@ -194,6 +198,10 @@ private:
     multi_uav_strike::OneEuroFilter1D pn_target_filter_x_;
     multi_uav_strike::OneEuroFilter1D pn_target_filter_y_;
     multi_uav_strike::OneEuroFilter1D pn_target_filter_z_;
+    // === 2026-08-25: PN OneEuro dt 缓存 — 之前传 msg->header.stamp.toSec() (~1.7e9) 当 dt,
+    //   filter 内部 α = 1/(1+te/τ) ≈ 1e-10,filter 完全冻在 first input。
+    //   模板照搬 chase_filter_last_time_ (L191),callback 顶部算一次 dt 共用 6 次 filter call。
+    ros::Time pn_filter_last_time_;
     geometry_msgs::PoseStamped pn_filtered_target_pose_;
     bool pn_filtered_target_valid_ = false;
     ros::Time pn_last_target_update_time_;
@@ -333,6 +341,14 @@ private:
     //   17-43-21 bag 在 horiz=1.37m 时 bbox 漂出 0.06 带导致 chase 提前退出,
     //   放宽到 0.10 允许更大波动, 让 chase 覆盖到命中圈边缘。ray 在 ~1m 内仍可信。
     double strike_terminal_image_chase_center_band_ = 0.10;
+    // === 2026-08-25: TRACK 末段图像导引 (用户口径"跟 STRIKE 相同") ===
+    //   TRACK 不发 strike, UAV 在 horiz≤22m + bbox 在中心时沿相机射线全速压位,
+    //   等 GS 发 105 后进入 STRIKE 命中圈。YOLO 不足/不在中心时降级回 chase 几何。
+    //   独立参数:未来调参不影响 STRIKE。默认值与 STRIKE 一致 (用户要求)。
+    bool   track_terminal_image_chase_enabled_      = true;
+    double track_terminal_image_chase_min_horiz_m_  = 22.0;
+    double track_terminal_image_chase_latch_sec_    = 0.5;
+    double track_terminal_image_chase_center_band_ = 0.22;
     bool   terminal_image_chase_active_              = false;
     ros::Time terminal_image_chase_enter_time_;
     // chase enter/exit 边沿日志 (2026-08-20),last=true/false 翻转时打 WARN
@@ -650,6 +666,22 @@ public:
             std::max(strike_terminal_image_chase_latch_sec_, 0.0);
         strike_terminal_image_chase_center_band_ =
             std::max(strike_terminal_image_chase_center_band_, image_center_deadband_);
+
+        // === 2026-08-25: TRACK 末段图像导引参数加载 (与 STRIKE 同源, 独立参数) ===
+        nh_private_.param<bool>("track_terminal_image_chase_enabled",
+                                track_terminal_image_chase_enabled_, true);
+        nh_private_.param<double>("track_terminal_image_chase_min_horiz_m",
+                                  track_terminal_image_chase_min_horiz_m_, 22.0);
+        nh_private_.param<double>("track_terminal_image_chase_latch_sec",
+                                  track_terminal_image_chase_latch_sec_, 0.5);
+        nh_private_.param<double>("track_terminal_image_chase_center_band",
+                                  track_terminal_image_chase_center_band_, 0.22);
+        track_terminal_image_chase_min_horiz_m_ =
+            std::max(track_terminal_image_chase_min_horiz_m_, 0.0);
+        track_terminal_image_chase_latch_sec_ =
+            std::max(track_terminal_image_chase_latch_sec_, 0.0);
+        track_terminal_image_chase_center_band_ =
+            std::max(track_terminal_image_chase_center_band_, image_center_deadband_);
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
         strike_slowdown_radius_m_ = std::max(
             strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
@@ -810,9 +842,19 @@ public:
         //   target_estimator EMA α=0.1 后残余噪声 ~0.05m,10Hz 发布在 50Hz PN 调用
         //   帧边界产生 0.04 rad/s los_rate 阶跃 → v_lateral 单帧 ~6m/s 跳变(被 nav_ratio 限幅)。
         //   对 nx/ny/nz 加 1Hz OneEuro,稳态 std 砍 ~70%,首跳 ≤0.1s 滞后可接受。
-        const double fx = pn_target_filter_x_.filter(nx, msg->header.stamp.toSec());
-        const double fy = pn_target_filter_y_.filter(ny, msg->header.stamp.toSec());
-        const double fz = pn_target_filter_z_.filter(nz, msg->header.stamp.toSec());
+        // === 2026-08-25: dt 修复 — 之前传 msg->header.stamp.toSec() (~1.7e9) 当 dt,
+        //   filter 内部 α = 1/(1+te/τ) ≈ 1e-10 完全冻结。改用 callback 顶部算的 dt。
+        //   callback 顶部一次算 dt,后面 6 次 filter call 共用 (L813-815 + L878-880 + L952-957)。
+        const ros::Time pn_filter_now = ros::Time::now();
+        double pn_filter_dt = pn_filter_last_time_.isZero()
+                                  ? (1.0 / 10.0)  // target_estimated_pose 10Hz
+                                  : (pn_filter_now - pn_filter_last_time_).toSec();
+        pn_filter_last_time_ = pn_filter_now;
+        if (pn_filter_dt <= 0.0) pn_filter_dt = 1e-3;
+        if (pn_filter_dt > 1.0)  pn_filter_dt = 1.0;
+        const double fx = pn_target_filter_x_.filter(nx, pn_filter_dt);
+        const double fy = pn_target_filter_y_.filter(ny, pn_filter_dt);
+        const double fz = pn_target_filter_z_.filter(nz, pn_filter_dt);
 
         // Jump detection below uses raw values (nx/ny/nz) — keeps it independent of LPF lag.
 
@@ -873,11 +915,10 @@ public:
         // main分支PN Layer 5：10Hz目标阶跃先经独立1Hz OneEuro，再交给50Hz PN。
         // IMAGE/GEO继续使用上面的current_target_pose_原值，二者互不污染。
         pn_filtered_target_pose_ = *msg;
-        const double filter_time = msg->header.stamp.isZero()
-            ? ros::Time::now().toSec() : msg->header.stamp.toSec();
-        pn_filtered_target_pose_.pose.position.x = pn_target_filter_x_.filter(nx, filter_time);
-        pn_filtered_target_pose_.pose.position.y = pn_target_filter_y_.filter(ny, filter_time);
-        pn_filtered_target_pose_.pose.position.z = pn_target_filter_z_.filter(nz, filter_time);
+        // === 2026-08-25: dt 修复 — 与 L813-815 共用 callback 顶部 pn_filter_dt ===
+        pn_filtered_target_pose_.pose.position.x = pn_target_filter_x_.filter(nx, pn_filter_dt);
+        pn_filtered_target_pose_.pose.position.y = pn_target_filter_y_.filter(ny, pn_filter_dt);
+        pn_filtered_target_pose_.pose.position.z = pn_target_filter_z_.filter(nz, pn_filter_dt);
         pn_filtered_target_valid_ = true;
         pn_last_target_update_time_ = ros::Time::now();
         //===================制导修改====================
@@ -943,18 +984,25 @@ public:
         wp2_fallback_valid_        = true;
         wp2_fallback_last_seen_    = ros::Time::now();
 
-        const double t = msg->header.stamp.isZero()
-            ? ros::Time::now().toSec()
-            : msg->header.stamp.toSec();
+        // === 2026-08-25: dt 修复 — 之前传 absolute timestamp,filter 冻结。
+        //   wp2_fallback_pose 是 mission_manager Attack(105) WP2 fallback 路径,
+        //   publish rate 不固定,fallback 用 0.1s (≈ 10Hz target_estimated_pose) 兜底。
+        const ros::Time pn_filter_now = ros::Time::now();
+        double pn_filter_dt = pn_filter_last_time_.isZero()
+                                  ? (1.0 / 10.0)
+                                  : (pn_filter_now - pn_filter_last_time_).toSec();
+        pn_filter_last_time_ = pn_filter_now;
+        if (pn_filter_dt <= 0.0) pn_filter_dt = 1e-3;
+        if (pn_filter_dt > 1.0)  pn_filter_dt = 1.0;
 
         // === PN 路径:经 OneEuro LPF (避免 cold filter 首帧 0, A1/A5) ===
         pn_filtered_target_pose_ = *msg;
         pn_filtered_target_pose_.pose.position.x =
-            pn_target_filter_x_.filter(msg->pose.position.x, t);
+            pn_target_filter_x_.filter(msg->pose.position.x, pn_filter_dt);
         pn_filtered_target_pose_.pose.position.y =
-            pn_target_filter_y_.filter(msg->pose.position.y, t);
+            pn_target_filter_y_.filter(msg->pose.position.y, pn_filter_dt);
         pn_filtered_target_pose_.pose.position.z =
-            pn_target_filter_z_.filter(msg->pose.position.z, t);
+            pn_target_filter_z_.filter(msg->pose.position.z, pn_filter_dt);
         pn_filtered_target_valid_    = true;
         pn_last_target_update_time_  = ros::Time::now();  // FIFO 在 enableCallback 之后
 
@@ -1260,6 +1308,9 @@ public:
     void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
         mission_state_received_ = true;
         current_mission_phase_ = msg->phase;
+        // === 2026-08-25: 同步 GS attack_cmd 接收标志 (末段 chase gate) ===
+        //   用户口径"接收到 attackCmd 之后才要末段 chase" → helper 顶部 guard
+        attack_cmd_received_ = (msg->attack_cmd_received != 0);
     }
 
     //========不要fail safe============//
@@ -1669,13 +1720,33 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
             current_image_target_.visible &&
             image_age <= image_visible_timeout_sec_ &&
             image_ray_filter_valid_;
+        // === 2026-08-25: mode-aware 参数选择 (TRACK 走 track_terminal_image_chase_*, STRIKE 走 strike_terminal_image_chase_*) ===
+        //   TRACK 末段图像导引 (新加) 与 STRIKE 共享 helper, 只在顶部加 4 个 local var。
+        //   函数体其余部分 (3D ray 速度、yaw rate、latch 状态机) 完全不动。
+        // === 2026-08-25: attack_cmd gate (用户口径"接收到 attackCmd 之后才要") ===
+        //   GS 未发 attack_cmd action=0 (打) 时,TRACK 末段 chase 几何不下沉,
+        //   持续 stand-off 跟着;发了之后 (1) ignore (2) stash 才回 false。
+        //   STRIKE 路径默认 attack_cmd_received=true (action=0 才会进 strike),
+        //   helper guard 对它无影响。
+        if (!attack_cmd_received_) {
+            return false;
+        }
+        const bool is_track_chase = (current_mode_ == "track");
+        const bool  terminal_chase_enabled = is_track_chase
+            ? track_terminal_image_chase_enabled_   : strike_terminal_image_chase_enabled_;
+        const double min_horiz_m_chase = is_track_chase
+            ? track_terminal_image_chase_min_horiz_m_ : strike_terminal_image_chase_min_horiz_m_;
+        const double center_band_chase = is_track_chase
+            ? track_terminal_image_chase_center_band_ : strike_terminal_image_chase_center_band_;
+        const double latch_sec_chase = is_track_chase
+            ? track_terminal_image_chase_latch_sec_ : strike_terminal_image_chase_latch_sec_;
         const bool image_centered =
-            std::fabs(current_image_target_.center_x - 0.5) <= strike_terminal_image_chase_center_band_ &&
-            std::fabs(current_image_target_.center_y - 0.5) <= strike_terminal_image_chase_center_band_;
+            std::fabs(current_image_target_.center_x - 0.5) <= center_band_chase &&
+            std::fabs(current_image_target_.center_y - 0.5) <= center_band_chase;
         const bool in_terminal_zone =
             g.horizontal > 0.1 &&
-            g.horizontal <= strike_terminal_image_chase_min_horiz_m_;
-        const bool should_chase = strike_terminal_image_chase_enabled_ &&
+            g.horizontal <= min_horiz_m_chase;
+        const bool should_chase = terminal_chase_enabled &&
                                   image_fresh && image_centered && in_terminal_zone;
 
         if (should_chase) {
@@ -1685,18 +1756,19 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
             terminal_image_chase_active_ &&
             !terminal_image_chase_enter_time_.isZero() &&
             (ros::Time::now() - terminal_image_chase_enter_time_).toSec() <
-                strike_terminal_image_chase_latch_sec_;
+                latch_sec_chase;
         const bool chase_active = should_chase ||
             (terminal_image_chase_active_ && in_latch_period && image_fresh);
         terminal_image_chase_active_ = chase_active;
 
         // === 状态切换日志 (2026-08-20):便于下次跑 bag 直接确认 chase 是否起作用 ===
         if (chase_active && !last_chase_log_active_) {
-            ROS_WARN("[Guidance] CHASE ENTERED: image_centered=%.3f,%.3f horiz=%.2fm "
+            ROS_WARN("[Guidance] CHASE ENTERED (mode=%s): image_centered=%.3f,%.3f horiz=%.2fm "
                      "(min=%.1fm, latch=%.1fs, image_age=%.3fs)",
+                     current_mode_.c_str(),
                      current_image_target_.center_x, current_image_target_.center_y,
-                     g.horizontal, strike_terminal_image_chase_min_horiz_m_,
-                     strike_terminal_image_chase_latch_sec_, image_age);
+                     g.horizontal, min_horiz_m_chase,
+                     latch_sec_chase, image_age);
         } else if (!chase_active && last_chase_log_active_) {
             ROS_WARN("[Guidance] CHASE EXITED: image_fresh=%d image_centered=%d in_zone=%d "
                      "(horiz=%.2fm image_age=%.3fs)",
@@ -2430,14 +2502,27 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
         double chase_cmd_x = tvx_f + chase_K_p_ * horiz_err * dir_x;
         double chase_cmd_y = tvy_f + chase_K_p_ * horiz_err * dir_y;
 
-        // 4) 总模长 clamp 到 track_max_speed_ — 不切 body-frame,大 yaw_err 时不再刹车
+        // 4) 总模长 clamp — 不切 body-frame,大 yaw_err 时不再刹车
+        //    === 2026-08-25: 加二次减速区 (close_horiz=30m) ===
+        //    horiz<30m 时按比例缩放速度: horiz=12m → 0.4 × 17 = 6.8 m/s 压位
+        //    floor 0.4 防最低速度保护,允许 chase 在 horiz=0 时仍 6.8 m/s 跟速度
+        //    修前 bug: 原 clamp 只用 track_max_speed_(17m/s),horiz=0 时仍按 17m/s 飞,
+        //    target 移动时 chase 跟着平移却不会压位,稳态在目标上空 17m/s 盘旋过冲。
+        const double close_horiz = 30.0;
+        const double close_speed_floor = 0.4;
+        double close_speed_scale = 1.0;
+        if (lead_horiz_dist < close_horiz) {
+            close_speed_scale = std::max(close_speed_floor,
+                                          lead_horiz_dist / close_horiz);
+        }
+        const double final_speed = track_max_speed_ * close_speed_scale;
         double chase_speed = std::sqrt(chase_cmd_x*chase_cmd_x + chase_cmd_y*chase_cmd_y);
-        const bool chase_speed_clamped = (chase_speed > track_max_speed_);
-        if (chase_speed > track_max_speed_) {
-            const double s = track_max_speed_ / chase_speed;
+        const bool chase_speed_clamped = (chase_speed > final_speed);
+        if (chase_speed > final_speed) {
+            const double s = final_speed / chase_speed;
             chase_cmd_x *= s;
             chase_cmd_y *= s;
-            chase_speed  = track_max_speed_;
+            chase_speed  = final_speed;
         }
 
         // 5) 高度控制：固定 track_altitude_（P 控制）— 与旧版一致
@@ -2513,6 +2598,16 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
         //   物理方向 chase→PX4 保留正号 → UAV 左转/右转跟 chase 算的方向一致。✓
         //   修前错误诊断: 曾误以为此链需要少翻一次号,改成 +yaw_rate → 反而破坏自洽。
         vel_cmd.angular.z = -yaw_rate;
+
+        // === 2026-08-25: TRACK 末段图像导引 (与 STRIKE chase 同源 helper) ===
+        //   TRACK 不发 strike,UAV 在 horiz≤22m + bbox 在中心时沿相机射线全速压位,
+        //   等 GS 发 105 后进入 STRIKE 命中圈。YOLO 不足/不在中心时降级回 chase 几何。
+        //   必须在 vel_cmd.angular.z = -yaw_rate (上方) 之后,这样 chase_active=true 时
+        //   helper 覆盖 angular.z = terminalYawRate(ray_bearing, horiz),chase_active=false
+        //   时 helper return false 不修改,几何 chase 输出保留 (= 降级路径)。
+        //   路径与 STRIKE 路径 (L2184-2185 在 computeCommand 之后) 完全对齐。
+        const StrikeTargetGeometry track_geometry = strikeTargetGeometry();
+        maybeApplyTerminalImageChase(vel_cmd, track_geometry);
 
         // =====================================================================
 

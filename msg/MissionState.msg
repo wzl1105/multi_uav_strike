@@ -16,3 +16,12 @@ uint8   phase
 #   本机到达 attack_point 的微秒时间戳(0 = 还没到)
 #   comm_node 从这里读并填进 InterUavStatus 心跳,partner 据此计算 strike_sync_time
 uint64 attack_arrival_time_us
+
+# === 2026-08-25: GS 是否已下达 attack_cmd action=0 (打) ===
+#   0 = 未下达或已 ignore(1)/stash(2)/清锁,末段图像导引(chase 几何)不下沉;
+#   1 = 已下达,SEARCH_TRACK 下 UAV 持续 stand-off 跟着但不下沉,直到
+#       phase 推进或 GS 二次指令(action=1/2)清掉。
+#   用户口径:"我要末端图像导引,但是接收到 attackCmd 之后才要"
+#   → 只有 GS 显式发攻击指令,TRACK/STRIKE 末段 chase 才下沉,避免
+#     TRACK 阶段 UAV 自己在 horiz≤22m 时往下冲。
+uint8 attack_cmd_received

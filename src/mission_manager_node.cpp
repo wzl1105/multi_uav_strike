@@ -539,6 +539,11 @@ private:
     // task_speed 必须由任务显式传入，并统一限制到 attack_max_speed_。
     double min_guidance_speed_;
     double attack_max_speed_;
+    // === 2026-08-25: attack_speed 缺失兜底 (用户口径"默认 20 m/s") ===
+    //   SEARCH_TRACK(102) + attack_cmd 路径下, params_json 没 attack_speed 字段时
+    //   fallback 此速度 (clamp 到 attack_max_speed_)。skill 105 路径 task_speed 必有,
+    //   不走此 fallback。默认 20 m/s 跟 task_speed 默认值对齐, 够追上 ≤17 m/s 动目标。
+    double attack_speed_default_m_s_;
     //=======高度下降===========//
     // Attack 飞向 WP1 时的预下降规划速率，与 waypoint/guidance 共用 common.yaml 参数。
     double strike_descent_rate_;
@@ -609,6 +614,13 @@ private:
     // 制导接近参数
     bool is_guidance_active_;
     double strike_distance_threshold_;  // 打击成功距离阈值
+
+    // === 2026-08-25: GS 已发 attack_cmd action=0 (打) 标志 ===
+    //   action=0 → true (持续整个 attack/strike 流程);action=1/2 (忽略/暂存) → false
+    //   publishMissionState() 把它同步到 ms.attack_cmd_received,guidance 订阅后
+    //   作为末段图像导引 (TRACK/STRIKE) 的 gate
+    //   (用户口径"接收到 attackCmd 之后才要末段 chase")
+    bool attack_cmd_received_;
 
     // 参数
     double mission_loop_rate_;
@@ -930,7 +942,12 @@ public:
                                               //   新 TaskFlow 到达时 taskFlowCallback 会清空)
         ignored_match_radius_m_(20.0),      // 空间匹配默认 20m
         last_ignored_cleanup_(ros::Time()),
-        last_reported_cleanup_(ros::Time()) {
+        last_reported_cleanup_(ros::Time()),
+        // === 2026-08-25: GS 已发 attack_cmd action=0 (打) 标志 ===
+        //   action=0 → true (持续整个 attack/strike 流程);action=1/2 (忽略/暂存) → false
+        //   publishMissionState() 填到 ms.attack_cmd_received,guidance 订阅后作为
+        //   末段图像导引的 gate (用户口径"接收到 attackCmd 之后才要末段 chase")
+        attack_cmd_received_(false) {
 
         initParams();
         initSubscribers();
@@ -1084,6 +1101,9 @@ public:
         nh_private_.param<double>("min_guidance_speed", min_guidance_speed_, 2.0);
         nh_private_.param<double>("attack_max_speed", attack_max_speed_, 40.0);
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
+        nh_private_.param<double>("attack_speed_default_m_s",
+                                  attack_speed_default_m_s_, 20.0);
+        attack_speed_default_m_s_ = std::max(0.1, attack_speed_default_m_s_);
         //=======高度下降===========//
         nh_private_.param<double>("strike_descent_rate", strike_descent_rate_, 2.0);
         strike_descent_rate_ = std::max(0.1, strike_descent_rate_);
@@ -3243,9 +3263,17 @@ public:
                                  guidance_speed_, new_speed, sr_ref.msg.skill_type);
                         guidance_speed_ = new_speed;
                     } else {
-                        ROS_WARN_THROTTLE(2.0, "[MissionManager] AttackCmd action=0: no "
-                                              "attack_speed in params_json, keep guidance_speed_=%.2f",
-                                              guidance_speed_);
+                        // === 2026-08-25: attack_speed 缺失 fallback (用户口径"默认 20 m/s") ===
+                        //   现状: 保持 SEARCH_TRACK 的 search_speed (可能 5 m/s) 当 strike 速度
+                        //   → UAV 飘过去打不动。修法: fallback attack_speed_default_m_s_ 兜底,
+                        //   clamp 到 attack_max_speed_。floor 也同步设: parsed==0 也走 fallback
+                        //   (老 Skill 模板有时填 0 占位)。
+                        const double new_speed = std::min(attack_speed_default_m_s_,
+                                                          attack_max_speed_);
+                        ROS_WARN("[MissionManager] AttackCmd action=0: no attack_speed in params_json, "
+                                 "fallback %.2f m/s (was guidance_speed_=%.2f, skill=%d)",
+                                 new_speed, guidance_speed_, sr_ref.msg.skill_type);
+                        guidance_speed_ = new_speed;
                     }
                 }
                 ROS_WARN("[MissionManager] AttackCmd action=0 (打) — triggering strike");
@@ -3254,6 +3282,10 @@ public:
                 //   (TRACK 完全不 yield → race window 重复发送)。统一在 startGuidanceApproach()
                 //   顶部加 yield (带 guidance_has_control_yielded_ latch),STRIKE/TRACK 对称。
                 triggerStrike();
+                // === 2026-08-25: GS attack_cmd action=0 (打) → 末段 chase gate 开 ===
+                //   用户口径:"我要末端图像导引,但是接收到 attackCmd 之后才要"
+                //   此后 TRACK/STRIKE 末段 chase 几何下沉;ignore/stash/RTL → 关
+                attack_cmd_received_ = true;
                 detect_target_pub_.publish(dt);
                 {
                     multi_uav_strike::DetectTargets batch;
@@ -3315,6 +3347,8 @@ public:
                 setLockState(TrackLockState::NOT_LOCKED);
                 // 多目标: 忽略主目标后,清掉 primary;estimator 在下一帧重新锚定下一个
                 publishPrimaryTarget(0);
+                // === 2026-08-25: GS attack_cmd action=1 (忽略) → 末段 chase gate 关 ===
+                attack_cmd_received_ = false;
                 return;
             }
             case 2: {
@@ -3362,6 +3396,8 @@ public:
                 setLockState(TrackLockState::NOT_LOCKED);
                 // 多目标: 暂存后清 primary,estimator 在下一帧重新锚定下一个
                 publishPrimaryTarget(0);
+                // === 2026-08-25: GS attack_cmd action=2 (暂存) → 末段 chase gate 关 ===
+                attack_cmd_received_ = false;
                 return;
             }
             default:
@@ -5834,6 +5870,8 @@ public:
             }
         }
 
+        // === 2026-08-25: 同步 GS attack_cmd 接收标志给 guidance (末段 chase gate) ===
+        ms.attack_cmd_received = attack_cmd_received_ ? 1 : 0;
         mission_state_pub_.publish(ms);
         last_mission_state_pub_time_ = ros::Time::now();
     }

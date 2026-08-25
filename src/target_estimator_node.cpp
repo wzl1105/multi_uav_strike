@@ -2094,21 +2094,18 @@ private:
         // === 2026-08-23: 动目标 lead pose (KF + v*lead_time) ===
         //   STATIC / UNKNOWN: 直接用 KF 输出 (c.ned_x/y), 等效旧版 EMA 行为
         //   DYNAMIC:          c.kf + 收拢速度反算的 lead_time, UAV 不从目标后面飞过
-        double pub_x = c.ned_x;
-        double pub_y = c.ned_y;
-        if (c.motion_class_ == MotionClass::DYNAMIC && c.kf_.isInitialized()) {
-            const double closing = computeClosingSpeed(c);
-            const double dx = c.ned_x - current_uav_pose_.pose.position.x;
-            const double dy = c.ned_y - current_uav_pose_.pose.position.y;
-            const double horiz = std::hypot(dx, dy);
-            double lead_time = (closing > 0.5) ? (horiz / closing) : motion_lead_min_;
-            // clamp [lead_min, lead_max]
-            if (lead_time < motion_lead_min_) lead_time = motion_lead_min_;
-            if (lead_time > motion_lead_max_) lead_time = motion_lead_max_;
-            c.kf_.getPositionWithLead(lead_time, pub_x, pub_y);
-        }
-        msg.pose.position.x = pub_x;
-        msg.pose.position.y = pub_y;
+        // === 2026-08-25: 删 estimator lead_t1 (double-lead bug 治本) ===
+        //   原 DYNAMIC 块算 lead_time (0.2-1.5s) 后调 c.kf_.getPositionWithLead
+        //   把 KF 真值提前发布。guidance_control_node.cpp:2400 chase 自己也加
+        //   lead_t2 (0.2-1.5s),两层叠加 lead ≈ 2.0-3.0s,17 m/s × 2s = 34m,
+        //   稳态过冲 30m+ (uav0_strike_2026-08-25-14-34-08_0.bag 复盘)。
+        //   修法:统一在 chase 层加 lead,estimator 只 publish KF 真值。
+        //   chase 的 lead_t2 由 chase_lead_min/max (yaml:0.2/1.5s) 钳位,
+        //   closing speed 用 chase_K_p × horiz 闭环算出,比 estimator 这套更紧。
+        //   不冲突验证:3 个 subscriber (guidance:680 / mission_manager:1142 /
+        //   comm:226) 不读 lead,改完下游透明。
+        msg.pose.position.x = c.ned_x;
+        msg.pose.position.y = c.ned_y;
         msg.pose.position.z = c.ned_alt;
         msg.pose.orientation.w = 1.0;  // 单位四元数(目标无朝向)
         target_est_pose_pub_.publish(msg);
