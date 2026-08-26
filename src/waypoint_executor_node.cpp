@@ -789,6 +789,25 @@ public:
 
         // 起飞和起飞高度悬停只允许 position。搜索航线、Attack 的 WP1→WP2
         // 以及返航航线才允许 waypoint velocity；其它阶段一律不发布。
+        //
+        // === 2026-08-26 修 (gs_test_play_9.bag, t=1787677644.440 → AUTO.LAND @ 1787677645.559
+        //   setpoint 断流 1.119s = COM_OFFBOARD_LOSS_TIMEOUT):
+        //   mission_manager 收到 SEARCH_ONLY task_flow 调 disableGuidance()
+        //   → enable=False 让 guidance_has_control_=false,但 phase 仍残留 4 (GUIDANCE_TRACK),
+        //   executeSegmentFlight() 调 publishVelocityCommandWithYaw() 走到下面的 return false
+        //   → setpoint_velocity 整链断流 1.119s → PX4 AUTO.LAND。
+        //   修法:guidance_has_control_=false 时 (mission_manager 已 disableGuidance),
+        //   waypoint_executor 必须接管发 setpoint,允许 phase 4 (GUIDANCE_TRACK) 和
+        //   phase 5 (GUIDANCE_STRIKE)。phase 1/2/9 (TAKING_OFF/HOVERING/HOLDING)
+        //   仍由 mission_manager position setpoint 主管,不动 (避免 8/17 那次
+        //   重复发送的 bug,[[feedback-zero-velocity-phase-gate]])。
+        if (!guidance_has_control_) {
+            if (current_mission_phase_ == 4 ||  // GUIDANCE_TRACK
+                current_mission_phase_ == 5) {  // GUIDANCE_STRIKE
+                return true;
+            }
+        }
+
         return current_mission_phase_ == 3 ||  // WAYPOINT_FOLLOW
                current_mission_phase_ == 6;    // RETURNING
         //=========setpoint====//
@@ -935,6 +954,23 @@ public:
 
         if (!is_executing_ || !is_waypoints_received_) {
             // === 2026-08-05 修:无航点但 guidance 未启,发 0 维持心跳 ===
+            publishZeroVelocity();
+            return;
+        }
+
+        // === 2026-08-26 修 (gs_test_play_9.bag symptoms #1+#2):
+        //   typedWorkModeCallback 切 SEARCH_ONLY + taskFlowCallback 路径 A 调
+        //   disableGuidance() 后,phase 仍 4 (GUIDANCE_TRACK) + guidance_has_control_=false,
+        //   segment_phase_ 通常 IDLE/HOLD/COMPLETE,is_executing_+is_waypoints_received_ 都 true,
+        //   上述三个 if 全跳过 → 主 timer 走完不发任何 setpoint → PX4 OFFBOARD 1s
+        //   失流 → AUTO.LAND (实测 gs_test_play_9.bag t=3497.134s)。
+        //   修法:这个组合是 task_flow→disableGuidance→新 skill 推送的 race window,
+        //   必须发 0 速度保活 OFFBOARD 心跳,直到 pushCurrentSkillToExecutor 让
+        //   waypoint_executor 进入 executeSegmentFlight() 或 startGuidanceApproach 重新接管。
+        //   publishZeroVelocity() 内部 phase gate (1/2/9 return) 自动拦掉不允许发 setpoint 的 phase。
+        if (!guidance_has_control_ &&
+            segment_phase_ != SegmentPhase::ARRIVE &&
+            segment_phase_ != SegmentPhase::SKILL_AREA) {
             publishZeroVelocity();
             return;
         }

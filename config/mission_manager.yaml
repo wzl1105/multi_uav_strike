@@ -114,3 +114,10 @@ attack_direct_look_confirm_hits: 3
 # 注:vtol_state==2 的检查在 TaskFlow 接收时已完成,触发后不再判断中间态 3=姿态修正,
 #   直接看最终态 4。
 catapult_wait_state4_timeout_sec: 60.0
+
+# === 2026-08-25: attack_speed 缺失兜底 (SEARCH_TRACK + attack_cmd 路径) ===
+#   SEARCH_TRACK skill (102) 的 params_json 没 attack_speed 字段时,
+#   strike 阶段 fallback 此速度 (clamp 到 attack_max_speed)。
+#   默认 20 m/s 跟 task_speed 默认值对齐, 够追上 ≤17 m/s 动目标。
+#   skill 105 ATTACK 路径 task_speed 必有, 不走此 fallback。
+attack_speed_default_m_s: 20.0

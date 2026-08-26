@@ -79,6 +79,9 @@ SETPOINT_VELOCITY_TOPICS = [
 SETPOINT_RAW_LOCAL = "/{ns}/mavros/setpoint_raw/target_local"
 STATE_TOPIC = "/{ns}/mavros/state"
 MISSION_STATE_TOPIC = "/{ns}/mission/mission_state"
+# === 2026-08-26: A+F 抑制用 ===
+LOCAL_POSE_TOPIC = "/{ns}/mavros/local_position/pose"
+ATTACK_CMD_TOPIC = "/{ns}/mission/attack_cmd"
 
 
 def first_existing(bag, candidates):
@@ -103,6 +106,48 @@ def analyze_autoland(bag, state_topic):
         if isinstance(mode, str) and mode == "AUTO.LAND":
             events.append((t.to_sec(), mode))
     return events
+
+
+def _altitude_at(bag, pose_topic, t_query):
+    """Return UAV altitude (m, ENU z up) at or just before t_query.
+    Returns None if bag has no pose topic.
+    """
+    if pose_topic is None:
+        return None
+    try:
+        bag.get_message_count(pose_topic)
+    except Exception:
+        return None
+    last_z = None
+    for topic, msg, t in bag.read_messages(pose_topic):
+        ts = t.to_sec()
+        if ts > t_query:
+            break
+        # geometry_msgs/PoseStamped: msg.pose.position.z
+        p = getattr(getattr(msg, "pose", None), "position", None)
+        if p is not None:
+            last_z = getattr(p, "z", None)
+    return last_z
+
+
+def _last_attack_cmd_time(bag, attack_topic, before_t):
+    """Return timestamp_sec of most recent attack_cmd action=0 (打) before before_t.
+    Returns None if no attack_cmd in bag, or no action=0 before before_t.
+    """
+    if attack_topic is None:
+        return None
+    try:
+        bag.get_message_count(attack_topic)
+    except Exception:
+        return None
+    last = None
+    for topic, msg, t in bag.read_messages(attack_topic):
+        ts = t.to_sec()
+        if ts > before_t:
+            break
+        if getattr(msg, "action", None) == 0:  # 0 = 打 (strike)
+            last = ts
+    return last
 
 
 def _gaps(times, threshold):
@@ -509,6 +554,17 @@ def main():
                          "Overlap windows within ±N seconds of any phase transition "
                          "are tagged as suppressed (handoff design region, not a bug). "
                          "(default 1.5 s)")
+    # === 2026-08-26: A+F 抑制 (用户口径, 排除合法 strike-and-LAND 的误报) ===
+    ap.add_argument("--autoland-alt-threshold", type=float, default=5.0,
+                    help="Suppress AUTO.LAND finding if UAV altitude at LAND time "
+                         "< this many meters (default 5.0). Rationale: 落地触发的 LAND/RTL "
+                         "不是 setpoint 断流 bug,应排除 (2026-08-26 用户口径).")
+    ap.add_argument("--autoland-attack-window", type=float, default=5.0,
+                    help="Suppress AUTO.LAND finding if there was an attack_cmd action=0 "
+                         "(strike) within this many seconds before LAND (default 5.0). "
+                         "Rationale: 打击 → 落地 → LAND/RTL 是合法流程,不报 (2026-08-26 用户口径).")
+    ap.add_argument("--no-autoland-suppress", action="store_true",
+                    help="Disable A+F suppression for AUTO.LAND findings (report all)")
     args = ap.parse_args()
 
     pos_tpcs = [t.format(ns=args.ns) for t in SETPOINT_POSITION_TOPICS]
@@ -525,13 +581,45 @@ def main():
         if not args.no_autoland:
             events = analyze_autoland(bag, state_tpc)
             if events:
-                findings.append(("AUTOLAND",
-                                 "PX4 mode=AUTO.LAND detected ({} events)".format(len(events))))
-                for ts, _ in events[:5]:
-                    print(f"  AUTOLAND t={ts:.3f}s")
-                if len(events) > 5:
-                    print(f"  AUTOLAND ... +{len(events) - 5} more")
-                rc = 1
+                # === 2026-08-26 A+F 抑制 (用户口径,排除合法 strike-and-LAND 误报):
+                #   A (Altitude): LAND 时 UAV 高度 < --autoland-alt-threshold → 落地触发,合法
+                #   F (Follow-up attack): LAND 前 --autoland-attack-window 秒内有
+                #     attack_cmd action=0 (打) → 合法 strike-and-LAND
+                #   两者任一满足则 suppress,不报 AUTOLAND。
+                #   用户口径:"看第一次LAND或者RTL的时候无人机高度,如果很低那可能是打击之后的事儿"
+                #          "通过是否发送过打击指令之后2-3s来判断"
+                pose_tpc = LOCAL_POSE_TOPIC.format(ns=args.ns)
+                atk_tpc = ATTACK_CMD_TOPIC.format(ns=args.ns)
+                kept, suppressed = [], []
+                if args.no_autoland_suppress:
+                    kept = [ts for ts, _ in events]
+                else:
+                    for ts, _ in events:
+                        alt = _altitude_at(bag, pose_tpc, ts)
+                        last_atk = _last_attack_cmd_time(bag, atk_tpc, ts)
+                        if (alt is not None
+                                and alt < args.autoland_alt_threshold):
+                            suppressed.append((ts, f"altitude={alt:.2f}m < "
+                                f"{args.autoland_alt_threshold}m (low-altitude LAND)"))
+                        elif (last_atk is not None
+                                and (ts - last_atk) < args.autoland_attack_window):
+                            suppressed.append((ts, f"attack_cmd {ts-last_atk:.2f}s ago "
+                                f"< {args.autoland_attack_window}s window (strike-and-LAND)"))
+                        else:
+                            kept.append(ts)
+                if kept:
+                    findings.append(("AUTOLAND",
+                                     "PX4 mode=AUTO.LAND detected ({} events)".format(len(kept))))
+                    for ts in kept[:5]:
+                        print(f"  AUTOLAND t={ts:.3f}s")
+                    if len(kept) > 5:
+                        print(f"  AUTOLAND ... +{len(kept) - 5} more")
+                    rc = 1
+                if suppressed:
+                    for ts, reason in suppressed[:5]:
+                        print(f"  AUTOLAND t={ts:.3f}s SUPPRESSED ({reason})")
+                    if len(suppressed) > 5:
+                        print(f"  AUTOLAND ... +{len(suppressed) - 5} more suppressed")
 
         # ------- Check 2: stream gap -------
         if not args.no_stream_gap:
