@@ -333,6 +333,18 @@ private:
         // SITL 平地无地形,够用;真实场景需配合 terrain map。
     //=======高度下降===========//
 
+    // === 2026-08-27: 段切换 yaw 预对齐 (简单参数版) ===
+    //   段切换瞬间如 |new_bearing - current_yaw| > 阈值,把 (vx,vy) 清 0,
+    //   让 yaw P-controller 单独把朝向转对齐,偏差 < 阈值后继续沿新段飞。
+    //   与 pre_align_radius_ blend 互补: blend 解决接近 WP1 渐进,
+    //   这个解决段切换瞬间的突发(段首 yaw 偏差大)。
+    //   ramp filter (publishVelocityCommandWithYaw 内部) 会用 ~2s 把 vx
+    //   从巡航速平滑降到 0,期间 yaw 也旋转,总停时间 ~2~3s 后开始新段。
+    double segment_yaw_align_deg_ = 0.0;   // deg, 0 = 禁用
+    bool   yaw_aligning_         = false;  // 当前是否在对齐模式
+    int    last_segment_phase_int_ = -1;   // 上次 executeSegmentFlight 的 segment_phase_
+    size_t last_segment_idx_     = 0;      // 上次 executeSegmentFlight 的 idx
+
 public:
     WaypointExecutor() : nh_private_("~"),
         current_waypoint_index_(0),
@@ -560,6 +572,15 @@ public:
         strike_final_commit_radius_m_ = std::max(0.5, strike_final_commit_radius_m_);  // 不要小于 0.5m
         strike_ground_safety_margin_m_ = std::max(0.0, strike_ground_safety_margin_m_);
         //=======高度下降===========//
+        // === 2026-08-27: 段切换 yaw 预对齐 ===
+        //   段切换瞬间如 |new_bearing - current_yaw| > 此阈值 (deg), 把
+        //   (vx, vy) 清 0,让 yaw P-controller 单独转对齐,偏差 < 阈值后
+        //   继续沿新段飞。0 = 禁用 (默认, 行为不变)。
+        //   ramp filter (publishVelocityCommandWithYaw 内部) 用 ~2s 把 vx
+        //   从巡航速平滑降到 0 (vel_slew_max_horiz_accel=8 m/s²),期间 yaw
+        //   也旋转,154° 转弯总停时间 ≈ 2.7s 后开始新段。典型 15~30 deg。
+        nh_private_.param<double>("segment_yaw_align_deg", segment_yaw_align_deg_, 0.0);
+        segment_yaw_align_deg_ = std::max(0.0, segment_yaw_align_deg_);
     }
 
     void initSubscribers() {
@@ -1476,6 +1497,56 @@ public:
 
         // (2026-08-03 重构:段切换 fall-through 已移至函数顶端,不再在此处
         //  publishZeroVelocity()+return。avoidance 之后直接 publish velocity)
+
+        // === 2026-08-27: 段切换 yaw 预对齐 (简单参数版) ===
+        //   段切换瞬间 (segment_phase_ 或 cur_idx 变化) 时,如
+        //   |bearing - current_yaw| > 阈值,把 (vx, vy) 清 0 让 yaw P-controller
+        //   单独把朝向转对齐,偏差 < 阈值后继续。
+        //   bearing 仍按新段方向计算 (前面已确定),vx/vy=0 不影响 bearing。
+        //   ramp filter (publishVelocityCommandWithYaw 内部) 用 ~2s 把 vx 从
+        //   巡航速平滑降到 0,期间 yaw 也旋转,总停时间 ≈ 2~3s 后开始新段。
+        //   不影响:
+        //     - phase 不切换的连续 idx 飞行 (seg_just_transitioned=false 跳过)
+        //     - 第一帧执行 (last_segment_phase_int_ < 0 跳过,避免启动误触)
+        //     - 禁用 (segment_yaw_align_deg_ == 0 跳过,行为不变)
+        if (segment_yaw_align_deg_ > 0.0 && last_segment_phase_int_ >= 0) {
+            const int cur_phase_int = static_cast<int>(segment_phase_);
+            const size_t cur_idx_val = *cur_idx;
+            const bool seg_just_transitioned =
+                (last_segment_phase_int_ != cur_phase_int ||
+                 last_segment_idx_ != cur_idx_val);
+            double yaw_diff = bearing - current_yaw_ned_;
+            while (yaw_diff >  M_PI) yaw_diff -= 2.0 * M_PI;
+            while (yaw_diff < -M_PI) yaw_diff += 2.0 * M_PI;
+            const double yaw_diff_deg = std::fabs(yaw_diff) * 180.0 / M_PI;
+            if (yaw_aligning_) {
+                // 已进入对齐模式:继续 0 速度直到 yaw 偏差 < 阈值
+                if (yaw_diff_deg > segment_yaw_align_deg_) {
+                    vx = 0.0;
+                    vy = 0.0;
+                } else {
+                    yaw_aligning_ = false;  // 对齐完成,恢复飞行
+                }
+            } else if (seg_just_transitioned &&
+                       yaw_diff_deg > segment_yaw_align_deg_) {
+                // 段切换 + 偏差超阈值 → 进入对齐模式
+                yaw_aligning_ = true;
+                vx = 0.0;
+                vy = 0.0;
+                ROS_WARN_THROTTLE(1.0,
+                    "[WaypointExecutor] yaw_align ENTERED: phase=%d->%d idx=%zu->%zu "
+                    "yaw_diff=%.1fdeg (threshold=%.1fdeg)",
+                    last_segment_phase_int_, cur_phase_int,
+                    last_segment_idx_, cur_idx_val,
+                    yaw_diff_deg, segment_yaw_align_deg_);
+            }
+            last_segment_phase_int_ = cur_phase_int;
+            last_segment_idx_ = cur_idx_val;
+        } else if (segment_yaw_align_deg_ > 0.0) {
+            // 第一帧执行: 仅记录状态, 不触发对齐 (避免启动时误触发)
+            last_segment_phase_int_ = static_cast<int>(segment_phase_);
+            last_segment_idx_ = *cur_idx;
+        }
 
         // === 发布速度+航向(沿段方向,不是目标方向)===
         publishVelocityCommandWithYaw(vx, vy, vz, bearing);
