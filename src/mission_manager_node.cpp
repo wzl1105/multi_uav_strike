@@ -622,6 +622,25 @@ private:
     //   (用户口径"接收到 attackCmd 之后才要末段 chase")
     bool attack_cmd_received_;
 
+    // === 2026-08-28: skill 105 接收到之后静默聚类 publish 守卫 ===
+    //   用户口径(2026-08-28 最终版):"skill 105 接收到之后不再发送聚类"。
+    //   触发点:taskFlowCallback 收到 skill_type=105 时把 work_mode 切到
+    //   SEARCH_STRIKE (L2562-2565 "Attack route activated")。
+    //   一旦触发,所有后续 DetectTarget publish 全部静默,包括:
+    //     - cluster_states 回调里的 type=3 (non-primary / WP2 gate fail /
+    //       target_type no-match / stale / gating WAITING)
+    //     - attack_cmdCallback action=2 (stash) 的 type=2 上报
+    //   不静默:
+    //     - attack_cmdCallback action=0 (打) L3303 strike 触发信号
+    //     - processSearchStrikeStrike L4327 strike commit 信号 (target_type=1)
+    //   注:helper 只看 work_mode==SEARCH_STRIKE,不依赖 phase,因为:
+    //     - skill 105 taskFlow 进入后 work_mode 立即切 SEARCH_STRIKE
+    //     - 200ms 间隙(直到 phase 切 GUIDANCE_STRIKE)也要静默
+    //     (uav0_strike_2026-08-28-00-43-44_0.bag bug:9 条 type=3 在间隙里漏出)
+    inline bool shouldSuppressPostAttackDetectPublish() const {
+        return current_work_mode_ == WorkMode::SEARCH_STRIKE;
+    }
+
     // 参数
     double mission_loop_rate_;
     double target_lock_confidence_;  // 目标锁定所需置信度
@@ -3356,11 +3375,16 @@ public:
                 //   收尾动作与 action=1 完全一致(action=2 仅多 publish 一个 DetectTarget)
                 dt.target_type = 2;
                 ROS_WARN("[MissionManager] AttackCmd action=2 (暂存) — adding to blacklist");
-                detect_target_pub_.publish(dt);
-                {
-                    multi_uav_strike::DetectTargets batch;
-                    batch.targets.push_back(dt);
-                    detect_targets_pub_.publish(batch);
+                // === 2026-08-28: skill 105 已激活 → stash publish 同样抑制 ===
+                //   用户口径:"skill 105 接收到之后不再发送聚类"。
+                //   work_mode=SEARCH_STRIKE 已 true → 一律静默。
+                if (!shouldSuppressPostAttackDetectPublish()) {
+                    detect_target_pub_.publish(dt);
+                    {
+                        multi_uav_strike::DetectTargets batch;
+                        batch.targets.push_back(dt);
+                        detect_targets_pub_.publish(batch);
+                    }
                 }
                 if (tracked_target_.latest) {
                     addIgnoredTarget(locked_cluster_ned_x_, locked_cluster_ned_y_, locked_cluster_ned_alt_,
@@ -3834,6 +3858,12 @@ public:
             if ((current_work_mode_ == WorkMode::SEARCH_TRACK ||
                  current_work_mode_ == WorkMode::SEARCH_STRIKE) &&
                 tracked_target_.is_valid) {
+                // === 2026-08-28: skill 105 已激活 → non-primary publish 抑制 ===
+                //   用户口径:"skill 105 接收到之后不再发送聚类"。
+                //   work_mode=SEARCH_STRIKE → 一律静默,GS 不需要看 non-primary 候选。
+                if (shouldSuppressPostAttackDetectPublish()) {
+                    continue;
+                }
                 multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
                 detect_target_pub_.publish(dt);
                 {
@@ -3887,6 +3917,11 @@ public:
                     //   风暴。
                     multi_uav_strike::DetectTarget dt =
                         buildDetectTarget(cluster, /*target_type=*/3);
+                    // === 2026-08-28: skill 105 已激活 → WP2 gate fail publish 抑制 ===
+                    //   用户口径:"skill 105 接收到之后不再发送聚类"。
+                    if (shouldSuppressPostAttackDetectPublish()) {
+                        continue;
+                    }
                     detect_target_pub_.publish(dt);
                     {
                         multi_uav_strike::DetectTargets batch;
@@ -3919,6 +3954,11 @@ public:
                 if (current_work_mode_ == WorkMode::SEARCH_STRIKE &&
                     !labelMatchesTargetType(cluster.label, sr.msg.target_type)) {
                     multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
+                    // === 2026-08-28: skill 105 已激活 → target_type no-match publish 抑制 ===
+                    //   用户口径:"skill 105 接收到之后不再发送聚类"。
+                    if (shouldSuppressPostAttackDetectPublish()) {
+                        continue;
+                    }
                     detect_target_pub_.publish(dt);
                     {
                         multi_uav_strike::DetectTargets batch;
@@ -3951,6 +3991,11 @@ public:
                         //   写 reported_to_gs_,所以下一次还能通过 L3185 dedup"完成
                         //   → 实际只需第一次 publish 写,后续由 L3185 拦截。
                         multi_uav_strike::DetectTarget dt_s = buildDetectTarget(cluster, /*target_type=*/3);
+                        // === 2026-08-28: skill 105 已激活 → stale publish 抑制 ===
+                        //   用户口径:"skill 105 接收到之后不再发送聚类"。
+                        if (shouldSuppressPostAttackDetectPublish()) {
+                            continue;
+                        }
                         detect_target_pub_.publish(dt_s);
                         {
                             multi_uav_strike::DetectTargets batch;
@@ -4247,6 +4292,17 @@ public:
         auto gating = checkAttackStrikeGating(sr);
         if (gating == AttackStrikeGating::WAITING) {
             multi_uav_strike::DetectTarget dt_w = buildDetectTarget(cluster, /*target_type=*/3);
+            // === 2026-08-28: skill 105 已激活 → gating WAITING publish 抑制 ===
+            //   用户口径:"skill 105 接收到之后不再发送聚类"。
+            //   注意: attack_strike_pending_* / publishPrimaryTarget 仍需保留,
+            //   这是本机状态机(等 partner ready)的状态记录,与上报 GS 解耦。
+            if (shouldSuppressPostAttackDetectPublish()) {
+                attack_strike_pending_             = true;
+                attack_strike_pending_cluster_id_  = cluster.cluster_id;
+                attack_strike_pending_time_        = ros::Time::now();
+                publishPrimaryTarget(cluster.cluster_id);
+                return;
+            }
             detect_target_pub_.publish(dt_w);
             {
                 multi_uav_strike::DetectTargets batch;

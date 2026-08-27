@@ -47,21 +47,18 @@ strike_terminal_speed_schedule_enabled: true
 #   sticky_latch_sec: 进入 chase 后最少保持 X 秒, 容忍 bbox 短暂抖动 (1-2 帧 visible=false)
 #   不在 chase/GEO 之间反复切. 超过 latch 仍 image_ready 才允许退出.
 strike_terminal_image_chase_enabled: true
-strike_terminal_image_chase_min_horiz_m: 22.0
+strike_terminal_image_chase_min_horiz_m: 30.0
 strike_terminal_image_chase_latch_sec: 0.5
 # chase 用更宽的居中死区 (vs image_center_deadband 0.03),17-43-21 bag 在 horiz=1.37m
 # 时 bbox 漂出 0.06 带导致 chase 提前退出,放大到 0.10 允许更大波动,让 chase
 # 能覆盖到命中圈边缘。ray 在 ~1m 内仍可信任,过宽反而引入错误方向。
-strike_terminal_image_chase_center_band: 0.22
+strike_terminal_image_chase_center_band: 0.4
 
-# === 2026-08-25: TRACK 末段图像导引 (与 STRIKE chase 同源, 用户口径"跟 STRIKE 相同") ===
-#   TRACK 不发 strike, UAV 在 horiz≤22m + bbox 在中心时沿相机射线全速压位,
-#   等 GS 发 105 后进入 STRIKE 命中圈。YOLO 不足/不在中心时降级回 chase 几何。
-#   独立参数: 未来调参不影响 STRIKE。默认值与 STRIKE 一致。
-track_terminal_image_chase_enabled: true
-track_terminal_image_chase_min_horiz_m: 22.0
-track_terminal_image_chase_latch_sec: 0.5
-track_terminal_image_chase_center_band: 0.22
+# === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===
+#   2026-08-25 引入的 4 个 track_* 独立参数已删除。TRACK 阶段 GS 未发
+#   attack_cmd action=0 时不下沉 (helper 顶部 attack_cmd gate 只挡 TRACK);
+#   发了之后跟 STRIKE 一样进 chase 几何。STRIKE 默认就要开 chase,
+#   不再等 attack_cmd (用户口径"GS 在发 105 技能的时候默认就是要开打击")。
 # //===================制导修改====================
 # image_max_vertical_speed: 1.0
 image_max_vertical_speed: 2.0

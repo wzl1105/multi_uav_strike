@@ -46,3 +46,8 @@ __pycache__/
 
 # Autostart stress test logs (and any future autotest/ dir under scripts/)
 scripts/autostart_test_logs/
+
+# Deploy bundles / generated archives (under tools/update_tools/)
+tools/update_tools/*.tar.gz
+tools/update_tools/*.zip
+tools/update_tools/*.tgz

@@ -341,14 +341,17 @@ private:
     //   17-43-21 bag 在 horiz=1.37m 时 bbox 漂出 0.06 带导致 chase 提前退出,
     //   放宽到 0.10 允许更大波动, 让 chase 覆盖到命中圈边缘。ray 在 ~1m 内仍可信。
     double strike_terminal_image_chase_center_band_ = 0.10;
-    // === 2026-08-25: TRACK 末段图像导引 (用户口径"跟 STRIKE 相同") ===
-    //   TRACK 不发 strike, UAV 在 horiz≤22m + bbox 在中心时沿相机射线全速压位,
-    //   等 GS 发 105 后进入 STRIKE 命中圈。YOLO 不足/不在中心时降级回 chase 几何。
-    //   独立参数:未来调参不影响 STRIKE。默认值与 STRIKE 一致 (用户要求)。
-    bool   track_terminal_image_chase_enabled_      = true;
-    double track_terminal_image_chase_min_horiz_m_  = 22.0;
-    double track_terminal_image_chase_latch_sec_    = 0.5;
-    double track_terminal_image_chase_center_band_ = 0.22;
+    // === 2026-08-27: 末段水平速度缩放下限 (用户口径"水平也要按距离衰减") ===
+    //   feasibleHorizontalSpeedForDescent 在 horiz≤strike_terminal_world_direction_radius_
+    //   (30m) 时按 horiz/30 缩放水平速度,floor=此值 * requested_speed,腾电机余量给
+    //   垂直下降。0.4 = 末段最多用 40% 电机预算给水平,留 60% 给 vz。
+    //   命中圈 (≤strike_distance_threshold_) 已在函数顶部 early-return,这里不再叠加。
+    double strike_terminal_horizontal_scale_floor_  = 0.4;
+    // === 2026-08-28: 删除 track_terminal_image_chase_* 四套独立参数 ===
+    //   用户口径"tracking 和 strike 用同样参数",统一用 strike_terminal_image_chase_*。
+    //   mode-aware 选择器 (helper L1764+) 现在也直接选 strike_* 这一套,
+    //   未来要再独立调参再加回。代码里 track_* 字段全部清掉。
+    // (track_terminal_image_chase_{enabled/min_horiz_m/latch_sec/center_band} 已删除)
     bool   terminal_image_chase_active_              = false;
     ros::Time terminal_image_chase_enter_time_;
     // chase enter/exit 边沿日志 (2026-08-20),last=true/false 翻转时打 WARN
@@ -667,21 +670,15 @@ public:
         strike_terminal_image_chase_center_band_ =
             std::max(strike_terminal_image_chase_center_band_, image_center_deadband_);
 
-        // === 2026-08-25: TRACK 末段图像导引参数加载 (与 STRIKE 同源, 独立参数) ===
-        nh_private_.param<bool>("track_terminal_image_chase_enabled",
-                                track_terminal_image_chase_enabled_, true);
-        nh_private_.param<double>("track_terminal_image_chase_min_horiz_m",
-                                  track_terminal_image_chase_min_horiz_m_, 22.0);
-        nh_private_.param<double>("track_terminal_image_chase_latch_sec",
-                                  track_terminal_image_chase_latch_sec_, 0.5);
-        nh_private_.param<double>("track_terminal_image_chase_center_band",
-                                  track_terminal_image_chase_center_band_, 0.22);
-        track_terminal_image_chase_min_horiz_m_ =
-            std::max(track_terminal_image_chase_min_horiz_m_, 0.0);
-        track_terminal_image_chase_latch_sec_ =
-            std::max(track_terminal_image_chase_latch_sec_, 0.0);
-        track_terminal_image_chase_center_band_ =
-            std::max(track_terminal_image_chase_center_band_, image_center_deadband_);
+        // === 2026-08-27: 末段水平速度缩放下限 (腾电机余量给垂直) ===
+        nh_private_.param<double>("strike_terminal_horizontal_scale_floor",
+                                  strike_terminal_horizontal_scale_floor_, 0.4);
+        strike_terminal_horizontal_scale_floor_ =
+            clampValue(strike_terminal_horizontal_scale_floor_, 0.05, 1.0);
+
+        // === 2026-08-28: 删除 track_terminal_image_chase_* 参数加载 ===
+        //   TRACK/STRIKE 共享 strike_* 一组参数,这里不再 load 4 个 track_* 字段。
+        // (2026-08-25 plan v7 引入的 4 个独立参数已合并到 strike_*)
         attack_max_speed_ = std::max(0.1, std::min(40.0, attack_max_speed_));
         strike_slowdown_radius_m_ = std::max(
             strike_slowdown_radius_m_, strike_horizontal_stop_radius_m_ + 0.1);
@@ -1536,7 +1533,27 @@ public:
         // 确保水平在垂直落地后 (lag 秒) 关闭,实现水平/垂直同步到达
         const double closed_loop_h_speed = horizontal_to_hit /
             std::max(0.1, time_to_land + strike_vertical_lag_);
-        return std::min(requested_speed, closed_loop_h_speed);
+        // === 2026-08-27: 末段水平距离二次减速 (用户口径"水平也要按实际距离限幅") ===
+        //   uav0_strike_2026-08-27-17-19.bag:STRIKE task_speed=8.5 m/s,末段 horiz=11.93m
+        //   alt=9.9m 时 chase 仍按 8.5 m/s + descent 5.0 m/s 命令,但电机饱和,实际
+        //   垂直只给 2 m/s → "无人机降不下来"。根因:水平吃满了电机拉力预算,腾不出
+        //   余量给垂直下降。
+        //   修法:horiz ≤ strike_terminal_world_direction_radius_(30m) 时,水平速度按
+        //   horiz/30 线性衰减,floor=0.4*requested_speed 兜底。floor=0.4 保证 UAV 还能
+        //   维持 chase 不丢失,但只允许用 40% 电机拉力预算,腾 60% 给 vz。horiz>30m
+        //   不缩 (中段全速冲,与 chase_active 路径分工)。命中圈 (≤ strike_distance_threshold_)
+        //   已经在上方 early-return,这里不再叠加,避免命中后还卡水平缩。
+        //   不影响 terminal_image_chase_active_ 路径 (那段在 caller 提前 return,
+        //   没机会走到 feasibleHorizontalSpeedForDescent)。
+        const double horiz_scale_radius = strike_terminal_world_direction_radius_m_;
+        double horiz_scaled = requested_speed;
+        if (horiz_scale_radius > 1e-3 &&
+            g.horizontal <= horiz_scale_radius && g.horizontal > strike_distance_threshold_) {
+            const double scale = clampValue(g.horizontal / horiz_scale_radius,
+                                            strike_terminal_horizontal_scale_floor_, 1.0);
+            horiz_scaled = requested_speed * scale;
+        }
+        return std::min({requested_speed, closed_loop_h_speed, horiz_scaled});
     }
 
     // === 2026-08-19: 实际下降率 EMA 跟踪器 ===
@@ -1720,26 +1737,27 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
             current_image_target_.visible &&
             image_age <= image_visible_timeout_sec_ &&
             image_ray_filter_valid_;
-        // === 2026-08-25: mode-aware 参数选择 (TRACK 走 track_terminal_image_chase_*, STRIKE 走 strike_terminal_image_chase_*) ===
-        //   TRACK 末段图像导引 (新加) 与 STRIKE 共享 helper, 只在顶部加 4 个 local var。
-        //   函数体其余部分 (3D ray 速度、yaw rate、latch 状态机) 完全不动。
-        // === 2026-08-25: attack_cmd gate (用户口径"接收到 attackCmd 之后才要") ===
-        //   GS 未发 attack_cmd action=0 (打) 时,TRACK 末段 chase 几何不下沉,
-        //   持续 stand-off 跟着;发了之后 (1) ignore (2) stash 才回 false。
-        //   STRIKE 路径默认 attack_cmd_received=true (action=0 才会进 strike),
-        //   helper guard 对它无影响。
-        if (!attack_cmd_received_) {
+        // === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 参数 (用户口径) ===
+        //   2026-08-25 引入的 4 个 track_* 独立参数已删除,helper 顶部直接选 strike_*
+        //   (见下面 4 个 local var)。用户口径"tracking 和 strike 用同样参数"。
+        //   攻击意图 gate 移到下一段 (L1764+,attack_cmd 只挡 TRACK)。
+        // === 2026-08-25: attack_cmd gate (TRACK only, 2026-08-28 修订) ===
+        //   原口径"接收到 attackCmd 之后才要末段 chase" → 只对 TRACK 适用,
+        //   TRACK 阶段 GS 未发 attack_cmd action=0 时不下沉,持续 stand-off 跟着。
+        //   STRIKE 路径已由 GS 发 skill 105 触发了打击意图,默认就要开 chase,
+        //   不再等 attack_cmd 协议 (用户口径 2026-08-28:"GS 在发 105 技能的时候
+        //   默认就是要开打击,attackCmd 只是跟踪阶段的打击指令")。
+        const bool is_track_chase_for_gate = (current_mode_ == "track");
+        if (is_track_chase_for_gate && !attack_cmd_received_) {
             return false;
         }
-        const bool is_track_chase = (current_mode_ == "track");
-        const bool  terminal_chase_enabled = is_track_chase
-            ? track_terminal_image_chase_enabled_   : strike_terminal_image_chase_enabled_;
-        const double min_horiz_m_chase = is_track_chase
-            ? track_terminal_image_chase_min_horiz_m_ : strike_terminal_image_chase_min_horiz_m_;
-        const double center_band_chase = is_track_chase
-            ? track_terminal_image_chase_center_band_ : strike_terminal_image_chase_center_band_;
-        const double latch_sec_chase = is_track_chase
-            ? track_terminal_image_chase_latch_sec_ : strike_terminal_image_chase_latch_sec_;
+        // === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===
+        //   用户口径"tracking 和 strike 用同样参数",删除 track_* 四套,只保留
+        //   strike_*。mode-aware 选择那一层变量保留作为未来扩展点 (默认全用 strike)。
+        const bool  terminal_chase_enabled = strike_terminal_image_chase_enabled_;
+        const double min_horiz_m_chase = strike_terminal_image_chase_min_horiz_m_;
+        const double center_band_chase = strike_terminal_image_chase_center_band_;
+        const double latch_sec_chase = strike_terminal_image_chase_latch_sec_;
         const bool image_centered =
             std::fabs(current_image_target_.center_x - 0.5) <= center_band_chase &&
             std::fabs(current_image_target_.center_y - 0.5) <= center_band_chase;

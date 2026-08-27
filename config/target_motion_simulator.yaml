@@ -61,7 +61,7 @@ targets:
   - {label: "person", x_init:  60.0, y_init: -100.0}    # 原:静止人 1 (116m)
   - {label: "person", x_init:   0.0, y_init: -205.0}    # 原:慢速人 (205m)
   - {label: "person", x_init:  90.0, y_init:  -50.0}    # 原:静止人 2 (NE 102m)
-  - {label: "person", x_init: -50.0, y_init: -150.0}    # 原:静止人 3 (SW 158m,attack_point)
+  - {label: "car",    x_init: -50.0, y_init: -150.0}    # 原:静止人 3 (SW 158m,attack_point) → 2026-08-27: 改 car, 测 label 过滤 fallback
   - {label: "person", x_init: 130.0, y_init: -100.0}    # 原:静止人 4 (E 164m)
   - {label: "person", x_init: -35.0, y_init: -150.0}    # E   (~15m 扎堆)
   - {label: "person", x_init: -65.0, y_init: -150.0}    # W   (~15m 扎堆)

@@ -48,6 +48,7 @@
 #include <multi_uav_strike/ClusterState.h>
 #include <multi_uav_strike/MissionState.h>
 #include <multi_uav_strike/WaypointStatus.h>
+#include <multi_uav_strike/Skill.h>       // === 2026-08-27: 订阅 waypoint_executor/skill 缓存 target_type ===
 //===================制导修改====================
 #include <multi_uav_strike/PrimaryImageTarget.h>
 //===================制导修改====================
@@ -290,6 +291,17 @@ public:
         //   waypoint / SEARCH 阶段 enable=false,候选 primary 显示紫色等 GS 接管。
         guidance_enable_sub_ = nh_.subscribe("guidance/enable", 10,
                                              &TargetClusterer::guidanceEnableCallback, this);
+        // === 2026-08-27: 订阅 /waypoint_executor/skill — 缓存 target_type ===
+        //   GS 通过 starling_bridge→kcp_comm.cpp:729 把 skill_params.target_type
+        //   透传到 Skill.msg.target_type (bit0=person, bit1=car),再由
+        //   mission_manager pushCurrentSkillToExecutor 推到 /waypoint_executor/skill。
+        //   estimator 同步缓存,用于 closest-to-WP2 / highest-confidence fallback 时
+        //   按 label 过滤,保证 GS 指定打 person 时不会去追 car cluster。
+        //   20260827_1733_person2car.bag:target_type=[1] 但 cluster[1]=car 在 WP2
+        //   附近,fallback 把它当 primary → UAV 实际追 car 位置 44s。
+        waypoint_skill_sub_  = nh_.subscribe<multi_uav_strike::Skill>(
+            "waypoint_executor/skill", 10,
+            &TargetClusterer::waypointSkillCallback, this);
 
         // 发布
         // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
@@ -366,7 +378,12 @@ public:
         //   频繁触发,YOLO batch 反复 skip → cluster stale → primary 切换 →
         //   chase 输出衰减 → 跟丢。TRACK 模式直接放行,waypoint/SEARCH 阶段
         //   保留门控(防 yaw 突变 bbox 抖被聚类)。
-        if (!guidance_mode_is_track_ &&
+        // === 2026-08-27: STRIKE (skill 105) 同样绕过 ===
+        //   20260827_1719.bag:STRIKE 期间 chase yaw_rate 持续 0.27~1.08 rad/s,
+        //   YOLO 反复 skip → cluster 1.5s STALE → primary 跳 WP2 fallback →
+        //   target switched jump=8.4m,CHASE 直接退出 → pilot override。
+        //   进 strike 后 yaw_rate 旁路放行,waypoint/SEARCH 阶段保留门控。
+        if (!guidance_mode_is_track_ && !is_attack_active_ &&
             std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
             max_cluster_yaw_rate_rad_s_ + 1e-9) {
             ROS_WARN_THROTTLE(1.0,
@@ -935,6 +952,32 @@ public:
         }
     }
 
+    // === 2026-08-27: 缓存 Attack(105) skill 的 target_type (bit0=person bit1=car) ===
+    //   source: kcp_comm.cpp:729 把 GS skill_params.target_type 写进 Skill.msg,
+    //           mission_manager pushCurrentSkillToExecutor → /waypoint_executor/skill。
+    //   只在 skill_type==105 时覆盖 (SEARCH_TRACK(102) 阶段 target_type 通常是 0
+    //   "任意"),Attack 阶段切新 skill 时更新,fallback 路径按此过滤 label。
+    //   20260827_1733_person2car.bag:target_type=1 (person),但 GS fallback 路径
+    //   (closest-to-WP2 + highest-confidence) 完全不读 target_type → 选最近 cluster,
+    //   距 WP2 8.4m 的 cluster[1]=car 被当 primary → UAV 追车位置 44s。
+    void waypointSkillCallback(const multi_uav_strike::Skill::ConstPtr& msg) {
+        if (msg->skill_type != 105) {
+            // 非 Attack skill 清掉 (例如 SEARCH_TRACK→Attack 切换间隙),确保 Attack
+            // 阶段始终读到当前 skill 的 target_type,不会沿用 SEARCH 阶段的 stale 值。
+            current_skill_target_type_valid_ = false;
+            current_skill_target_type_ = 0;
+            return;
+        }
+        const uint32_t new_type = msg->target_type;
+        if (!current_skill_target_type_valid_ || new_type != current_skill_target_type_) {
+            ROS_WARN("[TargetClusterer] Attack(105) target_type cached: 0x%x "
+                     "(bit0=person bit1=car; 0=任意 label) → filter will apply on fallback paths",
+                     new_type);
+        }
+        current_skill_target_type_ = new_type;
+        current_skill_target_type_valid_ = true;
+    }
+
     // === 2026-08-24: 订阅 /guidance/mode — TRACK 模式禁用 YOLO yaw_rate 门控 ===
     //   跟踪动目标时 chase yaw_rate 持续偏高 (0.27~0.46 rad/s),超过默认
     //   max_cluster_yaw_rate_rad_s=0.2 → YOLO batch 持续被丢 → cluster stale →
@@ -1136,6 +1179,21 @@ public:
         }
         if (primary == nullptr) {
             bool used_wp2_fallback = false;
+            // === 2026-08-28: hoist WP2 GPS → NWU 坐标 + sanity 范围到外层 ===
+            //   原来 wp2_n / wp2_nwu_y / kWp2SanityRange 是 closest-to-WP2 内层的
+            //   局部变量,highest-confidence fallback 拿不到。bag
+            //   uav0_strike_2026-08-28-00-06-08_0.bag:closest-to-WP2 因 attack_point
+            //   car 没被 YOLO 检出 (label-matched 候选 <100m 全空) → fall through 到
+            //   highest-confidence,但 highest-confidence 完全不查距离 → 挑了 119m 远
+            //   的 cluster[45]=car 当 primary → chase 跟到 6m horiz 完全错目标。
+            //   修法:在 attack + wp2_gps_valid + home_locked 三条件满足下,把 WP2
+            //   坐标 + sanity 半径提到外层,让 highest-confidence fallback 也能复用
+            //   同一个距离约束(跟 closest-to-WP2 一致),保证 Attack 阶段 fallback
+            //   不会选 WP2 100m 以外的 cluster 当 primary。
+            bool wp2_coords_valid = false;
+            double wp2_n_outer = 0.0;
+            double wp2_nwu_y_outer = 0.0;
+            constexpr double kWp2SanityRange = 100.0;  // m
             if (is_attack_active_ && attack_wp2_gps_valid_ && is_home_locked_) {
                 // WP2 GPS → NWU(相对 home,与 cluster.ned_x/ned_y 同系)
                 //   c.ned_y 是 NWU y = west_m(正值=西)
@@ -1146,12 +1204,12 @@ public:
                 const double cos_lat = std::cos(home_gps_.latitude * M_PI / 180.0);
                 if (std::isfinite(cos_lat) && std::fabs(cos_lat) > 1e-9) {
                     const double deg_per_m_lon = DEG_PER_M_LAT / cos_lat;
-                    const double wp2_n = (attack_wp2_gps_.latitude - home_gps_.latitude) /
+                    wp2_n_outer = (attack_wp2_gps_.latitude - home_gps_.latitude) /
                                           DEG_PER_M_LAT;
                     const double wp2_east_m = (attack_wp2_gps_.longitude - home_gps_.longitude) /
                                               deg_per_m_lon;
-                    const double wp2_nwu_y = -wp2_east_m;  // NWU y = west_m
-                    constexpr double kWp2SanityRange = 100.0;  // m
+                    wp2_nwu_y_outer = -wp2_east_m;  // NWU y = west_m
+                    wp2_coords_valid = true;
                     const TargetCluster* closest = nullptr;
                     double closest_dist_sq = std::numeric_limits<double>::infinity();
                     for (const auto& kv : clusters_) {
@@ -1167,8 +1225,24 @@ public:
                                                     c.last_seen_us) * 1e-6;
                             if (lsu_age > cluster_stale_freeze_sec_) continue;
                         }
-                        const double dx = c.ned_x - wp2_n;
-                        const double dy = c.ned_y - wp2_nwu_y;
+                        // === 2026-08-27: closest-to-WP2 必须按 target_type 过滤 label ===
+                        //   20260827_1733_person2car.bag:GS 下发 target_type=[1]=person,
+                        //   但 cluster[1]=car 距 WP2 8.4m,cluster[2]=person 当时 stale
+                        //   (last_seen 115s 前),fallback 不读 label → 选 car 当 primary →
+                        //   UAV 追车位置 44s。这里要求:即使 cluster[2]=person stale,
+                        //   也不能把 car 拿上来当 primary;label 不匹配就直接跳过,
+                        //   没有任何 label-matched 候选时 → null → 回退到 attack_wp2
+                        //   GPS 位置本身 (publishPrimaryGps 不会被调用,后续 hit-circle
+                        //   会用 wp2 GPS 位置作为 fallback 中心)。
+                        if (!labelMatchesCachedTargetType(c.label)) {
+                            ROS_INFO_THROTTLE(2.0,
+                                "[TargetClusterer] WP2 fallback skip cluster[%lu] label=%s "
+                                "(target_type=0x%x no-match, won't promote to primary)",
+                                c.id, c.label.c_str(), current_skill_target_type_);
+                            continue;
+                        }
+                        const double dx = c.ned_x - wp2_n_outer;
+                        const double dy = c.ned_y - wp2_nwu_y_outer;
                         const double dist_sq = dx*dx + dy*dy;
                         if (dist_sq < closest_dist_sq) {
                             closest_dist_sq = dist_sq;
@@ -1181,14 +1255,15 @@ public:
                         used_wp2_fallback = true;
                         ROS_INFO_THROTTLE(2.0,
                             "[TargetClusterer] Primary fallback: closest-to-WP2 cluster_id=%lu "
-                            "(dist=%.1fm, WP2 lat=%.7f lon=%.7f)",
-                            closest->id, std::sqrt(closest_dist_sq),
+                            "label=%s (dist=%.1fm, WP2 lat=%.7f lon=%.7f)",
+                            closest->id, closest->label.c_str(), std::sqrt(closest_dist_sq),
                             attack_wp2_gps_.latitude, attack_wp2_gps_.longitude);
                     } else {
                         ROS_WARN_THROTTLE(5.0,
-                            "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS, "
+                            "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS "
+                            "(or all label-filtered out by target_type=0x%x), "
                             "falling back to highest-confidence",
-                            kWp2SanityRange);
+                            kWp2SanityRange, current_skill_target_type_);
                     }
                 }
             }
@@ -1204,9 +1279,34 @@ public:
                                                 c.last_seen_us) * 1e-6;
                         if (lsu_age > cluster_stale_freeze_sec_) continue;
                     }
+                    // === 2026-08-27: highest-confidence fallback 同样按 target_type 过滤 ===
+                    //   1733 bag:WP2 fallback 也可能因 label no-match 全部 skip,这里
+                    //   必须同样过滤,否则绕过 WP2 fallback 后还会把 car 当 primary。
+                    if (!labelMatchesCachedTargetType(c.label)) continue;
+                    // === 2026-08-28: highest-confidence fallback 也加 WP2 距离 sanity ===
+                    //   uav0_strike_2026-08-28-00-06-08_0.bag:closest-to-WP2 因 attack_point
+                    //   car 没被 YOLO 检出 (label-matched 候选 <100m 全空) → fall through,
+                    //   highest-confidence 不查距离 → 挑 119m 远的 cluster[45]=car 当 primary。
+                    //   修法:WP2 GPS + home locked 满足时,要求 cluster 也落在 kWp2SanityRange
+                    //   内才能进入 highest-confidence 候选,跟 closest-to-WP2 用同一个 sanity
+                    //   半径。Attack 阶段保证 primary 永远在 WP2 100m 范围内。
+                    if (wp2_coords_valid) {
+                        const double dx2 = c.ned_x - wp2_n_outer;
+                        const double dy2 = c.ned_y - wp2_nwu_y_outer;
+                        const double dist_sq2 = dx2*dx2 + dy2*dy2;
+                        if (dist_sq2 >= kWp2SanityRange * kWp2SanityRange) continue;
+                    }
                     if (primary == nullptr || c.best_confidence > primary->best_confidence) {
                         primary = &c;
                     }
+                }
+                if (primary == nullptr && wp2_coords_valid) {
+                    ROS_WARN_THROTTLE(5.0,
+                        "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS "
+                        "passing target_type=0x%x label filter "
+                        "(highest-confidence fallback also exhausted), "
+                        "primary=null this tick → chase will not engage",
+                        kWp2SanityRange, current_skill_target_type_);
                 }
             }
         }
@@ -1319,6 +1419,7 @@ private:
     ros::Subscriber waypoint_status_sub_;
     ros::Subscriber guidance_mode_sub_;             // /guidance/mode → TRACK 时绕过 yaw_rate 门控
     ros::Subscriber guidance_enable_sub_;            // /guidance/enable → 区分 tracked (橙) vs primary (紫)
+    ros::Subscriber waypoint_skill_sub_;             // /waypoint_executor/skill → 缓存 Attack(105) target_type
 
     ros::Publisher cluster_event_pub_;
     ros::Publisher cluster_states_pub_;
@@ -1399,6 +1500,28 @@ private:
     bool activated_skill_key_valid_ = false;
     std::string activated_skill_flow_id_;
     std::string activated_skill_id_;
+
+    // === 2026-08-27: Attack(105) skill 的 target_type 缓存 (来自 waypoint_skill_cb) ===
+    //   bit0=person, bit1=car, 0=任意 (与 mission_manager::labelMatchesTargetType 一致)。
+    //   closest-to-WP2 / highest-confidence fallback 时按此过滤候选 cluster label,
+    //   保证 GS 指定打 person 时不会去追 car 位置 (20260827_1733_person2car.bag)。
+    uint32_t current_skill_target_type_ = 0;
+    bool    current_skill_target_type_valid_ = false;
+    // 是否属于"车类" — 与 mission_manager::isVehicleLabel 保持一致 (labelToClassId 把
+    // car/truck/bus/van/vehicle 都报 class_id=2)。target_type bit1(0x02) 覆盖这些。
+    static bool isVehicleLabelForFilter(const std::string& label) {
+        return label == "car" || label == "vehicle" || label == "truck" ||
+               label == "bus" || label == "van";
+    }
+    // 与 mission_manager::labelMatchesTargetType 一致的本地版 (避免跨节点耦合)。
+    //   0/未定义 bit → 任意 label 匹配 (保持旧行为)。
+    bool labelMatchesCachedTargetType(const std::string& label) const {
+        const uint32_t known = current_skill_target_type_ & 0x03u;
+        if (!current_skill_target_type_valid_ || known == 0u) return true;
+        if ((known & 0x01u) && label == "person") return true;
+        if ((known & 0x02u) && isVehicleLabelForFilter(label)) return true;
+        return false;
+    }
 
     uint64_t primary_cluster_id_ = 0;   // 0 = mission 未指定, 回退最高置信度
 
