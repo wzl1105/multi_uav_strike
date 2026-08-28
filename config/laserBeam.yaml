@@ -1,0 +1,51 @@
+# ============================================================================
+# laserBeam_node 专属参数
+# 真机单线激光雷达 SPD1200N2 的串口参数 + 测量发布参数。
+# 仿真环境由 gimbal_simulator_node 发布 lidar/measurement,本文件参数不生效。
+#
+# 启动入口 (launch 片段):
+#   <node name="laserBeam_node" pkg="multi_uav_strike" type="laserBeam_node">
+#     <rosparam command="load" file="$(find multi_uav_strike)/config/laserBeam.yaml"/>
+#   </node>
+# ============================================================================
+
+# === 串口 ===
+# SPD1200N2 单线激光雷达通过 RS-232/RS-485 接到飞控板。
+# 不同机型/接线位置串口不同,按实际修改 port 即可,其它字段一般不动。
+port: "/dev/ttyS6"
+baudrate: 115200
+
+# === 量程 / 地面参考 ===
+# 距离小于 min_range 或 > max_range 的测量直接丢弃, 不发 LidarMeasurement。
+# max_range 300m 与 gimbal_simulator 的 lidar_max_range 一致,保证 waypoint_executor
+# 的 slowdown / climb 阈值参数两端都按相同量程设置。
+min_range: 0.2
+max_range: 300.0
+# 地面 z 平面(NWU 系)。UAV 飞行高度 = uav_pose.z, 雷达射线打到 ground_z 平面
+# 的距离 = (ground_z - uav_z) / ray_dir.z, 用来跟实测距离比较判定 HIT_GROUND。
+# 默认 0 = 海平面/起飞点 (与 gimbal_simulator 一致)。
+ground_z: 0.0
+
+# === hit_type 分类 tolerance ===
+# 实测距离 vs "打到地面应有距离" 差值,差值 ≤ max(abs_tol, rel_tol * ground_range)
+# 视为 HIT_GROUND, 否则 HIT_BUILDING (视为障碍)。
+# 默认值跟 gimbal_simulator (abs=1.0, rel=0.02) 一致,确保真机和仿真行为对齐。
+ground_range_abs_tolerance: 1.0
+ground_range_rel_tolerance: 0.02
+
+# === UAV pose 来源 ===
+# 真机: mavros/local_position/pose (ENU); laserBeam_node 直接当 NWU 处理
+#       (ENU z 向上 == NWU z 向上, 与 gimbal_simulator 真机分支一致)。
+# 仿真场景下本节点不启动, 此参数无效。
+uav_pose_topic: "mavros/local_position/pose"
+
+# === frame_id ===
+# LidarMeasurement.header.frame_id (与 gimbal_simulator 默认 "map" 一致, 多机场景
+# 由 launch override 成 "<ns>/map", 例如 "uav0/map")。
+frame_id: "map"
+
+# === 发布频率 ===
+# LidarMeasurement 按此频率拍最新一帧 SPD1200N2 距离计算并发布, 跟串口读
+# 线程解耦。SPD1200N2 串口实测 ~9Hz, 20Hz 拍最新值可保证下游 waypoint_executor
+# 拿到最新距离不会引入额外延迟。
+publish_rate: 20.0

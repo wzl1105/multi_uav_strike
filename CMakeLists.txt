@@ -190,6 +190,18 @@ target_link_libraries(yx_comm_node
 )
 add_dependencies(yx_comm_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
+# 12. 单线激光雷达驱动节点(2026-08-28 新增)
+#     - 硬件 SPD1200N2, RS-232/RS-485
+#     - 真机启动; 仿真时由 gimbal_simulator_node 发布 lidar/measurement,
+#       launch 里选择性启动 (laserBeam_node 不出现在仿真 launch)
+add_executable(laserBeam_node
+  src/laserBeam_node.cpp
+)
+target_link_libraries(laserBeam_node
+  ${catkin_LIBRARIES}
+)
+add_dependencies(laserBeam_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+
 # ========== 安装可执行文件和脚本 ==========
 install(TARGETS
   target_motion_simulator_node
@@ -203,6 +215,7 @@ install(TARGETS
   uav_avoidance_node
   power_interact_node
   yx_comm_node
+  laserBeam_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
