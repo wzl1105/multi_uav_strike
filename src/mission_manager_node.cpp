@@ -1303,7 +1303,7 @@ public:
                                            &MissionManager::launchIntentCallback, this);
         // 触发气体发生器(由 power_interact_node 暴露 /trigger_gas_generator 服务)
         trigger_gas_gen_client_ = nh_.serviceClient<std_srvs::Trigger>(
-            "/trigger_gas_generator");
+            "trigger_gas_generator");
     }
 
     void initPublishers() {
