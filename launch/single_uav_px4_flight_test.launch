@@ -132,6 +132,25 @@
   </group>
 
   <!-- ====================================================================== -->
+  <!-- 6b. 单线激光雷达驱动节点 (2026-08-28 新增)                                 -->
+  <!--   真机硬件: SPD1200N2 通过 /dev/ttyS6 上报距离                           -->
+  <!--   仿真场景: 不启动本节点, gimbal_simulator_node 已发布 lidar/measurement   -->
+  <!--   真机场景: 本节点发布 lidar/measurement, waypoint_executor 直接消费       -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="laserBeam_node"
+          pkg="multi_uav_strike"
+          type="laserBeam_node"
+          output="screen"
+          respawn="true">
+      <param name="uav_pose_topic" value="$(arg uav_name)/mavros/local_position/pose" />
+      <param name="frame_id" value="$(arg uav_name)/map" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/laserBeam.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
   <!-- 7. 通信节点                                                              -->
   <!-- ====================================================================== -->
   <!-- <group ns="$(arg uav_name)">
