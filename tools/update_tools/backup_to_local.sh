@@ -154,9 +154,9 @@ for pkg in "${PKGS[@]}"; do
                 --exclude='.catkin_tools/' \
                 --exclude='.git/' \
                 --exclude='.vscode/' \
-                "${DOCS_EXCLUDE[@]}" \                              # +++
+                "${DOCS_EXCLUDE[@]}" \
                 -e "$RSYNC_SSH" \
-                "$SRC_PKG" "$DST_PKG/"
+                "$SRC_PKG" "$DST_PKG/"                              # +++
             echo "[OK]  src/$pkg/  (含 launch / config)"
         else
             echo "[!!]  WITH_SRC=1 但板子上没找到 src/$pkg/"
