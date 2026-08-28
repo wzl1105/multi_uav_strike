@@ -142,6 +142,8 @@ for pkg in "${PKGS[@]}"; do
                 --exclude='__pycache__/' \
                 --exclude='build/' \
                 --exclude='.catkin_tools/' \
+                --exclude='.git/' \
+                --exclude='.vscode/' \
                 -e "$RSYNC_SSH" \
                 "$SRC_PKG" "$DST_PKG/"
             echo "[OK]  src/$pkg/  (含 launch / config)"
