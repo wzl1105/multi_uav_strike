@@ -78,6 +78,9 @@ public:
                                        "mavros/local_position/pose");
         double publish_rate = 20.0;
         nh_private_.param<double>("publish_rate", publish_rate, 20.0);
+        // 看门狗超时:超过此时间未收到任何有效距离帧 → 重发 0x89 触发指令
+        // 解决"启动时设备未接 / 中途拔掉再接上"后从机不会自动开始发的恢复问题
+        nh_private_.param<double>("trigger_resend_interval", trigger_resend_interval_, 2.0);
 
         // === 订阅 uav pose (用于算 ray_dir + hit_point) ===
         uav_pose_sub_ = nh_.subscribe(uav_pose_topic, 10,
@@ -123,6 +126,13 @@ public:
         // === 启动发布定时器 (publish_rate Hz) ===
         publish_timer_ = nh_.createTimer(ros::Duration(1.0 / publish_rate),
             &LaserBeamNode::publishTimerCallback, this);
+
+        // === 启动触发指令看门狗 (1Hz 检查,超时重发 0x89) ===
+        //   协议是"请求触发型":主机发 0x89 后从机才连续回,设备中途接入
+        //   必须再发一次 0x89 从机才会开始。连接正常时 timer 立即 return,
+        //   不会冗余触发。
+        trigger_watchdog_timer_ = nh_.createTimer(ros::Duration(1.0),
+            &LaserBeamNode::triggerWatchdogCallback, this);
     }
 
     ~LaserBeamNode() {
@@ -142,6 +152,7 @@ private:
     ros::Subscriber uav_pose_sub_;
     ros::Publisher  measurement_pub_;
     ros::Timer      publish_timer_;
+    ros::Timer      trigger_watchdog_timer_;   // 触发指令看门狗
     serial::Serial  serial_;
     boost::thread   read_thread_;
 
@@ -150,6 +161,7 @@ private:
     double ground_range_abs_tol_, ground_range_rel_tol_;
     double ground_z_;
     std::string frame_id_;
+    double trigger_resend_interval_;           // 看门狗超时阈值 (s)
 
     // 状态
     geometry_msgs::PoseStamped current_uav_pose_;
@@ -160,6 +172,7 @@ private:
     double  latest_distance_m_ = std::numeric_limits<double>::quiet_NaN();
     bool    have_distance_     = false;
     ros::Time latest_distance_time_;
+    ros::Time last_data_time_;                 // 最近一次有效距离帧 wall clock (看门狗用)
 
     // 异常计数 (throttle warn 用)
     int checksum_fail_count_ = 0;
@@ -218,6 +231,7 @@ private:
                             latest_distance_m_    = distance_m;
                             latest_distance_time_ = ros::Time::now();
                             have_distance_        = true;
+                            last_data_time_       = ros::Time::now();  // 看门狗:连接正常
                         } else {
                             sta_fail_count_++;
                             ROS_WARN_THROTTLE(5.0,
@@ -298,6 +312,47 @@ private:
         detailed.hit_point.z     = p.z + ray_dir.z() * range;
 
         measurement_pub_.publish(detailed);
+    }
+
+    // === 触发指令看门狗 (1Hz) ===
+    //   协议是请求触发式:0x89 触发后从机才连续回。
+    //   场景:
+    //     (1) 启动时设备未接 → 构造时的 0x89 写入空 → 永远没数据
+    //     (2) 设备中途拔掉再接上 → 从机默认等待指令,不会自动开始发
+    //   解决: 1Hz 检查 last_data_time_, 超过 trigger_resend_interval_ 重发 0x89。
+    //   连接正常时 since_data < threshold → 立即 return, 不冗余触发。
+    void triggerWatchdogCallback(const ros::TimerEvent&) {
+        if (!serial_.isOpen()) return;
+
+        ros::Time data_time;
+        {
+            boost::lock_guard<boost::mutex> lock(latest_mutex_);
+            data_time = last_data_time_;
+        }
+
+        const ros::Time now = ros::Time::now();
+        // last_data_time_ 仍为 ros::Time(0) 表示从未收到过 → 强制首次重发
+        // (构造时已发过一次 0x89,启动 1s 后仍无数据 = 第一次触发丢失,重发)
+        const double since_data = data_time.isZero()
+            ? trigger_resend_interval_ + 1.0
+            : (now - data_time).toSec();
+
+        if (since_data < trigger_resend_interval_) {
+            return;  // 连接正常,不重发
+        }
+
+        // 超时 → 重发 0x89 触发指令
+        uint8_t cmd[] = {0x55, 0xAA, 0x89, 0xFF, 0xFF, 0xFF, 0xFF, 0x85};
+        serial_.write(cmd, sizeof(cmd));
+
+        if (data_time.isZero()) {
+            ROS_WARN_THROTTLE(2.0,
+                "[LaserBeam] SPD1200N2 no data yet, re-triggering 0x89");
+        } else {
+            ROS_WARN_THROTTLE(2.0,
+                "[LaserBeam] SPD1200N2 no data for %.1fs, re-triggering 0x89",
+                (now - data_time).toSec());
+        }
     }
 };
 
