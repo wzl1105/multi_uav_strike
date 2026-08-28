@@ -673,6 +673,14 @@ private:
     ros::Subscriber launch_intent_sub_;         // 订阅 /tzs/state/launch_intent(UInt8, 仅日志)
     ros::Time catapult_launch_done_wait_time_;  // 触发气体发生器后开始等 vtol_state==4 的时刻(用于 60s 超时)
     double catapult_wait_state4_timeout_sec_ = 60.0;  // 弹射完成超时,yaml 可覆盖
+    // ===== 弹射起飞 OFFBOARD 接管兜底重试 =====
+    // 弹射场景下 PX4 已在 POSCTL + armed,主矛盾是切 OFFBOARD。PX4 commander 偶尔
+    // 会拒绝 SET_MODE (mode_sent=false),或 mavros 1Hz tick 滞后导致验证看到老 mode。
+    // 外层 1Hz 重试 triggerOffboardAndArm 直到 mode==OFFBOARD && armed,5min 兜底。
+    // **只对 skill_type=100 生效**: 106 地面起飞走原 if (triggerOffboardAndArm()) 路径,
+    // 加这层反而拖累正常起飞时机。is_catapult_takeoff_ 在 SETTING_OFFBOARD 期间稳定。
+    ros::Time settings_offboard_start_time_;  // 进 SETTING_OFFBOARD 的时刻(弹射场景用,用于 5min 兜底)
+    ros::Time last_offboard_attempt_time_;    // 上次重试 triggerOffboardAndArm 的时刻(用于 1Hz 节流)
     // LOCAL_POSITION_NED 发送频率（Hz）。某些板子 PX4 重启后默认频率太低，
     // 必须上电后用 MAV_CMD_SET_MESSAGE_INTERVAL (511) 设置一次，否则位置数据延迟大、
     // OFFBOARD 控制发散。FCU 断连后 flag 会清掉，PX4 重启重连时自动重发。
@@ -4907,6 +4915,9 @@ public:
                     ROS_WARN("[MissionManager] >>>> CATAPULT: vtol_state==4 (launch complete), "
                              "handing off to OFFBOARD takeover");
                     // 复用 TAKEOFF_SETTING_OFFBOARD 的 ARM + setpoint 预发 + OFFBOARD 切换
+                    // 清零弹射场景 OFFBOARD 兜底的时间戳(每次进 SETTING_OFFBOARD 重新计时)
+                    settings_offboard_start_time_ = ros::Time();
+                    last_offboard_attempt_time_   = ros::Time();
                     takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
                     break;
                 }
@@ -4932,6 +4943,9 @@ public:
                 // 触发条件:有遗留状态(老版本启动后停在 POSCTL),首 tick 立刻进 SETTING_OFFBOARD。
                 ROS_ERROR("[MissionManager] CATAPULT_POSCTL state entered unexpectedly (should be "
                           "merged into CATAPULT_TRIGGERED). Forcing OFFBOARD takeover.");
+                // 清零弹射场景 OFFBOARD 兜底的时间戳
+                settings_offboard_start_time_ = ros::Time();
+                last_offboard_attempt_time_   = ros::Time();
                 takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
                 break;
 
@@ -5020,16 +5034,82 @@ public:
                 // 一次性快速序列: SET_MODE → COMMAND_LONG → ARM，不等 mode 确认。
                 // 模仿 pymavlink 的 50ms 内连发 SET_MODE+ARM 的行为 — 这是它在同一架
                 // FCU 上能跑通的关键时机 (PX4 commander 100~500ms 内会 revert OFFBOARD)。
-                if (triggerOffboardAndArm()) {
+                // === 2026-08-28: 按 is_catapult_takeoff_ 分支 ===
+                //   - 106 地面起飞:走原逻辑,triggerOffboardAndArm 成功立即 TAKEOFF_EXEC,
+                //     失败下一 tick 重试整组动作(已有 ARM 内部 3 次重试兜底)。
+                //   - 100 弹射起飞:外层 1Hz 重试 + 5min 超时,显式验证 mode==OFFBOARD。
+                //     弹射路径 PX4 已 POSCTL+armed,主要矛盾是切 OFFBOARD 模式;
+                //     ARM 段被前面 !armed 守卫跳过,所以 triggerOffboardAndArm 内
+                //     need_arm=false 自动跳过 ARM 部分,只发 SET_MODE+DO_SET_MODE。
+                if (!is_catapult_takeoff_) {
+                    // ===== 106 地面起飞:原行为,完全不变 =====
+                    if (triggerOffboardAndArm()) {
+                        takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
+                        takeoff_start_time_ = ros::Time::now();
+
+                        // ===== 决定本次起飞爬升速率 =====
+                        // 优先取当前 takeoff skill 的 Skill.takeoff_speed(GS 在 task_flow
+                        // 里下发),对 skill_type=100(弹射)/106(地面)均生效。夹到 [1, 5] m/s:
+                        //   - 下限 1:避免风大/弹射后初始姿态不稳时爬升过慢、过渡时间过长
+                        //   - 上限 5:PX4 MPC_VEL_UP_MAX(~5 m/s)安全区,避免速度饱和+overshoot
+                        // skill 字段 <= 0 或当前 skill 非起飞 → 退化为私有 param ~takeoff_climb_rate_
+                        constexpr double MIN_CLIMB = 1.0;
+                        constexpr double MAX_CLIMB = 5.0;
+                        double effective_climb = takeoff_climb_rate_;  // 默认兜底
+                        if (current_skill_index_ < skill_queue_.size()) {
+                            const auto& tk = skill_queue_[current_skill_index_].msg;
+                            if (tk.skill_type == 100 || tk.skill_type == 106) {
+                                if (tk.takeoff_speed > 0.0f) {
+                                    double s = static_cast<double>(tk.takeoff_speed);
+                                    if (s < MIN_CLIMB) s = MIN_CLIMB;
+                                    if (s > MAX_CLIMB) s = MAX_CLIMB;
+                                    effective_climb = s;
+                                    ROS_INFO("[MissionManager] Takeoff climb rate from skill.takeoff_speed=%.2f "
+                                             "(clamped to [%.1f, %.1f] → %.2f m/s)",
+                                             tk.takeoff_speed, MIN_CLIMB, MAX_CLIMB, effective_climb);
+                                }
+                            }
+                        }
+                        takeoff_climb_rate_ = effective_climb;  // 后续 TAKEOFF_TAKEOFF_EXEC 每 tick 用此值斜坡推
+
+                        // ===== 不再阶跃跳到目标高度 =====
+                        // 原因: 0.5m → 30m 的阶跃会让 PX4 速度饱和(MPC_VEL_UP_MAX),真机上引起
+                        //       40m 级别 overshoot,然后快速下落,衔接 waypoint 时有明显下沉。
+                        // 改为: 记录当前实际高度作为斜坡起点,每个 tick 按 takeoff_climb_rate_
+                        //       线性推高,直到达到 takeoff_altitude_。PX4 在斜坡模式下稳态跟踪,
+                        //       几乎不超调。
+                        takeoff_start_alt_ = -current_pose_.pose.position.z;
+                        takeoff_setpoint_.pose.position.z = takeoff_start_alt_;
+                        ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS (106), takeoff climb started "
+                                 "(sp=%.0fms, target alt=%.1f m, climb_rate=%.1f m/s, start_alt=%.2f m)",
+                                 sp_elapsed * 1000.0, takeoff_altitude_,
+                                 takeoff_climb_rate_, takeoff_start_alt_);
+                    } else {
+                        // 不进 FAILED 状态，下一 tick 会再走一遍 SETTING_OFFBOARD 重试整组动作
+                        ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM sequence FAILED (PX4 mode=%s armed=%d), "
+                                 "will retry next cycle",
+                                 current_mavros_state_.mode.c_str(),
+                                 current_mavros_state_.armed ? 1 : 0);
+                    }
+                    //=========setpoint====//
+                    break;
+                }
+
+                // ===== 100 弹射起飞:外层 1Hz 重试 + 5min 超时兜底 =====
+                // 入口时间戳防御性初始化(catapult 路径已清零,但万一进入时已是非零值
+                //   说明上次没成功推进/清掉,这里保险覆盖一次)
+                if (settings_offboard_start_time_.isZero()) {
+                    settings_offboard_start_time_ = ros::Time::now();
+                }
+                // 验证:已 OFFBOARD + armed → 接管成功,推进
+                //   注意:mavros state 是 1Hz tick,SET_MODE 发出后最多滞后 1s 才反映
+                //   PX4 真实 mode。triggerOffboardAndArm 完成后本 tick mavros state
+                //   可能还是老 mode,所以这里必须用外层重试而不是"调一次看一次"。
+                if (current_mavros_state_.mode == "OFFBOARD" && current_mavros_state_.armed) {
                     takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
                     takeoff_start_time_ = ros::Time::now();
 
-                    // ===== 决定本次起飞爬升速率 =====
-                    // 优先取当前 takeoff skill 的 Skill.takeoff_speed(GS 在 task_flow
-                    // 里下发),对 skill_type=100(弹射)/106(地面)均生效。夹到 [1, 5] m/s:
-                    //   - 下限 1:避免风大/弹射后初始姿态不稳时爬升过慢、过渡时间过长
-                    //   - 上限 5:PX4 MPC_VEL_UP_MAX(~5 m/s)安全区,避免速度饱和+overshoot
-                    // skill 字段 <= 0 或当前 skill 非起飞 → 退化为私有 param ~takeoff_climb_rate_
+                    // ===== 决定本次起飞爬升速率(同 106) =====
                     constexpr double MIN_CLIMB = 1.0;
                     constexpr double MAX_CLIMB = 5.0;
                     double effective_climb = takeoff_climb_rate_;  // 默认兜底
@@ -5047,26 +5127,62 @@ public:
                             }
                         }
                     }
-                    takeoff_climb_rate_ = effective_climb;  // 后续 TAKEOFF_TAKEOFF_EXEC 每 tick 用此值斜坡推
+                    takeoff_climb_rate_ = effective_climb;
 
-                    // ===== 不再阶跃跳到目标高度 =====
-                    // 原因: 0.5m → 30m 的阶跃会让 PX4 速度饱和(MPC_VEL_UP_MAX),真机上引起
-                    //       40m 级别 overshoot,然后快速下落,衔接 waypoint 时有明显下沉。
-                    // 改为: 记录当前实际高度作为斜坡起点,每个 tick 按 takeoff_climb_rate_
-                    //       线性推高,直到达到 takeoff_altitude_。PX4 在斜坡模式下稳态跟踪,
-                    //       几乎不超调。
                     takeoff_start_alt_ = -current_pose_.pose.position.z;
                     takeoff_setpoint_.pose.position.z = takeoff_start_alt_;
-                    ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS, takeoff climb started "
-                             "(sp=%.0fms, target alt=%.1f m, climb_rate=%.1f m/s, start_alt=%.2f m)",
+                    ROS_WARN("[MissionManager] >>>> OFFBOARD takeover SUCCESS (100 catapult, %.1fs into SETTING_OFFBOARD), "
+                             "takeoff climb started (sp=%.0fms, target alt=%.1f m, climb_rate=%.1f m/s, start_alt=%.2f m)",
+                             (ros::Time::now() - settings_offboard_start_time_).toSec(),
                              sp_elapsed * 1000.0, takeoff_altitude_,
                              takeoff_climb_rate_, takeoff_start_alt_);
-                } else {
-                    // 不进 FAILED 状态，下一 tick 会再走一遍 SETTING_OFFBOARD 重试整组动作
-                    ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM sequence FAILED (PX4 mode=%s armed=%d), "
-                             "will retry next cycle",
+                    // 清零兜底时间戳以便下次 task_flow reuse
+                    settings_offboard_start_time_ = ros::Time();
+                    last_offboard_attempt_time_   = ros::Time();
+                    //=========setpoint====//
+                    break;
+                }
+
+                // 还没 OFFBOARD → 1Hz 节流重试 triggerOffboardAndArm
+                // 节流原因:1) 给 mavros 1Hz tick 留时间反映真实 PX4 mode
+                //          2) 避免短时间内多次 SET_MODE 被 PX4 commander 报 TEMP_REJ
+                // 日志策略:每次重试都打 (无 throttle),rosout 完整看到时间线
+                //   正常 1~2s 成功 → 只有 1~2 条 WARN,异常 5min 上限 300 条,日志量可控
+                double since_offboard_start =
+                    (ros::Time::now() - settings_offboard_start_time_).toSec();
+                if ((ros::Time::now() - last_offboard_attempt_time_).toSec() > 1.0) {
+                    ROS_WARN("[MissionManager] SETTING_OFFBOARD (100 catapult): not yet OFFBOARD "
+                             "(mode=%s armed=%d, %.1fs/300s into SETTING_OFFBOARD), "
+                             "retry triggerOffboardAndArm",
                              current_mavros_state_.mode.c_str(),
-                             current_mavros_state_.armed ? 1 : 0);
+                             current_mavros_state_.armed ? 1 : 0,
+                             since_offboard_start);
+                    triggerOffboardAndArm();   // 不接返回值,等下一 tick mavros state 反映
+                    last_offboard_attempt_time_ = ros::Time::now();
+                }
+
+                // 5min 兜底前 30s 倒计时:升级到 ERROR,throttle 5s,提示"快超时了,再不进就 FAILED"
+                if (since_offboard_start > 270.0 && since_offboard_start <= 300.0) {
+                    ROS_ERROR_THROTTLE(5.0,
+                        "[MissionManager] SETTING_OFFBOARD (100 catapult): approaching 300s timeout "
+                        "(%.1fs/300s, mode=%s armed=%d), will FAILED soon if OFFBOARD not entered",
+                        since_offboard_start,
+                        current_mavros_state_.mode.c_str(),
+                        current_mavros_state_.armed ? 1 : 0);
+                }
+
+                // 5min 兜底超时 — 正常应该秒级成功,这里只防 PX4 preflight 检查
+                //   没过(GPS 失锁 / mag 未校准 / 安全开关未上等 mission 端兜不住的场景)
+                if (since_offboard_start > 300.0) {
+                    ROS_ERROR("[MissionManager] SETTING_OFFBOARD (100 catapult): failed to enter OFFBOARD within 300s "
+                              "(PX4 mode=%s armed=%d), FAILED",
+                              current_mavros_state_.mode.c_str(),
+                              current_mavros_state_.armed ? 1 : 0);
+                    takeoff_state_ = TakeoffState::TAKEOFF_FAILED;
+                    current_phase_ = MissionPhase::PHASE_FAILED;
+                    // 清零兜底时间戳以便下次 task_flow reuse
+                    settings_offboard_start_time_ = ros::Time();
+                    last_offboard_attempt_time_   = ros::Time();
                 }
                 //=========setpoint====//
                 break;
