@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # backup_to_local.sh — 在开发者笔记本上跑，把指定包的编译产物从板子取到本地并打包
+# +++ 默认排除 docs/ 目录（避免 Windows tar 解析 bundle 里的中文文件名炸掉）
+# +++ 需临时保留 docs/ 时: EXCLUDE_DOCS=0 ./backup_to_local.sh <ip>
 #
 # 用法:
 #   ./backup_to_local.sh <source_ip>                       # 备份三个常用包(默认不带 start_gimbal.sh)
@@ -15,14 +17,7 @@
 #   SSH_USER=rpdzkj               SSH 用户名（默认 rpdzkj）
 #   SRC_BASE=/home/rpdzkj/tzs_ws  板子上 workspace 根（默认）
 #   WITH_SRC=0                    设为 1 同时打包 src/<pkg>/（含 launch / config 更新）
-#
-# 输出:
-#   ./tzs_ws_bundle_<ip>_<YYYYMMDD_HHMMSS>.tar.gz   ← 发给调试员的文件
-#   ./tzs_ws_bundle_<ip>_<YYYYMMDD_HHMMSS>/         ← 解压目录，可检查内容后删除
-#
-# 前置:
-#   - 笔记本能 SSH 到板子（建议 ssh-copy-id 配置好密钥）
-#   - 板子上的服务是 rpdzkj 用户跑的，目录属主是 rpdzkj
+#   EXCLUDE_DOCS=1                默认 1，排除 docs/；设为 0 保留 docs/
 
 set -euo pipefail
 
@@ -33,6 +28,7 @@ Usage: $0 <source_ip> [pkg1 pkg2 ...]
 Default behavior:
   - 不传包名 → 备份 multi_uav_strike starling_bridge starling_gimbal
   - 默认不带 start_gimbal.sh （需要时 WITH_TOP=1）
+  - 默认排除 docs/ （EXCLUDE_DOCS=0 保留）
 
 Env vars (optional):
   SSH_USER=root                 SSH user (default root)
@@ -41,6 +37,7 @@ Env vars (optional):
   WITH_TOP=0                    Set to 1 to also include start_gimbal.sh
   TOP_SCRIPTS="start_gimbal.sh foo.sh"  Custom list of top-level scripts
   TOP_ONLY=0                    Set to 1 to skip packages, only backup top-level scripts
+  EXCLUDE_DOCS=1                Set to 0 to include docs/ (may contain CN filenames)
 
 Example:
   $0 192.168.1.151
@@ -48,6 +45,7 @@ Example:
   WITH_TOP=1 $0 192.168.1.151 multi_uav_strike starling_bridge
   TOP_ONLY=1 $0 192.168.1.151
   WITH_SRC=1 $0 192.168.1.151 multi_uav_strike starling_bridge
+  EXCLUDE_DOCS=0 $0 192.168.1.151       # 保留 docs/（含中文文档）
 EOF
     exit 1
 fi
@@ -75,6 +73,15 @@ fi
 SSH_USER="${SSH_USER:-root}"
 SRC_BASE="${SRC_BASE:-/home/rpdzkj/tzs_ws}"
 WITH_SRC="${WITH_SRC:-0}"
+EXCLUDE_DOCS="${EXCLUDE_DOCS:-1}"           # +++
+
+# +++ docs/ 排除项（默认启用，避免 bundle 里有中文文件名）
+DOCS_EXCLUDE=()
+if [ "$EXCLUDE_DOCS" = "1" ]; then
+    DOCS_EXCLUDE=(--exclude='docs/')
+    echo "[info] EXCLUDE_DOCS=1: 排除 docs/（避免 Windows tar 解析中文文件名炸）"
+    echo
+fi
 
 # SSH ControlMaster: 第一次 ssh 输密码,后续 ssh/rsync 都复用这个连接,不再问密码
 SSH_MASTER_PATH="/tmp/ssh-master-backup-$$-${SRC_IP//./_}"
@@ -99,6 +106,7 @@ echo "src  : $SSH_USER@$SRC_IP:$SRC_BASE"
 echo "pkgs : ${PKGS[*]}"
 echo "out  : ./$WORK/"
 echo "WITH_SRC=$WITH_SRC  (set WITH_SRC=1 to include launch/config)"
+echo "EXCLUDE_DOCS=$EXCLUDE_DOCS"
 echo
 
 # 探活 (用已建好的 ControlMaster)
@@ -115,7 +123,8 @@ for pkg in "${PKGS[@]}"; do
     DST="$WORK/devel/lib/${pkg}"
     if ssh -o ControlPath="$SSH_MASTER_PATH" "$SSH_USER@$SRC_IP" "test -d ${SRC_BASE}/devel/lib/${pkg}" 2>/dev/null; then
         mkdir -p "$DST"
-        rsync -av --delete --exclude='__pycache__/' -e "$RSYNC_SSH" "$SRC" "$DST/"
+        rsync -av --delete --exclude='__pycache__/' "${DOCS_EXCLUDE[@]}" \
+            -e "$RSYNC_SSH" "$SRC" "$DST/"                        # +++
         echo "[OK]  devel/lib/$pkg/  (C++ wrapper + .so)"
     else
         echo "[--]  无 devel/lib/$pkg/  (纯 Python 包?跳过)"
@@ -126,7 +135,8 @@ for pkg in "${PKGS[@]}"; do
     PY_DST="$WORK/devel/lib/python3/dist-packages/${pkg}"
     if ssh -o ControlPath="$SSH_MASTER_PATH" "$SSH_USER@$SRC_IP" "test -d ${SRC_BASE}/devel/lib/python3/dist-packages/${pkg}" 2>/dev/null; then
         mkdir -p "$PY_DST"
-        rsync -av --delete --exclude='__pycache__/' -e "$RSYNC_SSH" "$PY_SRC" "$PY_DST/"
+        rsync -av --delete --exclude='__pycache__/' "${DOCS_EXCLUDE[@]}" \
+            -e "$RSYNC_SSH" "$PY_SRC" "$PY_DST/"                   # +++
         echo "[OK]  devel/lib/python3/dist-packages/$pkg/  (Python)"
     else
         echo "[--]  无 Python 节点目录"
@@ -144,6 +154,7 @@ for pkg in "${PKGS[@]}"; do
                 --exclude='.catkin_tools/' \
                 --exclude='.git/' \
                 --exclude='.vscode/' \
+                "${DOCS_EXCLUDE[@]}" \                              # +++
                 -e "$RSYNC_SSH" \
                 "$SRC_PKG" "$DST_PKG/"
             echo "[OK]  src/$pkg/  (含 launch / config)"
