@@ -143,6 +143,13 @@ if [ -d "$BUNDLE_ROOT/src" ]; then
     done
 fi
 
+# 修目录权限：rsync/scp 用 root 走完后，新建的目录常被保留为 drwx------，
+# systemd 以 User=rpdzkj 跑时会进不去，roslaunch 找不到 launch/ 和 config/。
+# 解法：把 src/ 和 devel/lib/ 下所有目录强制设成 755（rpdzkj 可进入）。
+echo "[deploy] fix perms: chmod 755 dirs under src/ and devel/lib/"
+ssh -o ControlPath="$SSH_MASTER_PATH" "$SSH_USER@$TGT_IP" \
+    "find $TGT_BASE/src $TGT_BASE/devel/lib -type d -exec chmod 755 {} \;"
+
 # 顶层启动脚本（systemd 启动用的，必须 +x）
 for ts in start_gimbal.sh; do
     if [ -f "$BUNDLE_ROOT/$ts" ]; then

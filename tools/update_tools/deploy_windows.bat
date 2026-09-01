@@ -53,6 +53,10 @@ if exist "!BUNDLE_ROOT!\src" (
     for /d %%S in ("!BUNDLE_ROOT!\src\*") do scp %SSH_OPTS% -r "%%S\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/src/%%~nxS/
 )
 
+REM Fix permissions: scp as root leaves dirs as drwx------, blocks rpdzkj
+REM (systemd User) from entering. Force all dirs under src/ and devel/lib/ to 755.
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "find %TGT_BASE%/src %TGT_BASE%/devel/lib -type d -exec chmod 755 {} \;"
+
 if exist "!BUNDLE_ROOT!\start_gimbal.sh" (
     scp %SSH_OPTS% "!BUNDLE_ROOT!\start_gimbal.sh" %SSH_USER%@%TGT_IP%:%TGT_BASE%/start_gimbal.sh
     ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "chmod +x %TGT_BASE%/start_gimbal.sh"
