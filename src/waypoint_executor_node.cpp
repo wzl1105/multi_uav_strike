@@ -184,6 +184,27 @@ private:
     double yaw_speed_gate_;     // 水平速度门控:m/s,低于此值时冻结 yaw 角速度输出
                                 // (避免 CRITICAL stop+reverse 时 UAV 几乎不动但 yaw 仍追 bearing → 原地打转)
 
+    // === 2026-09-01: 102 SKILL_AREA 段切换 yaw 等待 ===
+    //   背景:用户口径 "102 搜索技能里 skill area 执行的时候等航向",
+    //   skill 102 (SEARCH_TRACK) 的 SKILL_AREA 段 L1 在 idx 跳变时 desired_yaw
+    //   直接跳到新段方向 → UAV 沿旧方向漂同时 yaw 慢慢转,视觉上"切点过冲 + yaw 滞后"。
+    //   修法:仅 skill 102 + SKILL_AREA 段 idx++ 触发时,如果
+    //   |new_seg_yaw - current_yaw| > 阈值,hold 水平速度 = 0,让 yaw 先转完再放行。
+    //   闸范围严格收敛:
+    //     - 其它 skill (101/103/105) 一律不动 (攻击 105 已有 pre_align_radius +
+    //       attack_wp1_arc_radius 双重 smoothstep blend,不重复 hold)
+    //     - 102 的 ARRIVE 段也不动 (用户没要求)
+    //   闸内的 yaw 输出由 yaw_align_hold_active_ 标记 bypass yaw_speed_gate_,
+    //   否则 v_horiz=0 < 0.5 m/s 会冻结 yaw → 等于不转。
+    bool   yaw_align_wait_enabled_   = true;   // 总开关 (yaml 可关)
+    double yaw_align_threshold_rad_ = 0.26;   // rad ≈ 15°:超过此差值就 hold
+    double yaw_align_vz_            = 0.0;    // hold 时垂直速度 (默认 0 = 不爬不降)
+    // 状态(本节点内,跨 tick 保留)
+    bool   yaw_align_hold_active_    = false;  // true 时 publish 0 vel + target yaw
+    double yaw_align_target_yaw_ned_ = 0.0;    // latched 的目标 yaw
+    bool   yaw_align_pending_        = false;  // 本 tick idx++ 过了,等待评估
+    size_t yaw_align_pending_idx_    = 0;      // 本 tick idx++ 后的新 idx
+
     // ============== 参数 ==============
     double executor_rate_;
     int flight_mode_velocity_;
@@ -455,6 +476,14 @@ public:
         //   - COLLISION: scale=0.2 → v≈1 m/s > 0.5 → 仍跟踪
         //   - CRITICAL: scale=0.0 → v≈0 < 0.5 → **冻结 yaw**
         nh_private_.param<double>("yaw_speed_gate", yaw_speed_gate_, 0.5);
+        // === 2026-09-01: ARRIVE 段切换 yaw 等待 (yaml) ===
+        //   关闭后行为退回到"切点 yaw 不等,沿旧方向漂着转",跟老代码一致。
+        //   阈值越小越敏感 (1° 也会等);阈值越大越宽松 (45° 才开始等)。
+        //   15° / 0.26 rad 是个折中:小幅偏航(<15°)直接走 (沿旧方向漂一点点),
+        //   大幅偏航(>15°)停下来等转完。
+        nh_private_.param<bool>("yaw_align_wait_enabled", yaw_align_wait_enabled_, true);
+        nh_private_.param<double>("yaw_align_threshold_rad", yaw_align_threshold_rad_, 0.26);
+        nh_private_.param<double>("yaw_align_vz", yaw_align_vz_, 0.0);
         // Latch 保留时间(s):climb 结束后 latch 仍保留的时长,缓冲 vbias 抖动。
         //   超过此时间(典型:对方已离开较远但 scale 还在边缘)→ 释放,允许开始下降。
         //   - 0 → 等价于"完全不 latch"(快速下降,但 oscillation 风险最大)
@@ -1004,6 +1033,48 @@ public:
             return;
         }
 
+        // === 2026-09-01: 切换 yaw 等待 — 闸内检测 ===
+        //   上一次 tick 触发了 hold,本 tick 继续 publish 0 vel + target yaw,
+        //   让 yaw 控制器有 P 输入,不靠 bearing (避免 yaw_speed_gate 冻结)。
+        //   对齐到阈值以内才放行,放行后 filt_vx_/vy_/vz_ ramp 自然爬升。
+        //   闸仅对 skill 102 (SEARCH_TRACK) 的 SKILL_AREA 段保持:
+        //     - skill/phase 切换 (102 SKILL_AREA → 其它) 时强制清 hold,
+        //       防止闸在错相位死锁 (新阶段已不需要等 yaw,但旧 hold 还在 publish 0 vel)。
+        //     - 例如 SKILL_AREA 完成切到 COMPLETE / IDLE、新 skill 接管等场景。
+        if (yaw_align_wait_enabled_ && yaw_align_hold_active_) {
+            const bool still_in_scope = (active_skill_type_ == 102 &&
+                                         segment_phase_ == SegmentPhase::SKILL_AREA);
+            if (!still_in_scope) {
+                ROS_WARN_THROTTLE(1.0,
+                    "[WaypointExecutor] Yaw-wait cleared: skill=%u phase=%d "
+                    "out of scope (102 SKILL_AREA only); release hold immediately",
+                    static_cast<unsigned>(active_skill_type_),
+                    static_cast<int>(segment_phase_));
+                yaw_align_hold_active_ = false;
+                // 不 return,继续走下方新阶段逻辑
+            } else {
+                double yaw_err = yaw_align_target_yaw_ned_ - current_yaw_ned_;
+                // 角度环绕到 [-π, π]
+                while (yaw_err >  M_PI) yaw_err -= 2.0 * M_PI;
+                while (yaw_err < -M_PI) yaw_err += 2.0 * M_PI;
+                if (std::fabs(yaw_err) <= yaw_align_threshold_rad_) {
+                    // 对齐了 → 清 hold,本 tick 走下方 L1,ramp 自然从 0 爬到 cur_speed
+                    ROS_INFO_THROTTLE(2.0,
+                        "[WaypointExecutor] Yaw-wait aligned: target=%.1fdeg, "
+                        "current=%.1fdeg, err=%.2fdeg (idx=%lu); release hold",
+                        yaw_align_target_yaw_ned_ * 180.0 / M_PI,
+                        current_yaw_ned_ * 180.0 / M_PI,
+                        yaw_err * 180.0 / M_PI, *cur_idx);
+                    yaw_align_hold_active_ = false;
+                } else {
+                    // 还在转 → hold 水平,水平完全停让 yaw 转完
+                    publishVelocityCommandWithYaw(0.0, 0.0, yaw_align_vz_,
+                                                  yaw_align_target_yaw_ned_);
+                    return;
+                }
+            }
+        }
+
         // ===== Fall-through:消除 publishZeroVelocity() 20ms 缺口 =====
         // 旧逻辑:idx 越界就 advanceSegmentPhase() + publishZeroVelocity() + return;
         //   下一 tick(20ms)才发新段速度指令,期间 PX4 看到 0,产出极大 yaw-rate 尖峰
@@ -1072,7 +1143,71 @@ public:
             // 已到达,标记后 idx++ 继续找下一个
             (*cur_queue)[*cur_idx].reached = true;
             (*cur_idx)++;
+            // === 2026-09-01: 切换 yaw 等待 — 标记本 tick 有 idx++ ===
+            //   仅 search skill (102) 的 SKILL_AREA 段标记 (用户口径:
+            //   "102 搜索技能里 skill area 执行的时候等航向")。
+            //   - ARRIVE 段不进 SKILL_AREA 段就单独 hold (搜索航线条进入
+            //     skill_area 后由本规则管,ARRIVE 段本身的过冲由用户后续
+            //     观察后再决定是否加)
+            //   - 其它 skill (101/103/105/...) 的 SKILL_AREA/A 段一律不动
+            //   - 攻击 105 已有 pre_align_radius (30m / 50m) +
+            //     attack_wp1_arc_radius (5m) 双重 smoothstep blend,
+            //     不需要再叠 yaw-wait hold。
+            if (active_skill_type_ == 102 &&
+                segment_phase_ == SegmentPhase::SKILL_AREA) {
+                yaw_align_pending_     = true;
+                yaw_align_pending_idx_ = *cur_idx;
+            }
             // 注意:此处不 publishZeroVelocity(),直接下一轮循环
+        }
+
+        // === 2026-09-01: 切换 yaw 等待 — 评估 hold ===
+        //   loop 内可能 idx++ 多次 (连续多 WP 都到达),但只有"切到新方向"的
+        //   那一刻需要 hold。这里只对最后那个 pending_idx_ (本次 idx++ 后的
+        //   终点 idx) 评估一次,跟 L1 的 seg_x0/seg_y0 选取保持一致。
+        //   仅 search skill (102) 的 SKILL_AREA 段评估,其它 (101/103/105) 一律不 hold。
+        if (yaw_align_pending_) {
+            // 一次性消费,无论是否符合条件都清,避免 carry-over。
+            yaw_align_pending_ = false;
+            if (yaw_align_wait_enabled_ &&
+                active_skill_type_ == 102 &&
+                segment_phase_ == SegmentPhase::SKILL_AREA) {
+                // 进入评估:有 prev WP (新 idx > 0),且不是最后一个 WP
+                if (yaw_align_pending_idx_ > 0 &&
+                    yaw_align_pending_idx_ < cur_queue->size()) {
+                    const auto& prev = (*cur_queue)[yaw_align_pending_idx_ - 1];
+                    const auto& next = (*cur_queue)[yaw_align_pending_idx_];
+                    const double ndx = next.ned_x - prev.ned_x;
+                    const double ndy = next.ned_y - prev.ned_y;
+                    if (std::hypot(ndx, ndy) > 0.5) {
+                        const double new_seg_yaw_ned = std::atan2(ndy, ndx);
+                        double yaw_err = new_seg_yaw_ned - current_yaw_ned_;
+                        while (yaw_err >  M_PI) yaw_err -= 2.0 * M_PI;
+                        while (yaw_err < -M_PI) yaw_err += 2.0 * M_PI;
+                        if (std::fabs(yaw_err) > yaw_align_threshold_rad_) {
+                            // 偏差大 → 闸内 hold,先让 yaw 转完
+                            yaw_align_hold_active_     = true;
+                            yaw_align_target_yaw_ned_  = new_seg_yaw_ned;
+                            ROS_INFO_THROTTLE(2.0,
+                                "[WaypointExecutor] Yaw-wait enter (skill 102): "
+                                "WP transition idx=%lu, new_seg_yaw=%.1fdeg, "
+                                "current=%.1fdeg, err=%.1fdeg (>=%.1fdeg threshold); "
+                                "hold horiz, rotate yaw first",
+                                yaw_align_pending_idx_,
+                                new_seg_yaw_ned * 180.0 / M_PI,
+                                current_yaw_ned_ * 180.0 / M_PI,
+                                yaw_err * 180.0 / M_PI,
+                                yaw_align_threshold_rad_ * 180.0 / M_PI);
+                            publishVelocityCommandWithYaw(0.0, 0.0, yaw_align_vz_,
+                                                          new_seg_yaw_ned);
+                            return;
+                        }
+                        // 偏差小 (≤阈值) → 不 hold,继续走下方 L1 (yaw 自然跟踪)
+                    }
+                    // 段退化 (< 0.5 m) → 没法算方向,不 hold,继续 L1
+                }
+                // 首个 WP (idx==0) 或最后一个 WP → 不 hold
+            }
         }
 
         // === 段方向(压航线:用前一个点(或锁存的段起点)→ 当前点)===
@@ -1757,8 +1892,12 @@ public:
         double yaw_rate_ned = 0.0;
         // 水平速度门控:水平速度过低(典型场景:CRITICAL 避让中 vx≈vy≈0)时冻结 yaw,
         //   否则身体几乎不动但 yaw 仍死追 L1 bearing → 看起来"原地自由旋转"。
+        //   例外:yaw_align_hold_active_ (ARRIVE 段切换 yaw 等待) 时闸内的 yaw 必须
+        //         旋转,否则永远转不到 target yaw,闸外逻辑被设计成 v=0 + target_yaw
+        //         publish,期望 P-controller 在 v=0 期间把 yaw 转过去。
         const double v_horiz = sqrt(vx*vx + vy*vy);
-        if (v_horiz > yaw_speed_gate_ && fabs(yaw_error_ned) > yaw_deadband) {
+        const bool yaw_gate_open = (v_horiz > yaw_speed_gate_) || yaw_align_hold_active_;
+        if (yaw_gate_open && fabs(yaw_error_ned) > yaw_deadband) {
             yaw_rate_ned = yaw_kp * yaw_error_ned;
             if (yaw_rate_ned >  yaw_max_rate_) yaw_rate_ned =  yaw_max_rate_;
             if (yaw_rate_ned < -yaw_max_rate_) yaw_rate_ned = -yaw_max_rate_;

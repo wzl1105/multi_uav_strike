@@ -112,6 +112,28 @@ attack_wp1_arc_radius: 5.0         # m,Attack WP1 小圆弧进入触发半径
 
 # 楼体越障默认关闭，由 UAV0 专用演示 launch 开启。
 lidar_building_avoidance_enabled: false
+
+# === 2026-09-01: 102 SKILL_AREA 段切换 yaw 等待 ===
+#   用户口径"102 搜索技能里 skill area 执行的时候等航向"。
+#   老行为:L1 在 idx++ 那一 tick desired_yaw 直接跳到新段方向,UAV 沿旧方向
+#     漂着同时 yaw 慢慢转 (yaw_max_rate=1 rad/s, 90° 要 1.5s),视觉上
+#     "切点过冲 + yaw 滞后",典型 15 m/s 段间 30° 转弯能漂 25m+ 才转完。
+#   新行为:仅 skill 102 (SEARCH_TRACK) + SKILL_AREA 段 idx++ 后,
+#     |new_seg_yaw - current_yaw| > 阈值 时,hold 水平速度=0,
+#     让 yaw 先转完再放行 (P-controller 走闸内闸外 bypass yaw_speed_gate)。
+#   其它 skill (101 SEARCH_ONLY / 103 SEARCH_STRIKE / 105 ATTACK 等) 一律不动:
+#     - 攻击 105 已有 pre_align_radius (30m / 50m) + attack_wp1_arc_radius (5m)
+#       双重 smoothstep blend,不需要再叠 yaw-wait hold。
+#   闸外 publish 0 vel + target_yaw,期望 PX4 OFFBOARD 在闸内收到
+#     持续 yaw_rate 输出,ramp filter 把 v 从 cur_speed 平滑到 0 再爬回。
+#   阈值参考:
+#     - 15° (0.26 rad) 默认:小幅偏航(<15°)直接走,大幅(>15°)停下来等
+#     - 30° (0.52) 激进:只有大角度才停 (节省切换时间,但小角度仍漂)
+#     -  5° (0.09) 保守:任何可视偏航都等 (切换平滑,但频繁停)
+#   关掉 (yaw_align_wait_enabled: false) 后回到老行为。
+yaw_align_wait_enabled: true
+yaw_align_threshold_rad: 0.26    # rad ≈ 15°:超过此差值就 hold 等 yaw
+yaw_align_vz: 0.0                # m/s, hold 时垂直速度 (默认 0 = 不爬不降)
 lidar_climb_rate: 1.0
 lidar_clear_confirm_time: 3.0
 lidar_timeout: 0.5
