@@ -56,15 +56,19 @@ strike_terminal_image_chase_center_band: 0.4
 
 # //=============打击保护bbox=========//
 # 测试模式：使用归一化 bbox 等效边长 sqrt(width * height)，不依赖图像分辨率。
-# 从 slow_threshold 到 hover_threshold 线性减速；连续达到 hover 阈值后锁存悬停。
+# bbox 连续达到 hover 阈值，或本地高度低于安全阈值时，直接锁存悬停。
+# 未达到悬停条件时不再进行渐进减速。
 # 真实打击前必须将 strike_test_guard_enabled 改为 false。
 strike_test_guard_enabled: true
 # 只有水平距离进入该范围后才锁存开启 bbox 判断，远距离大框不会触发停车。
 strike_test_guard_arm_distance_m: 15.0
-# 依据 2026-09-08 仿真 bag 调整：近区有效框峰值约 0.25，0.20/0.30 无法触发悬停。
-# 0.10 开始减速，0.15 连续确认后悬停；先用于仿真和低速实机测试。
-strike_test_bbox_slow_threshold: 0.10
+# 依据 2026-09-08 仿真 bag 调整：近区有效框峰值约 0.25。
+# 0.15 连续确认后直接切换 Position Hold。
 strike_test_bbox_hover_threshold: 0.15
+# 高度硬保护使用 MAVROS local_position 转换后的 NWU 本地高度，
+# 不依赖 bbox、目标距离或近区布防；低于或等于 4m 立即锁存悬停。
+strike_test_altitude_guard_enabled: true
+strike_test_min_altitude_m: 4.0
 # 0.50 覆盖整个归一化画面，避免近距离目标偏到画面边缘时保护失效；
 # primary_image_target、visible 和 confidence 仍负责筛除非主目标及低置信度检测。
 strike_test_bbox_center_band: 0.50
@@ -72,8 +76,17 @@ strike_test_bbox_min_confidence: 0.70
 strike_test_bbox_confirm_frames: 5
 strike_test_bbox_timeout_sec: 0.4
 strike_test_bbox_filter_alpha: 0.4
-# 已经进入减速区后若 bbox 丢失，按最保守策略直接锁存悬停。
-strike_test_hover_on_bbox_loss: true
+
+# 拉烟请求只能在打击保护 Position Hold 已锁存且飞机连续稳定后触发一次。
+# 默认关闭，避免仿真、回放或普通启动时向真实 YX 载荷发送 0x4E。
+strike_test_smoke_enabled: false
+# yx_comm.launch 默认在根命名空启动，因此使用绝对 Service 名。
+strike_test_smoke_service: "/trigger_smoke"
+strike_test_smoke_min_hold_sec: 1.0
+strike_test_smoke_max_xy_speed_mps: 0.5
+strike_test_smoke_max_z_speed_mps: 0.3
+strike_test_smoke_max_position_error_m: 0.8
+strike_test_smoke_stable_confirm_sec: 1.0
 # //=============打击保护bbox=========//
 
 # === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===

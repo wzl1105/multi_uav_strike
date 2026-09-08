@@ -12,6 +12,7 @@
     - /yx/status (multi_uav_strike/YxStatus)
     - /yx/raw_frame (std_msgs/UInt8MultiArray,16 字节)
     - /yx/cmd (std_msgs/UInt8,0..5)
+    - /trigger_smoke (std_srvs/Trigger,0x4E 连续 10 帧，暂无完成反馈)
 
   可调参数(launch arg):
     serial_port          默认 /dev/ttyS3

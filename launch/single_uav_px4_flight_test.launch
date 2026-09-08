@@ -34,6 +34,9 @@
   -->
   <arg name="uav_name" default="uav0" />
   <arg name="flow" default="" />
+  <!-- YX 会占用实机 /dev/ttyS3 并周期发自检，默认关闭；全流程实测时显式开启。 -->
+  <arg name="enable_yx_comm" default="true" />
+  <arg name="enable_strike_test_smoke" default="true" />
 
   <!-- Set GeographicLib data path -->
   <!-- <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" /> -->
@@ -112,6 +115,7 @@
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/guidance_control.yaml" />
+      <param name="strike_test_smoke_enabled" value="$(arg enable_strike_test_smoke)" />
     </node>
   </group>
 
@@ -237,6 +241,10 @@
     <node pkg="multi_uav_strike" type="power_interact_node" name="power_interact_node" respawn="true" output="screen">
     </node>
   </group>
+
+  <!-- YX RS-485 拉烟载荷：在根命名空提供 /trigger_smoke。 -->
+  <include if="$(arg enable_yx_comm)"
+           file="$(find multi_uav_strike)/launch/yx_comm.launch" />
 
 
   <!-- ====================================================================== -->

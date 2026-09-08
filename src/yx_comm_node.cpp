@@ -22,6 +22,7 @@
 #include <ros/ros.h>
 #include <std_msgs/UInt8.h>
 #include <std_msgs/UInt8MultiArray.h>
+#include <std_srvs/Trigger.h>
 #include <multi_uav_strike/YxStatus.h>
 #include <serial/serial.h>
 #include <chrono>
@@ -54,7 +55,7 @@ static const std::map<uint8_t, CmdEntry> YX_CMD_TABLE = {
     {1, {0x69, 10, "stage2_release"}},
     {2, {0x87, 10, "qb_charge"}},
     {3, {0x1B, 3,  "qb_discharge"}},
-    {4, {0x4E, 10, "qb_fire"}},
+    {4, {0x4E, 10, "smoke_trigger"}},
     {5, {0xD2, 10, "self_destruct"}},
 };
 
@@ -290,6 +291,11 @@ public:
         // ---- 指令订阅 ----
         sub_cmd_ = nh_.subscribe("yx/cmd", 10, &YxCommNode::cmdCallback, this);
 
+        // 拉烟与弹射气体发生器一样使用 Trigger Service 作为上层入口，
+        // 底层仍走 YX RS-485 的 0x4E 连续 10 帧序列，不经过 power_interact_node。
+        srv_trigger_smoke_ = nh_.advertiseService(
+            "trigger_smoke", &YxCommNode::triggerSmokeCallback, this);
+
         // ---- GPIO 初始化 ----
         GpioPin::Config gpio_cfg;
         gpio_cfg.gpio_chip   = gpio_chip_;
@@ -333,6 +339,55 @@ public:
 
 private:
     // ---- ROS 回调 ----
+    bool startCommandSequence(uint8_t cmd_id, const char* source, bool allow_interrupt,
+                              std::string* error = nullptr) {
+        auto it = YX_CMD_TABLE.find(cmd_id);
+        if (it == YX_CMD_TABLE.end() || cmd_id == 0) {
+            if (error) *error = "invalid burst command";
+            return false;
+        }
+        if (!ser_.isOpen()) {
+            if (error) *error = "YX serial is not open";
+            return false;
+        }
+        if (sending_active_) {
+            if (!allow_interrupt) {
+                if (error) {
+                    *error = "another YX command sequence is already active: " +
+                             current_cmd_name_;
+                }
+                return false;
+            }
+            ROS_WARN("[yx_comm] %s interrupting in-flight sequence %s (%d/%d sent)",
+                     source, current_cmd_name_.c_str(), sent_count_, total_count_);
+        }
+
+        current_cmd_code_ = it->second.code;
+        current_cmd_name_ = it->second.name;
+        total_count_ = it->second.repeat_count;
+        sent_count_ = 0;
+        last_send_time_ = ros::Time(0);
+        sending_active_ = true;
+        ROS_WARN("[yx_comm] %s -> %s (0x%02X), starting burst %d frames @ %.0fms",
+                 source, current_cmd_name_.c_str(), current_cmd_code_, total_count_,
+                 send_interval_sec_ * 1000.0);
+        return true;
+    }
+
+    bool triggerSmokeCallback(std_srvs::Trigger::Request&,
+                              std_srvs::Trigger::Response& res) {
+        std::string error;
+        res.success = startCommandSequence(4, "/trigger_smoke", false, &error);
+        if (res.success) {
+            res.message = "Smoke trigger accepted: sending 0x4E burst (10 frames); "
+                          "no completion feedback is required";
+        } else {
+            res.message = "Smoke trigger rejected: " + error;
+            ROS_ERROR("[yx_comm] /trigger_smoke rejected: %s", error.c_str());
+        }
+        return true;
+    }
+
     void cmdCallback(const std_msgs::UInt8::ConstPtr& msg) {
         const uint8_t cmd_id = msg->data;
         auto it = YX_CMD_TABLE.find(cmd_id);
@@ -346,23 +401,10 @@ private:
             ROS_INFO("[yx_comm] /yx/cmd -> %s (single, periodic path)", it->second.name);
             return;
         }
-        // 关键/起爆类指令:启动"连续 N 次"序列
-        // 若已有序列在跑,取消旧的(语义:任何新指令重置当前计数,与协议"同指令连续 N 次"对齐)
-        if (sending_active_) {
-            ROS_WARN("[yx_comm] /yx/cmd interrupting in-flight sequence %s (%d/%d sent) "
-                     "with new cmd=%s",
-                     current_cmd_name_.c_str(), sent_count_, total_count_,
-                     it->second.name);
+        std::string error;
+        if (!startCommandSequence(cmd_id, "/yx/cmd", true, &error)) {
+            ROS_WARN("[yx_comm] /yx/cmd id=%u rejected: %s", cmd_id, error.c_str());
         }
-        current_cmd_code_   = it->second.code;
-        current_cmd_name_   = it->second.name;
-        total_count_        = it->second.repeat_count;
-        sent_count_         = 0;
-        last_send_time_     = ros::Time(0);  // 立刻发第一帧
-        sending_active_     = true;
-        ROS_INFO("[yx_comm] /yx/cmd -> %s (0x%02X) starting burst %d frames @ %.0fms interval",
-                 current_cmd_name_.c_str(), current_cmd_code_,
-                 total_count_, send_interval_sec_ * 1000.0);
     }
 
     void selfTestTimerCb(const ros::TimerEvent&) {
@@ -427,8 +469,12 @@ private:
         frame[3] = cmd;                 // CMD
         frame[4] = 0x00; frame[5] = 0x00;   // D 预留
         frame[6] = 0x00; frame[7] = 0x00;   // E 预留
-        // CRC16/MODBUS over bytes[2..7] = 6 bytes
-        uint16_t crc = crc16Modbus(frame + 2, 6);
+        // 已确认的拉烟完整帧为 EB 90 01 4E 00 00 00 00 F6 26，
+        // 其 CRC 计算范围包含同步头 bytes[0..7]。其他旧指令暂保持原有
+        // bytes[2..7] 范围，避免在未获得其它指令的确认报文前改变旧链路。
+        uint16_t crc = (cmd == 0x4E)
+            ? crc16Modbus(frame, 8)
+            : crc16Modbus(frame + 2, 6);
         frame[8] = (crc     ) & 0xFF;   // 低字节在前 (MODBUS 标准序,与 YX 端对齐)
         frame[9] = (crc >> 8) & 0xFF;
 
@@ -523,6 +569,7 @@ private:
     ros::NodeHandle nh_, pnh_;
     ros::Publisher  pub_payload_type_, pub_status_, pub_raw_frame_;
     ros::Subscriber sub_cmd_;
+    ros::ServiceServer srv_trigger_smoke_;
     ros::Timer      self_test_timer_, run_timer_;
 
     serial::Serial  ser_;
