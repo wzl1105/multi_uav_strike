@@ -54,6 +54,9 @@ private:
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
+    //=============打击保护bbox=========//
+    ros::Publisher strike_test_position_hold_pub_;  // bbox 保护锁存后的位置设定点
+    //=============打击保护bbox=========//
     ros::Publisher attitude_cmd_pub_;     // setpoint_attitude/attitude
     ros::Publisher attitude_rates_pub_;   // setpoint_attitude/cmd_vel (角速率)
     ros::Publisher thrust_cmd_pub_;       // thrust
@@ -110,11 +113,17 @@ private:
     // Control mode
     int flight_mode_velocity_;
     int flight_mode_attitude_;
+    //=============打击保护bbox=========//
+    int flight_mode_position_ = 2;
+    //=============打击保护bbox=========//
 
     // 仿真/真机切换
     bool use_sim_;
     std::string pose_topic_;
     std::string vel_cmd_topic_;
+    //=============打击保护bbox=========//
+    std::string strike_test_position_hold_topic_;
+    //=============打击保护bbox=========//
     std::string attitude_cmd_topic_;
     std::string attitude_rates_topic_;
     std::string thrust_cmd_topic_;
@@ -374,7 +383,7 @@ private:
 
     //=============打击保护bbox=========//
     // 测试保护使用归一化 bbox 等效边长 sqrt(width * height)，与图像分辨率无关。
-    // 达到 slow 阈值后连续减速；达到 hover 阈值并连续确认后锁存零速度悬停。
+    // 达到 slow 阈值后连续减速；达到 hover 阈值并连续确认后锁存位置悬停。
     bool strike_test_guard_enabled_ = false;
     double strike_test_guard_arm_distance_m_ = 15.0;
     double strike_test_bbox_slow_threshold_ = 0.20;
@@ -392,6 +401,8 @@ private:
     bool strike_test_bbox_guard_armed_ = false;
     bool strike_test_bbox_hover_latched_ = false;
     ros::Time strike_test_bbox_last_update_time_;
+    geometry_msgs::PoseStamped strike_test_position_hold_pose_;
+    bool strike_test_position_hold_latched_ = false;
     //=============打击保护bbox=========//
 
 public:
@@ -442,12 +453,18 @@ public:
         if (use_sim_) {
             pose_topic_ = "quad/pose";
             vel_cmd_topic_ = "quad/setpoint_velocity/cmd_vel_unstamped";
+            //=============打击保护bbox=========//
+            strike_test_position_hold_topic_ = "quad/setpoint_position/local";
+            //=============打击保护bbox=========//
             attitude_cmd_topic_ = "quad/setpoint_attitude/attitude";
             attitude_rates_topic_ = "quad/setpoint_attitude/cmd_vel";
             thrust_cmd_topic_ = "quad/thrust";
         } else {
             pose_topic_ = "mavros/local_position/pose";
             vel_cmd_topic_ = "mavros/setpoint_velocity/cmd_vel_unstamped";
+            //=============打击保护bbox=========//
+            strike_test_position_hold_topic_ = "mavros/setpoint_position/local";
+            //=============打击保护bbox=========//
             attitude_cmd_topic_ = "mavros/setpoint_attitude/attitude";
             attitude_rates_topic_ = "mavros/setpoint_attitude/cmd_vel";
             thrust_cmd_topic_ = "mavros/setpoint_attitude/thrust";
@@ -474,6 +491,12 @@ public:
 
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_attitude", flight_mode_attitude_, 1);
+        //=============打击保护bbox=========//
+        nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
+        nh_private_.param<std::string>("strike_test_position_hold_topic",
+                                      strike_test_position_hold_topic_,
+                                      strike_test_position_hold_topic_);
+        //=============打击保护bbox=========//
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);
         nh_private_.param<bool>("enable_strike_evaluation",  enable_strike_evaluation_,  false);  // strike_eval 总开关(默认关闭,见字段注释)
 
@@ -859,6 +882,10 @@ public:
 
         vel_cmd_pub_ = nh_.advertise<geometry_msgs::Twist>(
             vel_cmd_topic_, 10);
+        //=============打击保护bbox=========//
+        strike_test_position_hold_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
+            strike_test_position_hold_topic_, 10);
+        //=============打击保护bbox=========//
         velocity_active_pub_ = nh_.advertise<std_msgs::Bool>(
             "guidance/velocity_active", 10);
 
@@ -1229,6 +1256,8 @@ public:
             strike_test_bbox_guard_armed_ = false;
             strike_test_bbox_hover_latched_ = false;
             strike_test_bbox_last_update_time_ = ros::Time();
+            strike_test_position_hold_latched_ = false;
+            strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
             //=============打击保护bbox=========//
             const double target_age = last_target_pose_receive_time_.isZero()
                 ? std::numeric_limits<double>::infinity()
@@ -1336,6 +1365,8 @@ public:
             strike_test_bbox_guard_armed_ = false;
             strike_test_bbox_hover_latched_ = false;
             strike_test_bbox_last_update_time_ = ros::Time();
+            strike_test_position_hold_latched_ = false;
+            strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
             //=============打击保护bbox=========//
             //===================制导修改====================
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
@@ -1365,6 +1396,8 @@ public:
             strike_test_bbox_guard_armed_ = false;
             strike_test_bbox_hover_latched_ = false;
             strike_test_bbox_last_update_time_ = ros::Time();
+            strike_test_position_hold_latched_ = false;
+            strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
             //=============打击保护bbox=========//
             // === 2026-08-19: 进入 strike 重置闭环下降跟踪器 ===
             //   否则上一个 strike 的实际下降率 EMA 会污染新一次 strike 的闭环水平计算。
@@ -1469,6 +1502,75 @@ public:
     //=============打击保护bbox=========//
     // 必须在 NED 指令的所有制导、terminal chase 和滤波之后调用。
     // 返回 true 表示指令已被测试保护修改；开关关闭时立即返回，不影响原路径。
+    void latchStrikeTestPositionHold() {
+        if (strike_test_position_hold_latched_ || !is_uav_pose_received_) {
+            return;
+        }
+
+        const auto& q = current_uav_pose_.pose.orientation;
+        const double yaw_nwu = std::atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+
+        strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
+        strike_test_position_hold_pose_.header.frame_id = "map";
+        double output_yaw = 0.0;
+        if (use_sim_) {
+            // 内部 NWU 恢复为纯仿真 quad 接口使用的 NED。
+            strike_test_position_hold_pose_.pose.position.x =
+                current_uav_pose_.pose.position.x;
+            strike_test_position_hold_pose_.pose.position.y =
+                -current_uav_pose_.pose.position.y;
+            strike_test_position_hold_pose_.pose.position.z =
+                -current_uav_pose_.pose.position.z;
+            output_yaw = -yaw_nwu;
+        } else {
+            // 内部 NWU 转 MAVROS setpoint_position/local 使用的 ENU。
+            strike_test_position_hold_pose_.pose.position.x =
+                -current_uav_pose_.pose.position.y;
+            strike_test_position_hold_pose_.pose.position.y =
+                current_uav_pose_.pose.position.x;
+            strike_test_position_hold_pose_.pose.position.z =
+                current_uav_pose_.pose.position.z;
+            output_yaw = M_PI_2 + yaw_nwu;
+        }
+        output_yaw = std::atan2(std::sin(output_yaw), std::cos(output_yaw));
+        strike_test_position_hold_pose_.pose.orientation.z =
+            std::sin(0.5 * output_yaw);
+        strike_test_position_hold_pose_.pose.orientation.w =
+            std::cos(0.5 * output_yaw);
+        strike_test_position_hold_latched_ = true;
+        ROS_ERROR("[STRIKE TEST GUARD] POSITION HOLD LATCHED: "
+                  "topic=%s position=(%.2f,%.2f,%.2f) yaw=%.1fdeg",
+                  strike_test_position_hold_topic_.c_str(),
+                  strike_test_position_hold_pose_.pose.position.x,
+                  strike_test_position_hold_pose_.pose.position.y,
+                  strike_test_position_hold_pose_.pose.position.z,
+                  output_yaw * 180.0 / M_PI);
+    }
+
+    void publishStrikeTestPositionHold() {
+        if (!strike_test_position_hold_latched_) {
+            return;
+        }
+        strike_test_position_hold_pose_.header.stamp = ros::Time::now();
+        strike_test_position_hold_pub_.publish(strike_test_position_hold_pose_);
+        if (use_sim_) {
+            std_msgs::Int16 mode_msg;
+            mode_msg.data = flight_mode_position_;
+            flight_mode_pub_.publish(mode_msg);
+        }
+        // 沿用现有接管确认，确保 waypoint/mission position 源继续静默。
+        std_msgs::Bool active;
+        active.data = true;
+        velocity_active_pub_.publish(active);
+        ROS_WARN_THROTTLE(1.0,
+            "[STRIKE TEST GUARD] publishing latched position hold (%.2f,%.2f,%.2f)",
+            strike_test_position_hold_pose_.pose.position.x,
+            strike_test_position_hold_pose_.pose.position.y,
+            strike_test_position_hold_pose_.pose.position.z);
+    }
+
     bool applyStrikeTestBboxGuard(geometry_msgs::Twist& cmd_ned,
                                   double horizontal_distance_m) {
         if (!strike_test_guard_enabled_ || current_mode_ != "strike") {
@@ -1517,11 +1619,12 @@ public:
         }
 
         if (strike_test_bbox_hover_latched_) {
+            latchStrikeTestPositionHold();
             cmd_ned = geometry_msgs::Twist();
             last_strike_cmd_ned_ = cmd_ned;
             last_strike_cmd_valid_ = true;
             ROS_WARN_THROTTLE(1.0,
-                "[STRIKE TEST GUARD] holding zero velocity; bbox metric=%.3f fresh=%d",
+                "[STRIKE TEST GUARD] position hold active; bbox metric=%.3f fresh=%d",
                 strike_test_bbox_metric_, static_cast<int>(bbox_fresh));
             return true;
         }
@@ -2284,6 +2387,16 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
             return;
         }
 
+        //=============打击保护bbox=========//
+        // 一旦位置保持锁存，目标后续丢失或跳变都不能重新进入速度制导。
+        // 这里只发布位置 setpoint，避免与 velocity setpoint 混流。
+        if (strike_test_guard_enabled_ && strike_test_position_hold_latched_ &&
+            current_mode_ == "strike") {
+            publishStrikeTestPositionHold();
+            return;
+        }
+        //=============打击保护bbox=========//
+
         // === 2026-08-24: TRACK 诊断日志 (1Hz) ===
         //   用户报告: 跟踪上目标后突然停滞,实际 chase 输出 vel_raw 衰减到 ~0。
         //   一次性打印关键路径状态 + 控制量,确认到底是哪个分支 / 哪个限幅把速度扣光。
@@ -2333,7 +2446,10 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                 // Set flight mode to velocity (仅仿真模式发布；PX4 SITL 由 mission_manager 通过 mavros/set_mode 切换)
                 if (use_sim_) {
                     std_msgs::Int16 mode_msg;
-                    mode_msg.data = flight_mode_velocity_;
+                    //=============打击保护bbox=========//
+                    mode_msg.data = strike_test_position_hold_latched_
+                        ? flight_mode_position_ : flight_mode_velocity_;
+                    //=============打击保护bbox=========//
                     flight_mode_pub_.publish(mode_msg);
                 }
 
@@ -2362,11 +2478,15 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                         const double guard_dy = current_target_pose_.pose.position.y -
                                                 current_uav_pose_.pose.position.y;
                         applyStrikeTestBboxGuard(vel_cmd, std::hypot(guard_dx, guard_dy));
-                        //=============打击保护bbox=========//
-                        if (!use_sim_) {
-                            convertVelNedToEnu(vel_cmd);
+                        if (strike_test_position_hold_latched_) {
+                            publishStrikeTestPositionHold();
+                        } else {
+                            if (!use_sim_) {
+                                convertVelNedToEnu(vel_cmd);
+                            }
+                            publishGuidanceVelocity(vel_cmd);
                         }
-                        publishGuidanceVelocity(vel_cmd);
+                        //=============打击保护bbox=========//
                     } else if (strike_guidance_logic_ == "pn") {
                     // 原 PN STRIKE 分支完整保留，并融合main的目标LPF、stale软降速和handover。
                     //===================制导修改====================
@@ -2555,10 +2675,16 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                     pn_dbg.pitch_gate_weight = 1.0;
                     //===================制导修改====================
 
-                    if (!use_sim_) {
-                        convertVelNedToEnu(vel_cmd);
+                    //=============打击保护bbox=========//
+                    if (strike_test_position_hold_latched_) {
+                        publishStrikeTestPositionHold();
+                    } else {
+                        if (!use_sim_) {
+                            convertVelNedToEnu(vel_cmd);
+                        }
+                        publishGuidanceVelocity(vel_cmd);
                     }
-                    publishGuidanceVelocity(vel_cmd);
+                    //=============打击保护bbox=========//
                     pn_debug_pub_.publish(pn_dbg);
                     publishInterceptPointMarker(cmd.intercept_point_nwu);
                     //===================制导修改====================

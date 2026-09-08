@@ -61,10 +61,13 @@ strike_terminal_image_chase_center_band: 0.4
 strike_test_guard_enabled: true
 # 只有水平距离进入该范围后才锁存开启 bbox 判断，远距离大框不会触发停车。
 strike_test_guard_arm_distance_m: 15.0
-strike_test_bbox_slow_threshold: 0.20
-strike_test_bbox_hover_threshold: 0.30
-# bbox 必须位于画面中心区域且置信度合格，才作为保护判断依据。
-strike_test_bbox_center_band: 0.25
+# 依据 2026-09-08 仿真 bag 调整：近区有效框峰值约 0.25，0.20/0.30 无法触发悬停。
+# 0.10 开始减速，0.15 连续确认后悬停；先用于仿真和低速实机测试。
+strike_test_bbox_slow_threshold: 0.10
+strike_test_bbox_hover_threshold: 0.15
+# 0.50 覆盖整个归一化画面，避免近距离目标偏到画面边缘时保护失效；
+# primary_image_target、visible 和 confidence 仍负责筛除非主目标及低置信度检测。
+strike_test_bbox_center_band: 0.50
 strike_test_bbox_min_confidence: 0.70
 strike_test_bbox_confirm_frames: 5
 strike_test_bbox_timeout_sec: 0.4
