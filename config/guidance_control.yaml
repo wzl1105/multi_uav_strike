@@ -54,6 +54,25 @@ strike_terminal_image_chase_latch_sec: 0.5
 # 能覆盖到命中圈边缘。ray 在 ~1m 内仍可信任,过宽反而引入错误方向。
 strike_terminal_image_chase_center_band: 0.4
 
+# //=============打击保护bbox=========//
+# 测试模式：使用归一化 bbox 等效边长 sqrt(width * height)，不依赖图像分辨率。
+# 从 slow_threshold 到 hover_threshold 线性减速；连续达到 hover 阈值后锁存悬停。
+# 真实打击前必须将 strike_test_guard_enabled 改为 false。
+strike_test_guard_enabled: true
+# 只有水平距离进入该范围后才锁存开启 bbox 判断，远距离大框不会触发停车。
+strike_test_guard_arm_distance_m: 15.0
+strike_test_bbox_slow_threshold: 0.20
+strike_test_bbox_hover_threshold: 0.30
+# bbox 必须位于画面中心区域且置信度合格，才作为保护判断依据。
+strike_test_bbox_center_band: 0.25
+strike_test_bbox_min_confidence: 0.70
+strike_test_bbox_confirm_frames: 5
+strike_test_bbox_timeout_sec: 0.4
+strike_test_bbox_filter_alpha: 0.4
+# 已经进入减速区后若 bbox 丢失，按最保守策略直接锁存悬停。
+strike_test_hover_on_bbox_loss: true
+# //=============打击保护bbox=========//
+
 # === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===
 #   2026-08-25 引入的 4 个 track_* 独立参数已删除。TRACK 阶段 GS 未发
 #   attack_cmd action=0 时不下沉 (helper 顶部 attack_cmd gate 只挡 TRACK);

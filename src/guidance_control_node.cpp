@@ -372,6 +372,28 @@ private:
     bool last_strike_cmd_valid_ = false;
     //===================制导修改====================
 
+    //=============打击保护bbox=========//
+    // 测试保护使用归一化 bbox 等效边长 sqrt(width * height)，与图像分辨率无关。
+    // 达到 slow 阈值后连续减速；达到 hover 阈值并连续确认后锁存零速度悬停。
+    bool strike_test_guard_enabled_ = false;
+    double strike_test_guard_arm_distance_m_ = 15.0;
+    double strike_test_bbox_slow_threshold_ = 0.20;
+    double strike_test_bbox_hover_threshold_ = 0.30;
+    double strike_test_bbox_center_band_ = 0.25;
+    double strike_test_bbox_min_confidence_ = 0.70;
+    int strike_test_bbox_confirm_frames_ = 5;
+    double strike_test_bbox_timeout_sec_ = 0.4;
+    double strike_test_bbox_filter_alpha_ = 0.4;
+    bool strike_test_hover_on_bbox_loss_ = true;
+    double strike_test_bbox_metric_ = 0.0;
+    bool strike_test_bbox_metric_valid_ = false;
+    int strike_test_bbox_hover_confirm_count_ = 0;
+    bool strike_test_bbox_slow_zone_seen_ = false;
+    bool strike_test_bbox_guard_armed_ = false;
+    bool strike_test_bbox_hover_latched_ = false;
+    ros::Time strike_test_bbox_last_update_time_;
+    //=============打击保护bbox=========//
+
 public:
     GuidanceControlNode() : nh_private_("~"),
         first_strike_evaluated_(false),
@@ -670,6 +692,58 @@ public:
         strike_terminal_image_chase_center_band_ =
             std::max(strike_terminal_image_chase_center_band_, image_center_deadband_);
 
+        //=============打击保护bbox=========//
+        nh_private_.param<bool>("strike_test_guard_enabled",
+                                strike_test_guard_enabled_, false);
+        nh_private_.param<double>("strike_test_guard_arm_distance_m",
+                                  strike_test_guard_arm_distance_m_, 15.0);
+        nh_private_.param<double>("strike_test_bbox_slow_threshold",
+                                  strike_test_bbox_slow_threshold_, 0.20);
+        nh_private_.param<double>("strike_test_bbox_hover_threshold",
+                                  strike_test_bbox_hover_threshold_, 0.30);
+        nh_private_.param<double>("strike_test_bbox_center_band",
+                                  strike_test_bbox_center_band_, 0.25);
+        nh_private_.param<double>("strike_test_bbox_min_confidence",
+                                  strike_test_bbox_min_confidence_, 0.70);
+        nh_private_.param<int>("strike_test_bbox_confirm_frames",
+                               strike_test_bbox_confirm_frames_, 5);
+        nh_private_.param<double>("strike_test_bbox_timeout_sec",
+                                  strike_test_bbox_timeout_sec_, 0.4);
+        nh_private_.param<double>("strike_test_bbox_filter_alpha",
+                                  strike_test_bbox_filter_alpha_, 0.4);
+        nh_private_.param<bool>("strike_test_hover_on_bbox_loss",
+                                strike_test_hover_on_bbox_loss_, true);
+        strike_test_guard_arm_distance_m_ = std::max(
+            0.1, strike_test_guard_arm_distance_m_);
+        strike_test_bbox_slow_threshold_ = clampValue(
+            strike_test_bbox_slow_threshold_, 0.001, 0.99);
+        strike_test_bbox_hover_threshold_ = clampValue(
+            strike_test_bbox_hover_threshold_,
+            strike_test_bbox_slow_threshold_ + 0.001, 1.0);
+        strike_test_bbox_confirm_frames_ = std::max(1, strike_test_bbox_confirm_frames_);
+        strike_test_bbox_timeout_sec_ = std::max(0.05, strike_test_bbox_timeout_sec_);
+        strike_test_bbox_filter_alpha_ = clampValue(
+            strike_test_bbox_filter_alpha_, 0.01, 1.0);
+        strike_test_bbox_center_band_ = clampValue(
+            strike_test_bbox_center_band_, 0.0, 0.5);
+        strike_test_bbox_min_confidence_ = clampValue(
+            strike_test_bbox_min_confidence_, 0.0, 1.0);
+        if (strike_test_guard_enabled_) {
+            ROS_WARN("[STRIKE TEST GUARD] ENABLED: arm_distance=%.1fm "
+                     "bbox slow=%.3f hover=%.3f center=+/-%.2f confidence>=%.2f "
+                     "confirm=%d timeout=%.2fs; real impact is inhibited",
+                     strike_test_guard_arm_distance_m_,
+                     strike_test_bbox_slow_threshold_,
+                     strike_test_bbox_hover_threshold_,
+                     strike_test_bbox_center_band_,
+                     strike_test_bbox_min_confidence_,
+                     strike_test_bbox_confirm_frames_,
+                     strike_test_bbox_timeout_sec_);
+        } else {
+            ROS_WARN("[STRIKE TEST GUARD] DISABLED: original strike command path is unchanged");
+        }
+        //=============打击保护bbox=========//
+
         // === 2026-08-27: 末段水平速度缩放下限 (腾电机余量给垂直) ===
         nh_private_.param<double>("strike_terminal_horizontal_scale_floor",
                                   strike_terminal_horizontal_scale_floor_, 0.4);
@@ -938,6 +1012,47 @@ public:
         if (is_new_frame) {
             last_image_frame_seq_ = msg->frame_seq;
             last_image_stamp_us_ = msg->stamp_us;
+
+            //=============打击保护bbox=========//
+            const bool bbox_centered =
+                std::fabs(static_cast<double>(msg->center_x) - 0.5) <=
+                    strike_test_bbox_center_band_ &&
+                std::fabs(static_cast<double>(msg->center_y) - 0.5) <=
+                    strike_test_bbox_center_band_;
+            const bool bbox_qualified = strike_test_bbox_guard_armed_ &&
+                msg->visible && bbox_centered &&
+                msg->confidence >= strike_test_bbox_min_confidence_;
+            if (strike_test_guard_enabled_ && bbox_qualified &&
+                std::isfinite(msg->width) && std::isfinite(msg->height) &&
+                msg->width > 0.0 && msg->height > 0.0) {
+                const double bbox_metric = std::sqrt(
+                    static_cast<double>(msg->width) *
+                    static_cast<double>(msg->height));
+                if (!strike_test_bbox_metric_valid_) {
+                    strike_test_bbox_metric_ = bbox_metric;
+                    strike_test_bbox_metric_valid_ = true;
+                } else {
+                    strike_test_bbox_metric_ =
+                        strike_test_bbox_filter_alpha_ * bbox_metric +
+                        (1.0 - strike_test_bbox_filter_alpha_) *
+                            strike_test_bbox_metric_;
+                }
+                strike_test_bbox_last_update_time_ = ros::Time::now();
+                if (strike_test_bbox_metric_ >= strike_test_bbox_slow_threshold_) {
+                    strike_test_bbox_slow_zone_seen_ = true;
+                }
+                if (strike_test_bbox_metric_ >= strike_test_bbox_hover_threshold_) {
+                    strike_test_bbox_hover_confirm_count_ = std::min(
+                        strike_test_bbox_hover_confirm_count_ + 1,
+                        strike_test_bbox_confirm_frames_);
+                } else {
+                    strike_test_bbox_hover_confirm_count_ = 0;
+                }
+            } else if (strike_test_guard_enabled_ && strike_test_bbox_guard_armed_) {
+                strike_test_bbox_hover_confirm_count_ = 0;
+            }
+            //=============打击保护bbox=========//
+
             if (msg->visible) {
                 image_confirm_count_ = std::min(image_confirm_count_ + 1,
                                                 image_confirm_frames_);
@@ -1105,6 +1220,16 @@ public:
             // === 2026-08-20: 重置 chase latch, 新一轮 strike 不继承上一次末尾状态 ===
             terminal_image_chase_active_ = false;
             terminal_image_chase_enter_time_ = ros::Time();
+
+            //=============打击保护bbox=========//
+            strike_test_bbox_metric_ = 0.0;
+            strike_test_bbox_metric_valid_ = false;
+            strike_test_bbox_hover_confirm_count_ = 0;
+            strike_test_bbox_slow_zone_seen_ = false;
+            strike_test_bbox_guard_armed_ = false;
+            strike_test_bbox_hover_latched_ = false;
+            strike_test_bbox_last_update_time_ = ros::Time();
+            //=============打击保护bbox=========//
             const double target_age = last_target_pose_receive_time_.isZero()
                 ? std::numeric_limits<double>::infinity()
                 : (ros::Time::now() - last_target_pose_receive_time_).toSec();
@@ -1202,6 +1327,16 @@ public:
             last_strike_cmd_valid_ = false;
             last_strike_cmd_time_ = ros::Time();
             strike_target_latched_valid_ = false;
+
+            //=============打击保护bbox=========//
+            strike_test_bbox_metric_ = 0.0;
+            strike_test_bbox_metric_valid_ = false;
+            strike_test_bbox_hover_confirm_count_ = 0;
+            strike_test_bbox_slow_zone_seen_ = false;
+            strike_test_bbox_guard_armed_ = false;
+            strike_test_bbox_hover_latched_ = false;
+            strike_test_bbox_last_update_time_ = ros::Time();
+            //=============打击保护bbox=========//
             //===================制导修改====================
             ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
@@ -1221,6 +1356,16 @@ public:
             //   进入 strike 时 image 还没收到就误触发 chase, 跳过必要的前置检查。
             terminal_image_chase_active_ = false;
             terminal_image_chase_enter_time_ = ros::Time();
+
+            //=============打击保护bbox=========//
+            strike_test_bbox_metric_ = 0.0;
+            strike_test_bbox_metric_valid_ = false;
+            strike_test_bbox_hover_confirm_count_ = 0;
+            strike_test_bbox_slow_zone_seen_ = false;
+            strike_test_bbox_guard_armed_ = false;
+            strike_test_bbox_hover_latched_ = false;
+            strike_test_bbox_last_update_time_ = ros::Time();
+            //=============打击保护bbox=========//
             // === 2026-08-19: 进入 strike 重置闭环下降跟踪器 ===
             //   否则上一个 strike 的实际下降率 EMA 会污染新一次 strike 的闭环水平计算。
             resetActualDescentRate();
@@ -1320,6 +1465,87 @@ public:
         velocity_active_pub_.publish(active);
     }
     //========不要fail safe============//
+
+    //=============打击保护bbox=========//
+    // 必须在 NED 指令的所有制导、terminal chase 和滤波之后调用。
+    // 返回 true 表示指令已被测试保护修改；开关关闭时立即返回，不影响原路径。
+    bool applyStrikeTestBboxGuard(geometry_msgs::Twist& cmd_ned,
+                                  double horizontal_distance_m) {
+        if (!strike_test_guard_enabled_ || current_mode_ != "strike") {
+            return false;
+        }
+
+        if (!strike_test_bbox_guard_armed_) {
+            if (!std::isfinite(horizontal_distance_m) ||
+                horizontal_distance_m > strike_test_guard_arm_distance_m_) {
+                ROS_INFO_THROTTLE(2.0,
+                    "[STRIKE TEST GUARD] waiting near zone: distance=%.2fm arm<=%.2fm",
+                    horizontal_distance_m, strike_test_guard_arm_distance_m_);
+                return false;
+            }
+            strike_test_bbox_guard_armed_ = true;
+            // 丢弃远距离阶段积累的 bbox，必须等待进入近区后的新图像帧。
+            strike_test_bbox_metric_ = 0.0;
+            strike_test_bbox_metric_valid_ = false;
+            strike_test_bbox_hover_confirm_count_ = 0;
+            strike_test_bbox_slow_zone_seen_ = false;
+            strike_test_bbox_last_update_time_ = ros::Time();
+            ROS_WARN("[STRIKE TEST GUARD] bbox guard ARMED at horizontal distance %.2fm",
+                     horizontal_distance_m);
+            return false;
+        }
+
+        const ros::Time now = ros::Time::now();
+        const bool bbox_fresh = strike_test_bbox_metric_valid_ &&
+            !strike_test_bbox_last_update_time_.isZero() &&
+            (now - strike_test_bbox_last_update_time_).toSec() <=
+                strike_test_bbox_timeout_sec_;
+
+        if (!strike_test_bbox_hover_latched_ &&
+            strike_test_bbox_hover_confirm_count_ >=
+                strike_test_bbox_confirm_frames_) {
+            strike_test_bbox_hover_latched_ = true;
+            ROS_ERROR("[STRIKE TEST GUARD] HOVER LATCHED: bbox metric=%.3f >= %.3f",
+                      strike_test_bbox_metric_, strike_test_bbox_hover_threshold_);
+        }
+
+        if (!strike_test_bbox_hover_latched_ &&
+            strike_test_hover_on_bbox_loss_ &&
+            strike_test_bbox_slow_zone_seen_ && !bbox_fresh) {
+            strike_test_bbox_hover_latched_ = true;
+            ROS_ERROR("[STRIKE TEST GUARD] HOVER LATCHED: bbox lost/stale after slow zone");
+        }
+
+        if (strike_test_bbox_hover_latched_) {
+            cmd_ned = geometry_msgs::Twist();
+            last_strike_cmd_ned_ = cmd_ned;
+            last_strike_cmd_valid_ = true;
+            ROS_WARN_THROTTLE(1.0,
+                "[STRIKE TEST GUARD] holding zero velocity; bbox metric=%.3f fresh=%d",
+                strike_test_bbox_metric_, static_cast<int>(bbox_fresh));
+            return true;
+        }
+
+        if (!bbox_fresh ||
+            strike_test_bbox_metric_ <= strike_test_bbox_slow_threshold_) {
+            return false;
+        }
+
+        const double scale = clampValue(
+            (strike_test_bbox_hover_threshold_ - strike_test_bbox_metric_) /
+                (strike_test_bbox_hover_threshold_ -
+                 strike_test_bbox_slow_threshold_),
+            0.0, 1.0);
+        cmd_ned.linear.x *= scale;
+        cmd_ned.linear.y *= scale;
+        cmd_ned.linear.z *= scale;
+        cmd_ned.angular.z *= scale;
+        ROS_WARN_THROTTLE(1.0,
+            "[STRIKE TEST GUARD] decelerating: bbox metric=%.3f scale=%.2f",
+            strike_test_bbox_metric_, scale);
+        return true;
+    }
+    //=============打击保护bbox=========//
 
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
         if (ref_initialized_) return;  // 锁一次
@@ -2130,6 +2356,13 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                         computeImageGeoStrikeVelocity(vel_cmd);
                         evaluateStrike();
                         filterVelocityCmd(vel_cmd);
+                        //=============打击保护bbox=========//
+                        const double guard_dx = current_target_pose_.pose.position.x -
+                                                current_uav_pose_.pose.position.x;
+                        const double guard_dy = current_target_pose_.pose.position.y -
+                                                current_uav_pose_.pose.position.y;
+                        applyStrikeTestBboxGuard(vel_cmd, std::hypot(guard_dx, guard_dy));
+                        //=============打击保护bbox=========//
                         if (!use_sim_) {
                             convertVelNedToEnu(vel_cmd);
                         }
@@ -2287,6 +2520,10 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                         enforcePreCommitAltitudeGuard(vel_cmd, pn_descent_geometry, track_max_speed_);
                     }
                     //=======高度下降===========//
+
+                    //=============打击保护bbox=========//
+                    applyStrikeTestBboxGuard(vel_cmd, pn_geometry.horizontal);
+                    //=============打击保护bbox=========//
 
                     multi_uav_strike::GuidancePnDebug pn_dbg;
                     pn_dbg.header.stamp = ros::Time::now();
