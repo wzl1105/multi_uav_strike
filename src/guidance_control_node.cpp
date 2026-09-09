@@ -14,6 +14,9 @@
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <cmath>
+//=============打击保护bbox=========//
+#include <cctype>
+//=============打击保护bbox=========//
 //===================制导修改====================
 #include <algorithm>
 //===================制导修改====================
@@ -388,7 +391,12 @@ private:
     // bbox 连续达到 hover 阈值，或本地高度低于安全阈值时，直接锁存位置悬停。
     bool strike_test_guard_enabled_ = false;
     double strike_test_guard_arm_distance_m_ = 15.0;
-    double strike_test_bbox_hover_threshold_ = 0.30;
+    double strike_test_bbox_hover_threshold_ = 0.18;
+    double strike_test_bbox_person_threshold_ = 0.11;
+    double strike_test_bbox_vehicle_threshold_ = 0.30;
+    double strike_test_bbox_trigger_max_altitude_m_ = 10.0;
+    std::string strike_test_bbox_active_class_ = "default";
+    double strike_test_bbox_active_threshold_ = 0.18;
     bool strike_test_altitude_guard_enabled_ = true;
     double strike_test_min_altitude_m_ = 4.0;
     double strike_test_bbox_center_band_ = 0.25;
@@ -733,7 +741,13 @@ public:
         nh_private_.param<double>("strike_test_guard_arm_distance_m",
                                   strike_test_guard_arm_distance_m_, 15.0);
         nh_private_.param<double>("strike_test_bbox_hover_threshold",
-                                  strike_test_bbox_hover_threshold_, 0.30);
+                                  strike_test_bbox_hover_threshold_, 0.18);
+        nh_private_.param<double>("strike_test_bbox_person_threshold",
+                                  strike_test_bbox_person_threshold_, 0.11);
+        nh_private_.param<double>("strike_test_bbox_vehicle_threshold",
+                                  strike_test_bbox_vehicle_threshold_, 0.30);
+        nh_private_.param<double>("strike_test_bbox_trigger_max_altitude_m",
+                                  strike_test_bbox_trigger_max_altitude_m_, 10.0);
         nh_private_.param<bool>("strike_test_altitude_guard_enabled",
                                 strike_test_altitude_guard_enabled_, true);
         nh_private_.param<double>("strike_test_min_altitude_m",
@@ -766,6 +780,13 @@ public:
             0.1, strike_test_guard_arm_distance_m_);
         strike_test_bbox_hover_threshold_ = clampValue(
             strike_test_bbox_hover_threshold_, 0.001, 1.0);
+        strike_test_bbox_person_threshold_ = clampValue(
+            strike_test_bbox_person_threshold_, 0.001, 1.0);
+        strike_test_bbox_vehicle_threshold_ = clampValue(
+            strike_test_bbox_vehicle_threshold_, 0.001, 1.0);
+        strike_test_bbox_trigger_max_altitude_m_ = std::max(
+            strike_test_min_altitude_m_, strike_test_bbox_trigger_max_altitude_m_);
+        strike_test_bbox_active_threshold_ = strike_test_bbox_hover_threshold_;
         strike_test_min_altitude_m_ = std::max(0.0, strike_test_min_altitude_m_);
         strike_test_smoke_min_hold_sec_ = std::max(0.0, strike_test_smoke_min_hold_sec_);
         strike_test_smoke_max_xy_speed_mps_ =
@@ -786,11 +807,15 @@ public:
             strike_test_bbox_min_confidence_, 0.0, 1.0);
         if (strike_test_guard_enabled_) {
             ROS_WARN("[STRIKE TEST GUARD] ENABLED: arm_distance=%.1fm "
-                     "bbox hover=%.3f center=+/-%.2f confidence>=%.2f "
+                     "bbox person=%.3f vehicle=%.3f default=%.3f trigger_altitude<=%.2fm "
+                     "center=+/-%.2f confidence>=%.2f "
                      "altitude_guard=%d local_altitude<=%.2fm "
                      "confirm=%d timeout=%.2fs smoke=%d service=%s; real impact is inhibited",
                      strike_test_guard_arm_distance_m_,
+                     strike_test_bbox_person_threshold_,
+                     strike_test_bbox_vehicle_threshold_,
                      strike_test_bbox_hover_threshold_,
+                     strike_test_bbox_trigger_max_altitude_m_,
                      strike_test_bbox_center_band_,
                      strike_test_bbox_min_confidence_,
                      static_cast<int>(strike_test_altitude_guard_enabled_),
@@ -1066,6 +1091,33 @@ public:
         is_target_twist_received_ = true;
     }
 
+    //=============打击保护bbox=========//
+    std::string strikeTestBboxClass(const std::string& label) const {
+        std::string normalized = label;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (normalized == "person" || normalized == "pedestrian") {
+            return "person";
+        }
+        if (normalized == "car" || normalized == "truck" ||
+            normalized == "bus" || normalized == "vehicle" ||
+            normalized == "van" || normalized == "suv") {
+            return "vehicle";
+        }
+        return "default";
+    }
+
+    double strikeTestBboxThreshold(const std::string& target_class) const {
+        if (target_class == "person") {
+            return strike_test_bbox_person_threshold_;
+        }
+        if (target_class == "vehicle") {
+            return strike_test_bbox_vehicle_threshold_;
+        }
+        return strike_test_bbox_hover_threshold_;
+    }
+    //=============打击保护bbox=========//
+
     //===================制导修改====================
     void primaryImageTargetCallback(
         const multi_uav_strike::PrimaryImageTarget::ConstPtr& msg) {
@@ -1091,6 +1143,19 @@ public:
             if (strike_test_guard_enabled_ && bbox_qualified &&
                 std::isfinite(msg->width) && std::isfinite(msg->height) &&
                 msg->width > 0.0 && msg->height > 0.0) {
+                const std::string target_class = strikeTestBboxClass(msg->label);
+                if (target_class != strike_test_bbox_active_class_) {
+                    strike_test_bbox_active_class_ = target_class;
+                    strike_test_bbox_active_threshold_ =
+                        strikeTestBboxThreshold(target_class);
+                    // 类别发生变化后重新滤波并重新累计，禁止低阈值跨类别继承计数。
+                    strike_test_bbox_metric_ = 0.0;
+                    strike_test_bbox_metric_valid_ = false;
+                    strike_test_bbox_hover_confirm_count_ = 0;
+                    ROS_WARN("[STRIKE TEST GUARD] bbox class=%s label=%s threshold=%.3f",
+                             strike_test_bbox_active_class_.c_str(), msg->label.c_str(),
+                             strike_test_bbox_active_threshold_);
+                }
                 const double bbox_metric = std::sqrt(
                     static_cast<double>(msg->width) *
                     static_cast<double>(msg->height));
@@ -1104,7 +1169,12 @@ public:
                             strike_test_bbox_metric_;
                 }
                 strike_test_bbox_last_update_time_ = ros::Time::now();
-                if (strike_test_bbox_metric_ >= strike_test_bbox_hover_threshold_) {
+                const bool trigger_altitude_ok = is_uav_pose_received_ &&
+                    std::isfinite(current_uav_pose_.pose.position.z) &&
+                    current_uav_pose_.pose.position.z <=
+                        strike_test_bbox_trigger_max_altitude_m_;
+                if (trigger_altitude_ok &&
+                    strike_test_bbox_metric_ >= strike_test_bbox_active_threshold_) {
                     strike_test_bbox_hover_confirm_count_ = std::min(
                         strike_test_bbox_hover_confirm_count_ + 1,
                         strike_test_bbox_confirm_frames_);
@@ -1730,6 +1800,8 @@ public:
             strike_test_bbox_metric_valid_ = false;
             strike_test_bbox_hover_confirm_count_ = 0;
             strike_test_bbox_last_update_time_ = ros::Time();
+            strike_test_bbox_active_class_ = "default";
+            strike_test_bbox_active_threshold_ = strike_test_bbox_hover_threshold_;
             ROS_WARN("[STRIKE TEST GUARD] bbox guard ARMED at horizontal distance %.2fm",
                      horizontal_distance_m);
             return false;
@@ -1741,12 +1813,15 @@ public:
             (now - strike_test_bbox_last_update_time_).toSec() <=
                 strike_test_bbox_timeout_sec_;
 
-        if (!strike_test_bbox_hover_latched_ &&
+        if (!strike_test_bbox_hover_latched_ && bbox_fresh &&
             strike_test_bbox_hover_confirm_count_ >=
                 strike_test_bbox_confirm_frames_) {
             strike_test_bbox_hover_latched_ = true;
-            ROS_ERROR("[STRIKE TEST GUARD] HOVER LATCHED: bbox metric=%.3f >= %.3f",
-                      strike_test_bbox_metric_, strike_test_bbox_hover_threshold_);
+            ROS_ERROR("[STRIKE TEST GUARD] HOVER LATCHED: class=%s "
+                      "bbox metric=%.3f >= %.3f altitude=%.2fm",
+                      strike_test_bbox_active_class_.c_str(),
+                      strike_test_bbox_metric_, strike_test_bbox_active_threshold_,
+                      current_uav_pose_.pose.position.z);
         }
 
         if (strike_test_bbox_hover_latched_) {

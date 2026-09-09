@@ -62,9 +62,14 @@ strike_terminal_image_chase_center_band: 0.4
 strike_test_guard_enabled: true
 # 只有水平距离进入该范围后才锁存开启 bbox 判断，远距离大框不会触发停车。
 strike_test_guard_arm_distance_m: 15.0
-# 依据 2026-09-08 仿真 bag 调整：近区有效框峰值约 0.25。
-# 0.15 连续确认后直接切换 Position Hold。
-strike_test_bbox_hover_threshold: 0.15
+# 未识别为人员或车辆时使用的兼容回退阈值。
+strike_test_bbox_hover_threshold: 0.18
+# 依据人员与车辆实测分别设置：人员框较小，车辆框较大。
+strike_test_bbox_person_threshold: 0.11
+strike_test_bbox_vehicle_threshold: 0.30
+# bbox 只允许在本地高度不高于 10m 时累计确认，避免车辆大框在高空提前停车。
+# 该参数不会在 10m 主动触发；bbox 未达标时继续接近，最低仍由 4m 硬保护兜底。
+strike_test_bbox_trigger_max_altitude_m: 10.0
 # 高度硬保护使用 MAVROS local_position 转换后的 NWU 本地高度，
 # 不依赖 bbox、目标距离或近区布防；低于或等于 4m 立即锁存悬停。
 strike_test_altitude_guard_enabled: true
