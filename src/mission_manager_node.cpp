@@ -1961,6 +1961,52 @@ public:
             return;
         }
 
+        // === 2026-09-09: PHASE_FAILED 状态下的新 TaskFlow 自动 reset ===
+        //   触发场景:上一条任务以 phase=FAILED 收尾(弹射 vtol_state 超时 / OFFBOARD 接管
+        //     5min 超时 / 其它 mission 端兜不住的失败),GS 重发新任务期望重新起飞。
+        //   原 bug:runPx4TakeoffSequence line 4790-4792 起飞守卫把 PHASE_FAILED 排除在外
+        //     (只允许 TAKING_OFF / HOVERING / HOLDING),新 task_flow 入队后起飞守卫 return,
+        //     triggerOffboardAndArm 永远不会跑 → 飞机一直停在 FAILED,GS 怎么发技能都没用。
+        //   修法:跟现有 is_landing_in_progress_ reset(line 2129-2135)对齐 ——
+        //     新 TaskFlow 到达 → phase 重置为 GROUND_IDLE → 起飞守卫放行 → 正常接管序列。
+        //   注意:takeoff_state_ 不在这里清 — 后面 L2379 守卫("非 IDLE 就 reset")
+        //     会接手把 takeoff_state_=IDLE + retry/failed 标志清零。
+        if (current_phase_ == MissionPhase::PHASE_FAILED) {
+            // 打印 PX4 实时状态 + 位置高度,方便 rosout 排查"上次为什么 FAILED"——
+            //   用户口径"担心 reset 连带产生其他问题",日志里能看到 reset 前一刻 PX4
+            //   mode / armed / 高度,事后回溯可区分三种 FAILED 入口(弹射 60s / OFFBOARD 5min
+            //   / 爬升 60s)和 reset 时机是否合理。
+            const double alt_enu = (current_pose_.header.stamp.isZero() || !is_pose_received_)
+                                      ? NAN
+                                      : -current_pose_.pose.position.z;
+            ROS_WARN("[MissionManager] New TaskFlow during PHASE_FAILED — resetting to "
+                     "PHASE_GROUND_IDLE for fresh takeoff "
+                     "(flow_id=%s, prev_px4_mode=%s, prev_armed=%d, prev_alt_enu=%.2f m, "
+                     "takeoff_state=%s, vtol_state=%u, has_task_flow=%d)",
+                     msg->flow_id.c_str(),
+                     current_mavros_state_.mode.c_str(),
+                     current_mavros_state_.armed ? 1 : 0,
+                     alt_enu,
+                     [&]() -> const char* {
+                         switch (takeoff_state_) {
+                             case TakeoffState::TAKEOFF_IDLE:               return "IDLE";
+                             case TakeoffState::TAKEOFF_CATAPULT_ARMED:     return "CATAPULT_ARMED";
+                             case TakeoffState::TAKEOFF_CATAPULT_TRIGGERED: return "CATAPULT_TRIGGERED";
+                             case TakeoffState::TAKEOFF_CATAPULT_POSCTL:    return "CATAPULT_POSCTL";
+                             case TakeoffState::TAKEOFF_WAITING_FCU:        return "WAITING_FCU";
+                             case TakeoffState::TAKEOFF_SETTING_OFFBOARD:   return "SETTING_OFFBOARD";
+                             case TakeoffState::TAKEOFF_TAKEOFF_EXEC:       return "TAKEOFF_EXEC";
+                             case TakeoffState::TAKEOFF_HOVERING:           return "HOVERING";
+                             case TakeoffState::TAKEOFF_COMPLETE:           return "COMPLETE";
+                             case TakeoffState::TAKEOFF_FAILED:             return "FAILED";
+                             default:                                       return "UNKNOWN";
+                         }
+                     }(),
+                     static_cast<unsigned>(current_vtol_state_),
+                     has_task_flow_ ? 1 : 0);
+            current_phase_ = MissionPhase::PHASE_GROUND_IDLE;
+        }
+
         // === 2026-08-20: 新 TaskFlow 到达 → 清 gimbal angle latch ===
         //   用户口径:GS 发 angle → 保持到下次状态切换;新 task_flow 是切换信号。
         //   防止上一次任务的 GS 角度在新任务里继续生效(尤其 task_flow 整体变化时)。
