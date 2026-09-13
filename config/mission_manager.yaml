@@ -6,6 +6,21 @@
 # ============================================================================
 
 mission_loop_rate: 50.0
+
+# === 地面站失联固定点返航 ===
+# 只有链路至少成功建立过一次，随后 starling_bridge 判定 KCP 心跳超时，且飞机已解锁并在空中时触发。
+# 经纬度必须按实际试验场填写；保持 0 会拒绝触发，避免误飞往无效坐标。
+gcs_lost_return_enabled: false
+gcs_lost_return_latitude: 0.0
+gcs_lost_return_longitude: 0.0
+# 高度语义：相对 PX4 Home 的高度（米），不是海拔高度。
+gcs_lost_return_altitude_m: 20.0
+gcs_lost_return_radius_m: 3.0
+
+# === 空中 POSCTL 接收技能流后主动接管 OFFBOARD ===
+posctl_taskflow_takeover_enabled: true
+offboard_takeover_prestream_sec: 1.0
+offboard_takeover_min_altitude_m: 1.5
 low_speed_threshold: 12.0
 target_lock_confidence: 0.7
 spiral_approach_duration: 10.0
