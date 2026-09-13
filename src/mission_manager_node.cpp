@@ -2210,10 +2210,29 @@ public:
 
         // 空中 POSCTL 收到有效技能流时，由当前位置 setpoint 先建立 OFFBOARD 输入流，
         // 再请求模式切换。确认成功后才继续接纳任务，避免“先切模式、后发 setpoint”的空窗。
+        // === 2026-09-13: 扩展接管场景 — UAV 已被外部控制起飞,phase 仍 GROUND_IDLE ===
+        //   触发场景:PX4 AUTO.TAKEOFF / RC / 飞手 等让 UAV 在 AUTO.LOITER/ALTCTL/STABILIZED
+        //   等模式下悬停,mission_manager 还停在 PHASE_GROUND_IDLE。原 guard 只接 POSCTL,
+        //   导致 AUTO.LOITER 等模式下 TaskFlow 进了 skill 队列但 phase 永远不切,
+        //   setpoint publisher 不启动,UAV 不接管 OFFBOARD,任务静默失败。
+        //   修法:GROUND_IDLE + 物理在空中 + mode 非 OFFBOARD/AUTO.LAND/AUTO.RTL/
+        //   AUTO.TAKEOFF/AUTO.PRECLAND 时也走同一套接管流程。
+        //   - 路径 B (need_takeback_offboard, ~L2309) 仍覆盖 HOLDING/RETURNING/is_fcu_overridden_
+        //   - PHASE_TAKING_OFF/HOVERING 说明 mission_manager 自己正在接管,不应覆盖
+        //   - PHASE_FAILED 等"已结束"状态由路径 B 处理
         const bool physical_airborne = isPhysicallyAirborne();
+        const bool px4_mode_takeover_safe =
+            current_mavros_state_.mode != "OFFBOARD" &&
+            current_mavros_state_.mode != "AUTO.LAND" &&
+            current_mavros_state_.mode != "AUTO.RTL" &&
+            current_mavros_state_.mode != "AUTO.TAKEOFF" &&
+            current_mavros_state_.mode != "AUTO.PRECLAND";
         if (posctl_taskflow_takeover_enabled_ && physical_airborne &&
-            current_mavros_state_.mode == "POSCTL") {
-            ROS_WARN("[MissionManager] Airborne POSCTL + new TaskFlow: prestream position setpoint for %.1fs",
+            current_phase_ == MissionPhase::PHASE_GROUND_IDLE &&
+            px4_mode_takeover_safe) {
+            ROS_WARN("[MissionManager] UAV airborne externally (mode=%s, phase=GROUND_IDLE); "
+                     "TaskFlow id=%s triggering OFFBOARD takeover (prestream %.1fs)",
+                     current_mavros_state_.mode.c_str(), msg->flow_id.c_str(),
                      offboard_takeover_prestream_sec_);
             current_phase_ = MissionPhase::PHASE_HOLDING;
             if (!setpoint_running_) startSetpointPublisher();
@@ -2223,12 +2242,12 @@ public:
             const bool ok = setMode("OFFBOARD");
             suppress_recovery_ = false;
             if (!ok) {
-                ROS_ERROR("[MissionManager] POSCTL->OFFBOARD takeover failed; TaskFlow id=%s rejected",
-                          msg->flow_id.c_str());
+                ROS_ERROR("[MissionManager] OFFBOARD takeover failed (mode=%s); TaskFlow id=%s rejected",
+                          current_mavros_state_.mode.c_str(), msg->flow_id.c_str());
                 return;
             }
             is_fcu_overridden_ = false;
-            ROS_WARN("[MissionManager] POSCTL->OFFBOARD confirmed; accepting TaskFlow id=%s",
+            ROS_WARN("[MissionManager] OFFBOARD confirmed; accepting TaskFlow id=%s (was in external flight)",
                      msg->flow_id.c_str());
         }
 
