@@ -6,6 +6,35 @@
 # ============================================================================
 
 mission_loop_rate: 50.0
+
+# === 地面站失联固定点返航 ===
+# 触发链路：starling_bridge 判定 KCP 心跳超时 → callback 进入 grace 期
+#   → 主循环超时（gcs_lost_grace_sec 秒）→ startGcsLostReturn() 飞回返航点。
+# 只有链路至少成功建立过一次，随后 starling_bridge 判定 KCP 心跳超时，且飞机已解锁并在空中时触发。
+# gcs_lost_return_enabled: 总开关（false = 关闭整个 GS 失联返航，包括 grace 期都不进入 PHASE_RETURNING）。
+# gcs_lost_return_latitude / longitude: 返航点。
+#   (0.0, 0.0) → 飞回 PX4 Home（最自然的"返航"语义，推荐首次部署留 0）。
+#   非 0       → 飞用户指定的固定点（适合"试验场角落集合点"场景）。
+# 高度语义：相对 PX4 Home 的高度（米），不是海拔高度。
+gcs_lost_return_enabled: true
+gcs_lost_return_latitude: 0
+gcs_lost_return_longitude: 0
+gcs_lost_return_altitude_m: 40.0
+gcs_lost_return_radius_m: 3.0
+# === 2026-09-13: GS 失联 grace 计时 ===
+#   starling_bridge KCP 内部 6s 心跳周期会 publish tzs/gcs_link_state,
+#   应用层额外等这个秒数才真正触发返航 — 给 GS 短抖重连留余量,
+#   不让偶发链路抖动立刻把 UAV 召回去。
+#   - 默认 120s (2 min):实测 GS 偶发短抖 <30s,2min 触发折中
+#   - 0: 老行为,收到 healthy=false 立即触发 (fast fail)
+#   - 负数: 完全关闭返航触发 (gcs_lost_return_enabled 不受影响)
+#   grace 期内 GS 心跳恢复 → callback 清 grace → 不触发;超时 → 主循环触发
+gcs_lost_grace_sec: 120.0
+
+# === 空中 POSCTL 接收技能流后主动接管 OFFBOARD ===
+posctl_taskflow_takeover_enabled: true
+offboard_takeover_prestream_sec: 1.0
+offboard_takeover_min_altitude_m: 1.5
 low_speed_threshold: 12.0
 target_lock_confidence: 0.7
 spiral_approach_duration: 10.0

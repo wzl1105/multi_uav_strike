@@ -7,38 +7,41 @@
 
   节点职责:
     - /dev/ttyS3 @ 115200 8N1 RS-485 半双工
-    - GPIO1-C2 高发低收(默认 sysfs GPIO 编号 98;按板子实际硬件改)
+    - GPIO1-C2 高发低收(当前板卡 sysfs GPIO 编号 50)
     - /system/payload_type = 7 (NHY_PAYLOAD_TYPE_MUNITION)
     - /yx/status (multi_uav_strike/YxStatus)
     - /yx/raw_frame (std_msgs/UInt8MultiArray,16 字节)
     - /yx/cmd (std_msgs/UInt8,0..5)
+    - /trigger_smoke (std_srvs/Trigger,0x4E 连续 10 帧，暂无完成反馈)
 
   可调参数(launch arg):
     serial_port          默认 /dev/ttyS3
     baudrate             默认 115200
     gpio_chip            默认 "gpiochip1"  (libgpiod chip 名)
-    gpio_line            默认 2            (gpio1_C2 = chip1 line 2)
-    gpio_number          默认 98           (sysfs 全局编号,fallback 用)
+    gpio_line            默认 18           (gpio1_C2 = chip1 line 18)
+    gpio_number          默认 50           (gpio1_C2 的 sysfs 全局编号)
     kill_stale_gpioset   默认 true         (启动时杀残留 gpioset)
     use_gpioset          默认 false        (true=尝试启动 gpioset 占位,失败回退 sysfs)
     pidfile              默认 /tmp/yx_rs485_gpioset.pid
     self_test_hz         默认 1.0          (0x3C 自检指令周期)
     send_interval_sec    默认 0.05         (连续指令两帧间隔 50ms)
     gpio_settle_ms       默认 2            (GPIO 切换前后延迟)
+    gpio_retry_interval_sec 默认 1.0        (启动竞争导致失败时持续重试)
     payload_type         默认 7
 -->
 <launch>
   <arg name="serial_port"          default="/dev/ttyS3"/>
   <arg name="baudrate"             default="115200"/>
   <arg name="gpio_chip"            default="gpiochip1"/>
-  <arg name="gpio_line"            default="2"/>
-  <arg name="gpio_number"          default="98"/>
+  <arg name="gpio_line"            default="18"/>
+  <arg name="gpio_number"          default="50"/>
   <arg name="kill_stale_gpioset"   default="true"/>
   <arg name="use_gpioset"          default="false"/>
   <arg name="pidfile"              default="/tmp/yx_rs485_gpioset.pid"/>
   <arg name="self_test_hz"         default="1.0"/>
   <arg name="send_interval_sec"    default="0.05"/>
   <arg name="gpio_settle_ms"       default="2"/>
+  <arg name="gpio_retry_interval_sec" default="1.0"/>
   <arg name="payload_type"         default="7"/>
 
   <node pkg="multi_uav_strike" type="yx_comm_node" name="yx_comm_node"
@@ -54,6 +57,7 @@
     <param name="self_test_hz"         value="$(arg self_test_hz)"/>
     <param name="send_interval_sec"    value="$(arg send_interval_sec)"/>
     <param name="gpio_settle_ms"       value="$(arg gpio_settle_ms)"/>
+    <param name="gpio_retry_interval_sec" value="$(arg gpio_retry_interval_sec)"/>
     <param name="payload_type"         value="$(arg payload_type)"/>
   </node>
 </launch>

@@ -22,6 +22,7 @@
 #include <ros/ros.h>
 #include <std_msgs/UInt8.h>
 #include <std_msgs/UInt8MultiArray.h>
+#include <std_srvs/Trigger.h>
 #include <multi_uav_strike/YxStatus.h>
 #include <serial/serial.h>
 #include <chrono>
@@ -54,7 +55,7 @@ static const std::map<uint8_t, CmdEntry> YX_CMD_TABLE = {
     {1, {0x69, 10, "stage2_release"}},
     {2, {0x87, 10, "qb_charge"}},
     {3, {0x1B, 3,  "qb_discharge"}},
-    {4, {0x4E, 10, "qb_fire"}},
+    {4, {0x4E, 10, "smoke_trigger"}},
     {5, {0xD2, 10, "self_destruct"}},
 };
 
@@ -95,14 +96,15 @@ public:
 
     struct Config {
         std::string gpio_chip;     // libgpiod chip 名字, 如 "gpiochip1"
-        int         gpio_line;     // libgpiod line 偏移, 如 2 (gpio1_C2)
-        int         gpio_number;   // sysfs 全局 GPIO 编号, 如 98
+        int         gpio_line;     // libgpiod line 偏移, 如 18 (gpio1_C2)
+        int         gpio_number;   // sysfs 全局 GPIO 编号, 如 50 (gpio1_C2)
         std::string pidfile;       // gpioset PID 写入路径, 节点退出时 kill
         bool        kill_stale;    // 启动时是否先杀残留 gpioset
         bool        use_gpioset;   // 是否启用 gpioset backend (空闲时占位)
     };
 
     bool open(const Config& cfg) {
+        if (fd_ >= 0) return true;
         cfg_ = cfg;
         // ---- 步骤 1: 杀掉残留的 gpioset 进程(若之前的脚本/systemd 留下的) ----
         //   必须在 sysfs export 前做,否则 gpioset 持有同一 line 会让 sysfs write 被拒
@@ -124,11 +126,30 @@ public:
         }
         // ---- 步骤 3: sysfs 接管 ----
         const std::string base = "/sys/class/gpio/gpio" + std::to_string(cfg_.gpio_number);
-        std::ofstream exp("/sys/class/gpio/export");
-        if (exp.is_open()) { exp << cfg_.gpio_number; exp.close(); }
-        // 等 export 完成
-        for (int i = 0; i < 20 && !dirExists(base); ++i) {
-            usleep(50 * 1000);
+        // 单次初始化最多等待1秒；失败后由节点定时器继续重试，避免阻塞其它回调。
+        for (int i = 0; i < 5 && !dirExists(base); ++i) {
+            int export_fd = ::open("/sys/class/gpio/export", O_WRONLY);
+            if (export_fd >= 0) {
+                const std::string number = std::to_string(cfg_.gpio_number);
+                const ssize_t written = ::write(export_fd, number.data(), number.size());
+                const int write_errno = errno;
+                ::close(export_fd);
+                if (written < 0 && write_errno != EBUSY) {
+                    ROS_WARN_THROTTLE(1.0,
+                        "[yx_comm] export GPIO %d failed (errno=%d %s), retrying",
+                        cfg_.gpio_number, write_errno, std::strerror(write_errno));
+                }
+            } else {
+                ROS_WARN_THROTTLE(1.0,
+                    "[yx_comm] open GPIO export failed (errno=%d %s), retrying",
+                    errno, std::strerror(errno));
+            }
+            usleep(200 * 1000);
+        }
+        if (!dirExists(base)) {
+            ROS_WARN("[yx_comm] GPIO %d export did not become ready in this attempt",
+                      cfg_.gpio_number);
+            return false;
         }
         // 原子切为输出低电平: echo low > direction (跟脚本逻辑一致)
         std::ofstream dir_low(base + "/direction");
@@ -266,14 +287,15 @@ public:
         // GPIO 配置:跟板子自启动脚本对齐,chip+line 给 gpioset 命令用,gpio_number 给 sysfs 用。
         // 节点主路径是 sysfs,gpioset 仅作为"启动时清理残留占位"的可选 backend。
         pnh_.param<std::string>("gpio_chip", gpio_chip_,   "gpiochip1");
-        pnh_.param<int>("gpio_line",        gpio_line_,     2);     // gpio1_C2 = line 2
-        pnh_.param<int>("gpio_number",      gpio_number_, 98);     // sysfs 全局编号
+        pnh_.param<int>("gpio_line",        gpio_line_,     18);     // gpio1_C2 = line 18
+        pnh_.param<int>("gpio_number",      gpio_number_,   50);     // sysfs 全局编号
         pnh_.param<std::string>("pidfile",   pidfile_, "/tmp/yx_rs485_gpioset.pid");
         pnh_.param<bool>("kill_stale_gpioset", kill_stale_gpioset_, true);
         pnh_.param<bool>("use_gpioset",     use_gpioset_, false);   // 默认 sysfs,板子上有需要可改 true
         pnh_.param<double>("self_test_hz",  self_test_hz_, 1.0);
         pnh_.param<double>("send_interval_sec", send_interval_sec_, 0.05);  // 50ms 一帧
         pnh_.param<int>("gpio_settle_ms",   gpio_settle_ms_, 2);
+        pnh_.param<double>("gpio_retry_interval_sec", gpio_retry_interval_sec_, 1.0);
         pnh_.param<int>("payload_type",     payload_type_, 7);     // NHY_PAYLOAD_TYPE_MUNITION
 
         // ---- payload_type latched 发布 ----
@@ -290,17 +312,28 @@ public:
         // ---- 指令订阅 ----
         sub_cmd_ = nh_.subscribe("yx/cmd", 10, &YxCommNode::cmdCallback, this);
 
+        // 拉烟与弹射气体发生器一样使用 Trigger Service 作为上层入口，
+        // 底层仍走 YX RS-485 的 0x4E 连续 10 帧序列，不经过 power_interact_node。
+        srv_trigger_smoke_ = nh_.advertiseService(
+            "trigger_smoke", &YxCommNode::triggerSmokeCallback, this);
+
         // ---- GPIO 初始化 ----
-        GpioPin::Config gpio_cfg;
-        gpio_cfg.gpio_chip   = gpio_chip_;
-        gpio_cfg.gpio_line   = gpio_line_;
-        gpio_cfg.gpio_number = gpio_number_;
-        gpio_cfg.pidfile     = pidfile_;
-        gpio_cfg.kill_stale  = kill_stale_gpioset_;
-        gpio_cfg.use_gpioset = use_gpioset_;
-        if (!gpio_.open(gpio_cfg)) {
-            ROS_ERROR("[yx_comm] GPIO init failed, node will run but cannot transmit");
+        gpio_cfg_.gpio_chip   = gpio_chip_;
+        gpio_cfg_.gpio_line   = gpio_line_;
+        gpio_cfg_.gpio_number = gpio_number_;
+        gpio_cfg_.pidfile     = pidfile_;
+        gpio_cfg_.kill_stale  = kill_stale_gpioset_;
+        gpio_cfg_.use_gpioset = use_gpioset_;
+        gpio_ready_ = gpio_.open(gpio_cfg_);
+        if (!gpio_ready_) {
+            ROS_WARN("[yx_comm] GPIO init failed; retrying every %.2fs; transmit is disabled until ready",
+                     gpio_retry_interval_sec_);
         }
+
+        // 上电时其它服务可能暂时占用GPIO；失败后持续重试，成功后回调自动空转。
+        gpio_retry_timer_ = nh_.createTimer(
+            ros::Duration(std::max(gpio_retry_interval_sec_, 0.1)),
+            &YxCommNode::gpioRetryTimerCb, this);
 
         // ---- 串口初始化 ----
         try {
@@ -333,6 +366,70 @@ public:
 
 private:
     // ---- ROS 回调 ----
+    void gpioRetryTimerCb(const ros::TimerEvent&) {
+        if (gpio_ready_ || sending_active_) return;
+        ROS_WARN_THROTTLE(2.0, "[yx_comm] GPIO %d not ready, retrying initialization",
+                          gpio_number_);
+        if (gpio_.open(gpio_cfg_)) {
+            gpio_ready_ = true;
+            ROS_WARN("[yx_comm] GPIO %d recovered; RS485 transmit is now enabled",
+                     gpio_number_);
+        }
+    }
+
+    bool startCommandSequence(uint8_t cmd_id, const char* source, bool allow_interrupt,
+                              std::string* error = nullptr) {
+        auto it = YX_CMD_TABLE.find(cmd_id);
+        if (it == YX_CMD_TABLE.end() || cmd_id == 0) {
+            if (error) *error = "invalid burst command";
+            return false;
+        }
+        if (!ser_.isOpen()) {
+            if (error) *error = "YX serial is not open";
+            return false;
+        }
+        if (!gpio_ready_) {
+            if (error) *error = "YX RS485 direction GPIO is not ready";
+            return false;
+        }
+        if (sending_active_) {
+            if (!allow_interrupt) {
+                if (error) {
+                    *error = "another YX command sequence is already active: " +
+                             current_cmd_name_;
+                }
+                return false;
+            }
+            ROS_WARN("[yx_comm] %s interrupting in-flight sequence %s (%d/%d sent)",
+                     source, current_cmd_name_.c_str(), sent_count_, total_count_);
+        }
+
+        current_cmd_code_ = it->second.code;
+        current_cmd_name_ = it->second.name;
+        total_count_ = it->second.repeat_count;
+        sent_count_ = 0;
+        last_send_time_ = ros::Time(0);
+        sending_active_ = true;
+        ROS_WARN("[yx_comm] %s -> %s (0x%02X), starting burst %d frames @ %.0fms",
+                 source, current_cmd_name_.c_str(), current_cmd_code_, total_count_,
+                 send_interval_sec_ * 1000.0);
+        return true;
+    }
+
+    bool triggerSmokeCallback(std_srvs::Trigger::Request&,
+                              std_srvs::Trigger::Response& res) {
+        std::string error;
+        res.success = startCommandSequence(4, "/trigger_smoke", false, &error);
+        if (res.success) {
+            res.message = "Smoke trigger accepted: sending 0x4E burst (10 frames); "
+                          "no completion feedback is required";
+        } else {
+            res.message = "Smoke trigger rejected: " + error;
+            ROS_ERROR("[yx_comm] /trigger_smoke rejected: %s", error.c_str());
+        }
+        return true;
+    }
+
     void cmdCallback(const std_msgs::UInt8::ConstPtr& msg) {
         const uint8_t cmd_id = msg->data;
         auto it = YX_CMD_TABLE.find(cmd_id);
@@ -342,27 +439,18 @@ private:
         }
         // 自检指令走周期 timer,不进 SENDING 序列
         if (cmd_id == 0) {
+            if (!gpio_ready_) {
+                ROS_WARN_THROTTLE(2.0, "[yx_comm] GPIO not ready, drop periodic command");
+                return;
+            }
             sendSingleFrame(it->second.code);
             ROS_INFO("[yx_comm] /yx/cmd -> %s (single, periodic path)", it->second.name);
             return;
         }
-        // 关键/起爆类指令:启动"连续 N 次"序列
-        // 若已有序列在跑,取消旧的(语义:任何新指令重置当前计数,与协议"同指令连续 N 次"对齐)
-        if (sending_active_) {
-            ROS_WARN("[yx_comm] /yx/cmd interrupting in-flight sequence %s (%d/%d sent) "
-                     "with new cmd=%s",
-                     current_cmd_name_.c_str(), sent_count_, total_count_,
-                     it->second.name);
+        std::string error;
+        if (!startCommandSequence(cmd_id, "/yx/cmd", true, &error)) {
+            ROS_WARN("[yx_comm] /yx/cmd id=%u rejected: %s", cmd_id, error.c_str());
         }
-        current_cmd_code_   = it->second.code;
-        current_cmd_name_   = it->second.name;
-        total_count_        = it->second.repeat_count;
-        sent_count_         = 0;
-        last_send_time_     = ros::Time(0);  // 立刻发第一帧
-        sending_active_     = true;
-        ROS_INFO("[yx_comm] /yx/cmd -> %s (0x%02X) starting burst %d frames @ %.0fms interval",
-                 current_cmd_name_.c_str(), current_cmd_code_,
-                 total_count_, send_interval_sec_ * 1000.0);
     }
 
     void selfTestTimerCb(const ros::TimerEvent&) {
@@ -372,6 +460,7 @@ private:
         //   把"连续"判定清零 → 解保/起爆/自毁永远凑不到 N 次。
         //   跳过本周期自检,下个周期 SENDING 结束后再补发(1 Hz 时少一两次自检
         //   对设备无害,自检是周期性的)。
+        if (!gpio_ready_) return;
         if (sending_active_) {
             ROS_DEBUG_THROTTLE(2.0,
                 "[yx_comm] self-test 0x3C skipped: SENDING %s in progress (%d/%d)",
@@ -416,6 +505,10 @@ private:
 
     // ---- 下行帧组帧 + 发送(带 GPIO 切换)----
     void sendSingleFrame(uint8_t cmd) {
+        if (!gpio_ready_) {
+            ROS_WARN_THROTTLE(2.0, "[yx_comm] GPIO not ready, drop cmd 0x%02X", cmd);
+            return;
+        }
         if (!ser_.isOpen()) {
             ROS_WARN_THROTTLE(2.0, "[yx_comm] serial not open, drop cmd 0x%02X", cmd);
             return;
@@ -427,8 +520,12 @@ private:
         frame[3] = cmd;                 // CMD
         frame[4] = 0x00; frame[5] = 0x00;   // D 预留
         frame[6] = 0x00; frame[7] = 0x00;   // E 预留
-        // CRC16/MODBUS over bytes[2..7] = 6 bytes
-        uint16_t crc = crc16Modbus(frame + 2, 6);
+        // 已确认的拉烟完整帧为 EB 90 01 4E 00 00 00 00 F6 26，
+        // 其 CRC 计算范围包含同步头 bytes[0..7]。其他旧指令暂保持原有
+        // bytes[2..7] 范围，避免在未获得其它指令的确认报文前改变旧链路。
+        uint16_t crc = (cmd == 0x4E)
+            ? crc16Modbus(frame, 8)
+            : crc16Modbus(frame + 2, 6);
         frame[8] = (crc     ) & 0xFF;   // 低字节在前 (MODBUS 标准序,与 YX 端对齐)
         frame[9] = (crc >> 8) & 0xFF;
 
@@ -523,10 +620,13 @@ private:
     ros::NodeHandle nh_, pnh_;
     ros::Publisher  pub_payload_type_, pub_status_, pub_raw_frame_;
     ros::Subscriber sub_cmd_;
-    ros::Timer      self_test_timer_, run_timer_;
+    ros::ServiceServer srv_trigger_smoke_;
+    ros::Timer      self_test_timer_, run_timer_, gpio_retry_timer_;
 
     serial::Serial  ser_;
     GpioPin         gpio_;
+    GpioPin::Config gpio_cfg_;
+    bool            gpio_ready_ = false;
     std::vector<uint8_t> recv_buf_;
 
     // SENDING 序列
@@ -554,6 +654,7 @@ private:
     double      self_test_hz_;
     double      send_interval_sec_;
     int         gpio_settle_ms_;
+    double      gpio_retry_interval_sec_;
     int         payload_type_;
 };
 

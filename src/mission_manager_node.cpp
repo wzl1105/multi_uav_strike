@@ -348,6 +348,7 @@ private:
     ros::Subscriber waypoint_velocity_active_sub_; // 当前 skill 已实际发出速度的接管确认
     ros::Subscriber guidance_velocity_active_sub_; // guidance 已实际发出速度的接管确认
     ros::Subscriber inter_uav_status_sub_; // 多机心跳(/inter_uav/uav_status) — 多机 gather 同步用
+    ros::Subscriber gcs_link_state_sub_;   // starling_bridge KCP/GCS 链路健康状态
 
     // ============== Service Client ==============
     ros::ServiceClient set_mode_client_; // PX4 SITL: 模式切换
@@ -859,6 +860,27 @@ private:
     //   PX4 OFFBOARD 失流 failsafe。这个 latch 让闸门在那 1s 内保持 true。
     bool        strike_yaw_align_pending_         = false;
 
+    // ============== 地面站失联固定点返航 ==============
+    bool gcs_lost_return_enabled_ = false;
+    bool gcs_link_healthy_ = false;
+    bool gcs_link_ever_seen_ = false;
+    bool gcs_lost_return_active_ = false;
+    bool gcs_lost_return_arrived_ = false;
+    double gcs_lost_return_latitude_ = 0.0;
+    double gcs_lost_return_longitude_ = 0.0;
+    double gcs_lost_return_altitude_m_ = 20.0;  // 相对 PX4 Home 的 ENU 高度
+    double gcs_lost_return_radius_m_ = 3.0;
+    // === 2026-09-13: GS 失联 grace 计时 ===
+    //   starling_bridge KCP 6s 心跳周期内 tick1s publish tzs/gcs_link_state,
+    //   应用层额外等 gcs_lost_grace_sec_ 才真正触发返航 — 给 GS 短抖重连留余量。
+    //   0 = 老行为(收到 false 立即触发);负数 = 关闭 grace(永远不触发)。
+    double gcs_lost_grace_sec_ = 120.0;          // 默认 2 分钟
+    ros::Time gcs_link_first_unhealthy_at_;       // healthy→false 边沿时刻(grace 计时起点)
+    bool gcs_link_in_grace_ = false;              // 当前是否在 grace 期内
+    double offboard_takeover_prestream_sec_ = 1.0;
+    double offboard_takeover_min_altitude_m_ = 1.5;
+    bool posctl_taskflow_takeover_enabled_ = true;
+
     // === Attack(105) 多机协同参数 ===
     double      attack_safety_margin_m_         = 3.0;   // 协同:每架距目标保留距离
     double      attack_close_range_threshold_m_ = 5.0;   // 协同:UAV 已近时 attack_point = 当前位置
@@ -1017,6 +1039,16 @@ public:
         nh_private_.param<double>("world_ref_lat", world_ref_lat_, 36.058);
         nh_private_.param<double>("world_ref_lon", world_ref_lon_, 114.549);
         nh_private_.param<double>("world_ref_alt", world_ref_alt_, 75.0);
+        nh_private_.param<bool>("gcs_lost_return_enabled", gcs_lost_return_enabled_, false);
+        nh_private_.param<double>("gcs_lost_return_latitude", gcs_lost_return_latitude_, 0.0);
+        nh_private_.param<double>("gcs_lost_return_longitude", gcs_lost_return_longitude_, 0.0);
+        nh_private_.param<double>("gcs_lost_return_altitude_m", gcs_lost_return_altitude_m_, 20.0);
+        nh_private_.param<double>("gcs_lost_return_radius_m", gcs_lost_return_radius_m_, 3.0);
+        // === 2026-09-13: GS 失联 grace(秒),见 gcs_lost_grace_sec_ 默认值 ===
+        nh_private_.param<double>("gcs_lost_grace_sec", gcs_lost_grace_sec_, 120.0);
+        nh_private_.param<bool>("posctl_taskflow_takeover_enabled", posctl_taskflow_takeover_enabled_, true);
+        nh_private_.param<double>("offboard_takeover_prestream_sec", offboard_takeover_prestream_sec_, 1.0);
+        nh_private_.param<double>("offboard_takeover_min_altitude_m", offboard_takeover_min_altitude_m_, 1.5);
         // 单机自动模式:默认 true → home 到位后把 world_ref 覆盖成本机 home,
         //   使 x/y offset=0,单机永远在原点;多机 launch 设 false 并注入共享 world_ref。
         nh_private_.param<bool>("world_ref_auto", world_ref_auto_, true);
@@ -1248,6 +1280,8 @@ public:
         // TaskFlow 入口(本机 device_id 匹配的 flow 才会被采纳)
         task_flow_sub_ = nh_.subscribe("mission/task_flow", 10,
                                        &MissionManager::taskFlowCallback, this);
+        gcs_link_state_sub_ = nh_.subscribe("tzs/gcs_link_state", 10,
+                                            &MissionManager::gcsLinkStateCallback, this);
 
         // 类型化 WorkMode(GS 升级到 typed 时启用,与 String 模式并存双订阅)
         work_mode_sub_ = nh_.subscribe("mission/work_mode", 10,
@@ -1919,6 +1953,143 @@ public:
                  is_catapult_takeoff_ ? "true" : "false");
     }
 
+    void gcsLinkStateCallback(const std_msgs::Bool::ConstPtr& msg) {
+        const bool was_healthy = gcs_link_healthy_;
+        gcs_link_healthy_ = msg->data;
+        if (msg->data) {
+            gcs_link_ever_seen_ = true;
+            // === 2026-09-13: GS 恢复 — 清 grace 期,不退出返航(等新 TaskFlow) ===
+            gcs_link_in_grace_ = false;
+            gcs_link_first_unhealthy_at_ = ros::Time();  // reset
+            if (!was_healthy) {
+                ROS_WARN("[MissionManager] GCS link connected%s",
+                         gcs_lost_return_active_ ? "; keep return-point HOLD until a new TaskFlow" : "");
+            }
+            return;
+        }
+
+        // === healthy→false 边沿 ===
+        if (was_healthy && gcs_link_ever_seen_) {
+            // grace < 0: 完全关闭返航触发(老行为禁用)
+            if (gcs_lost_grace_sec_ < 0.0) {
+                ROS_WARN("[MissionManager] GCS heartbeat unhealthy; grace=%.1fs (<0), "
+                         "suppress return trigger", gcs_lost_grace_sec_);
+                return;
+            }
+            // grace == 0: 立即触发(老行为)
+            if (gcs_lost_grace_sec_ == 0.0) {
+                ROS_ERROR("[MissionManager] GCS heartbeat lost (grace=0, immediate)");
+                startGcsLostReturn();
+                return;
+            }
+            // grace > 0: 进入 grace 期,等主循环判定超时再触发
+            gcs_link_in_grace_ = true;
+            gcs_link_first_unhealthy_at_ = ros::Time::now();
+            ROS_WARN("[MissionManager] GCS heartbeat unhealthy; starting %.1fs grace "
+                     "before return trigger (GCS may recover)",
+                     gcs_lost_grace_sec_);
+        }
+    }
+
+    bool isPhysicallyAirborne() const {
+        return current_mavros_state_.armed && is_pose_received_ &&
+               (-current_pose_.pose.position.z) >= offboard_takeover_min_altitude_m_;
+    }
+
+    void startGcsLostReturn() {
+        if (!gcs_lost_return_enabled_ || gcs_lost_return_active_) return;
+        if (!is_px4_connected_ || !isPhysicallyAirborne()) {
+            ROS_WARN("[MissionManager] GCS-loss return not entered: connected=%d armed=%d altitude=%.2f",
+                     is_px4_connected_ ? 1 : 0, current_mavros_state_.armed ? 1 : 0,
+                     is_pose_received_ ? -current_pose_.pose.position.z : NAN);
+            return;
+        }
+        if (!ref_initialized_) {
+            ROS_ERROR("[MissionManager] GCS-loss return disabled for this event: PX4 Home not initialized");
+            return;
+        }
+        // === 2026-09-13: Home fallback ===
+        //   用户没配 gcs_lost_return_lat/lon (0,0) → 默认飞回 PX4 Home,
+        //   这是最自然的"返航"语义,免得强制用户填 GPS。
+        //   配了非 0 仍走配置固定点 (老行为,适合"集合点"场景)。
+        if (gcs_lost_return_latitude_ == 0.0 && gcs_lost_return_longitude_ == 0.0) {
+            gcs_lost_return_latitude_ = ref_lat_;
+            gcs_lost_return_longitude_ = ref_lon_;
+            ROS_WARN("[MissionManager] GCS-loss return: no configured GPS, using PX4 Home (%.7f, %.7f)",
+                     ref_lat_, ref_lon_);
+        }
+        if (current_mavros_state_.mode == "AUTO.LAND" || current_mavros_state_.mode == "AUTO.RTL") {
+            ROS_WARN("[MissionManager] GCS-loss return ignored while PX4 mode=%s",
+                     current_mavros_state_.mode.c_str());
+            return;
+        }
+
+        // === 2026-09-13: 预清理旧 setpoint 源(避免 TRACK/STRIKE → Return 期间打架) ===
+        //   背景:taskFlowCallback 内部 pushCurrentSkillToExecutor (L2646) 在
+        //   disableGuidance (L2683-2722) 之前 — 直接调 callback 会让
+        //   waypoint_executor 收到 Skill msg 比 guidance_control_node 收到 disable msg
+        //   更早,中间有几 ms 重叠。
+        //   而且 UAV 可能在 TAKEOFF/HOVERING 期间触发 (setpoint_thread 在跑)。
+        //   修法:这里手动先停 guidance + mission_manager setpoint,确保后续 callback
+        //   注入的 waypoint_executor 是唯一 setpoint 来源。
+        if (is_guidance_active_) {
+            ROS_WARN("[MissionManager] GCS-loss return: disabling residual guidance (was in TRACK/STRIKE)");
+            disableGuidance();
+        }
+        if (setpoint_running_) {
+            ROS_WARN("[MissionManager] GCS-loss return: stopping mission_manager setpoint_thread");
+            stopSetpointPublisher();
+        }
+
+        // === 构造合成 Return skill (skill_type=103) TaskFlow,直接调 taskFlowCallback 注入 ===
+        //   复用现有 Return skill → triggerPx4Landing() 流程:
+        //     飞回 → waypoint_executor ARRIVE→COMPLETE → triggerPx4Landing → AUTO.LAND
+        //   走 waypoint (避障) + 自动降落,跟 GS 主动下发的 Return 行为一致。
+        multi_uav_strike::TaskFlow::Ptr synthetic(new multi_uav_strike::TaskFlow());
+        synthetic->flow_id  = "synthetic-return-" + std::to_string(ros::Time::now().sec);
+        synthetic->issued_at_us = ros::Time::now().toNSec() / 1000;
+        synthetic->device_id = self_device_id_;
+
+        multi_uav_strike::Skill ret;
+        ret.skill_id    = "synthetic-return";
+        ret.skill_type  = 103;       // Return
+        ret.priority    = 90;        // 与正常 Return 一致
+        ret.cruise_speed = 8.0f;     // 返航速度,后续可加 yaml 参数
+        ret.task_speed   = 8.0f;
+        ret.formation   = 0;
+        ret.gimbal_pitch = 0.0f;
+        ret.target_type  = 0;
+
+        // arrive_path: 1 个 waypoint (Home / rally point 上方 gcs_lost_return_altitude_m)
+        geometry_msgs::PoseStamped wp;
+        wp.header.frame_id = "";
+        wp.pose.position.x = gcs_lost_return_latitude_;   // waypoint_executor 按字段名 lat
+        wp.pose.position.y = gcs_lost_return_longitude_;  // waypoint_executor 按字段名 lon
+        wp.pose.position.z = gcs_lost_return_altitude_m_;
+        wp.pose.orientation.w = 1.0;
+        ret.arrive_path.poses.push_back(wp);
+        // skill_area_path 留空 → advanceSegmentPhase() 走 L2469-2471
+        //   "ARRIVE + skill_area empty → COMPLETE" 直接路径
+
+        synthetic->skills.push_back(ret);
+
+        ROS_ERROR("[MissionManager] GCS-loss return ACTIVE: injecting synthetic Return skill, "
+                  "target=(%.7f, %.7f), alt=%.1fm, flow_id=%s",
+                  gcs_lost_return_latitude_, gcs_lost_return_longitude_,
+                  gcs_lost_return_altitude_m_, synthetic->flow_id.c_str());
+
+        // taskFlowCallback 内部 L2216-2220 会清 gcs_lost_return_active_,
+        // 必须放到 callback 之后再置位 (见下方)。
+        taskFlowCallback(synthetic);
+
+        // === callback 后再置位 flag — 让 missionTimerCallback 早退 (L5008-5012),
+        //     阻止 work_mode search/track handler 在 Return ARRIVE 飞行期间并行干扰。
+        //   triggerPx4Landing() 在 Return COMPLETE 时会再清这个 flag,
+        //   移交到 phase=PHASE_RETURNING 由状态机自身 gating。
+        gcs_lost_return_active_ = true;
+        gcs_lost_return_arrived_ = false;
+    }
+
     /**
      * Whether UAV is currently in flight (used to reject takeoff task_flow while airborne)
      * Ground states (return false): GROUND_IDLE / FAILED / HOLDING
@@ -1960,6 +2131,56 @@ public:
         if (msg->device_id != 0 && msg->device_id != self_device_id_) {
             return;
         }
+        if (msg->skills.empty()) {
+            ROS_ERROR("[MissionManager] REJECT empty TaskFlow id=%s", msg->flow_id.c_str());
+            return;
+        }
+
+        // === 2026-09-09: PHASE_FAILED 状态下的新 TaskFlow 自动 reset ===
+        //   触发场景:上一条任务以 phase=FAILED 收尾(弹射 vtol_state 超时 / OFFBOARD 接管
+        //     5min 超时 / 其它 mission 端兜不住的失败),GS 重发新任务期望重新起飞。
+        //   原 bug:runPx4TakeoffSequence line 4790-4792 起飞守卫把 PHASE_FAILED 排除在外
+        //     (只允许 TAKING_OFF / HOVERING / HOLDING),新 task_flow 入队后起飞守卫 return,
+        //     triggerOffboardAndArm 永远不会跑 → 飞机一直停在 FAILED,GS 怎么发技能都没用。
+        //   修法:跟现有 is_landing_in_progress_ reset(line 2129-2135)对齐 ——
+        //     新 TaskFlow 到达 → phase 重置为 GROUND_IDLE → 起飞守卫放行 → 正常接管序列。
+        //   注意:takeoff_state_ 不在这里清 — 后面 L2379 守卫("非 IDLE 就 reset")
+        //     会接手把 takeoff_state_=IDLE + retry/failed 标志清零。
+        if (current_phase_ == MissionPhase::PHASE_FAILED) {
+            // 打印 PX4 实时状态 + 位置高度,方便 rosout 排查"上次为什么 FAILED"——
+            //   用户口径"担心 reset 连带产生其他问题",日志里能看到 reset 前一刻 PX4
+            //   mode / armed / 高度,事后回溯可区分三种 FAILED 入口(弹射 60s / OFFBOARD 5min
+            //   / 爬升 60s)和 reset 时机是否合理。
+            const double alt_enu = (current_pose_.header.stamp.isZero() || !is_pose_received_)
+                                      ? NAN
+                                      : -current_pose_.pose.position.z;
+            ROS_WARN("[MissionManager] New TaskFlow during PHASE_FAILED — resetting to "
+                     "PHASE_GROUND_IDLE for fresh takeoff "
+                     "(flow_id=%s, prev_px4_mode=%s, prev_armed=%d, prev_alt_enu=%.2f m, "
+                     "takeoff_state=%s, vtol_state=%u, has_task_flow=%d)",
+                     msg->flow_id.c_str(),
+                     current_mavros_state_.mode.c_str(),
+                     current_mavros_state_.armed ? 1 : 0,
+                     alt_enu,
+                     [&]() -> const char* {
+                         switch (takeoff_state_) {
+                             case TakeoffState::TAKEOFF_IDLE:               return "IDLE";
+                             case TakeoffState::TAKEOFF_CATAPULT_ARMED:     return "CATAPULT_ARMED";
+                             case TakeoffState::TAKEOFF_CATAPULT_TRIGGERED: return "CATAPULT_TRIGGERED";
+                             case TakeoffState::TAKEOFF_CATAPULT_POSCTL:    return "CATAPULT_POSCTL";
+                             case TakeoffState::TAKEOFF_WAITING_FCU:        return "WAITING_FCU";
+                             case TakeoffState::TAKEOFF_SETTING_OFFBOARD:   return "SETTING_OFFBOARD";
+                             case TakeoffState::TAKEOFF_TAKEOFF_EXEC:       return "TAKEOFF_EXEC";
+                             case TakeoffState::TAKEOFF_HOVERING:           return "HOVERING";
+                             case TakeoffState::TAKEOFF_COMPLETE:           return "COMPLETE";
+                             case TakeoffState::TAKEOFF_FAILED:             return "FAILED";
+                             default:                                       return "UNKNOWN";
+                         }
+                     }(),
+                     static_cast<unsigned>(current_vtol_state_),
+                     has_task_flow_ ? 1 : 0);
+            current_phase_ = MissionPhase::PHASE_GROUND_IDLE;
+        }
 
         // === 2026-08-20: 新 TaskFlow 到达 → 清 gimbal angle latch ===
         //   用户口径:GS 发 angle → 保持到下次状态切换;新 task_flow 是切换信号。
@@ -1987,13 +2208,63 @@ public:
         }
         //===================制导修改====================
 
+        // 空中 POSCTL 收到有效技能流时，由当前位置 setpoint 先建立 OFFBOARD 输入流，
+        // 再请求模式切换。确认成功后才继续接纳任务，避免“先切模式、后发 setpoint”的空窗。
+        // === 2026-09-13: 扩展接管场景 — UAV 已被外部控制起飞,phase 仍 GROUND_IDLE ===
+        //   触发场景:PX4 AUTO.TAKEOFF / RC / 飞手 等让 UAV 在 AUTO.LOITER/ALTCTL/STABILIZED
+        //   等模式下悬停,mission_manager 还停在 PHASE_GROUND_IDLE。原 guard 只接 POSCTL,
+        //   导致 AUTO.LOITER 等模式下 TaskFlow 进了 skill 队列但 phase 永远不切,
+        //   setpoint publisher 不启动,UAV 不接管 OFFBOARD,任务静默失败。
+        //   修法:GROUND_IDLE + 物理在空中 + mode 非 OFFBOARD/AUTO.LAND/AUTO.RTL/
+        //   AUTO.TAKEOFF/AUTO.PRECLAND 时也走同一套接管流程。
+        //   - 路径 B (need_takeback_offboard, ~L2309) 仍覆盖 HOLDING/RETURNING/is_fcu_overridden_
+        //   - PHASE_TAKING_OFF/HOVERING 说明 mission_manager 自己正在接管,不应覆盖
+        //   - PHASE_FAILED 等"已结束"状态由路径 B 处理
+        const bool physical_airborne = isPhysicallyAirborne();
+        const bool px4_mode_takeover_safe =
+            current_mavros_state_.mode != "OFFBOARD" &&
+            current_mavros_state_.mode != "AUTO.LAND" &&
+            current_mavros_state_.mode != "AUTO.RTL" &&
+            current_mavros_state_.mode != "AUTO.TAKEOFF" &&
+            current_mavros_state_.mode != "AUTO.PRECLAND";
+        if (posctl_taskflow_takeover_enabled_ && physical_airborne &&
+            current_phase_ == MissionPhase::PHASE_GROUND_IDLE &&
+            px4_mode_takeover_safe) {
+            ROS_WARN("[MissionManager] UAV airborne externally (mode=%s, phase=GROUND_IDLE); "
+                     "TaskFlow id=%s triggering OFFBOARD takeover (prestream %.1fs)",
+                     current_mavros_state_.mode.c_str(), msg->flow_id.c_str(),
+                     offboard_takeover_prestream_sec_);
+            current_phase_ = MissionPhase::PHASE_HOLDING;
+            if (!setpoint_running_) startSetpointPublisher();
+            takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
+            ros::Duration(std::max(0.2, offboard_takeover_prestream_sec_)).sleep();
+            suppress_recovery_ = true;
+            const bool ok = setMode("OFFBOARD");
+            suppress_recovery_ = false;
+            if (!ok) {
+                ROS_ERROR("[MissionManager] OFFBOARD takeover failed (mode=%s); TaskFlow id=%s rejected",
+                          current_mavros_state_.mode.c_str(), msg->flow_id.c_str());
+                return;
+            }
+            is_fcu_overridden_ = false;
+            ROS_WARN("[MissionManager] OFFBOARD confirmed; accepting TaskFlow id=%s (was in external flight)",
+                     msg->flow_id.c_str());
+        }
+
+        // 新任务是唯一允许退出失联返航/到点悬停的信号，断线期间的旧任务不自动续跑。
+        if (gcs_lost_return_active_) {
+            gcs_lost_return_active_ = false;
+            gcs_lost_return_arrived_ = false;
+            ROS_WARN("[MissionManager] New TaskFlow cancels GCS-loss return hold");
+        }
+
         // === 弹射起飞 TaskFlow 验证(2026-08-16 重构) ===
         // 业务约束:
         //   (1) 只能在 PHASE_GROUND_IDLE 时接收(地面起飞路径是 106,这里是 100=弹射)
         //   (2) 必须有后置技能:101 Gather(集结) 或 102 Search(搜索),无后继或非 101/102 整条拒收
         //   (3) vtol_state 必须 == 2(PX4 等待弹射),否则 GS 必须先发 cmd=175 param1=1
         // 全部三个条件都满足才允许进入 skill_queue_;任一不满足 → ROS_ERROR + return
-        if (!msg->skills.empty() && msg->skills[0].skill_type == 100) {
+        if (!msg->skills.empty() && msg->skills[0].skill_type == 100 && !physical_airborne) {
             // (1) 地面检查
             if (current_phase_ != MissionPhase::PHASE_GROUND_IDLE) {
                 ROS_ERROR("[MissionManager] REJECT catapult TaskFlow id=%s: not on ground "
@@ -2099,7 +2370,7 @@ public:
         //   (我们刚把 OVERRIDDEN 算成 in-flight),此时 GS 发 [Takeoff] 会被错误剥掉,而飞机其实
         //   在地上 disarmed,必须执行 takeoff。加上 armed 检查后:disarm 状态下无论 phase 是什么,
         //   takeoff 都正常执行(地面起飞流程:arm + 爬升)。
-        bool uav_airborne = isInFlight() && current_mavros_state_.armed;
+        bool uav_airborne = (isInFlight() && current_mavros_state_.armed) || physical_airborne;
         bool strip_leading_takeoff = false;
         if (!msg->skills.empty() &&
             (msg->skills[0].skill_type == 100 || msg->skills[0].skill_type == 106) &&
@@ -4743,6 +5014,24 @@ public:
             return;
         }
 
+        // === 2026-09-13: GS 失联 grace 超时 → 触发返航 ===
+        //   收到 healthy→false 后进入 grace 期,主循环每 tick 检查是否超时。
+        //   超时后才调 startGcsLostReturn()(走原有的 5 闸检查)。
+        //   grace 期内 GS 恢复 → callback 里清 gcs_link_in_grace_,这里不会触发。
+        //   注:不再调 updateGcsLostReturn() — 返航已改走 Return skill
+        //   (waypoint_executor 抵达后由 advanceSegmentPhase 走 COMPLETE,
+        //    然后 mission_manager 调 triggerPx4Landing AUTO.LAND 落地)。
+        if (gcs_link_in_grace_ && !gcs_lost_return_active_) {
+            const double unhealthy_sec =
+                (ros::Time::now() - gcs_link_first_unhealthy_at_).toSec();
+            if (unhealthy_sec >= gcs_lost_grace_sec_) {
+                gcs_link_in_grace_ = false;
+                ROS_ERROR("[MissionManager] GCS grace %.1fs elapsed (unhealthy since %.1fs); "
+                          "triggering return", gcs_lost_grace_sec_, unhealthy_sec);
+                startGcsLostReturn();
+            }
+        }
+
         // PX4 SITL: 运行起飞状态机
         if (!use_sim_) {
             runPx4TakeoffSequence();
@@ -4753,6 +5042,12 @@ public:
             // === 返航落地监控 (必须在 isTakeoffComplete 早 return 之后调用,避免落地检查被卡) ===
             // 正常情况下 AUTO.LAND 流程中 takeoff_state_ 仍是 COMPLETE,这里能跑到
             checkLandingComplete();
+        }
+
+        if (gcs_lost_return_active_) {
+            // 失联期间冻结旧 TaskFlow；只维持固定返航点/到点悬停，不再运行搜索、跟踪或打击逻辑。
+            publishStatus();
+            return;
         }
 
         // 检查急停条件（毫米波雷达）
@@ -4797,7 +5092,7 @@ public:
             //     AUTO.LAND failsafe(2026-07-26 修复:用 attack_hover_setpoint_latched_ 标记
             //     豁免,Attack EXIT_PENDING 路径会清标志并停 publisher)。
             if (setpoint_running_ && !attack_hover_setpoint_latched_ &&
-                !waiting_for_waypoint_velocity_handoff_) {
+                !waiting_for_waypoint_velocity_handoff_ && !gcs_lost_return_active_) {
                 stopSetpointPublisher();
             }
             // 注意:不再重置 takeoff_state_。phase=WAYPOINT_FOLLOW/HOLDING 时 takeoff_state_=COMPLETE
@@ -5495,6 +5790,14 @@ public:
         landing_complete_logged_     = false;
         current_phase_               = MissionPhase::PHASE_RETURNING;
 
+        // 2026-09-13:清 gcs_lost_return_active_,mission_manager 接手控制。
+        //   startGcsLostReturn() 把这个 flag 置位是为了让 missionTimerCallback
+        //   早退阻止 work_mode search/track handler 在返航 ARRIVE 期间并行干扰。
+        //   现在 phase=PHASE_RETURNING,主循环的 work_mode gate 改由状态机自身
+        //   负责 (advanceSkillStateMachine / 搜索/跟踪 handler 各自的 phase 守卫),
+        //   这个 flag 完成使命清掉避免泄漏。
+        gcs_lost_return_active_      = false;
+
         ROS_WARN("[MissionManager] ===== Return-skill  PX4 AUTO.LAND triggered =====");
 
         // 1. 停 waypoint_executor (AUTO.LAND 接管水平位置 + 下降率,executor 不应再发速度)
@@ -5682,6 +5985,7 @@ public:
                     current_phase_ == MissionPhase::PHASE_TAKING_OFF ||
                     current_phase_ == MissionPhase::PHASE_HOVERING ||
                     current_phase_ == MissionPhase::PHASE_HOLDING ||
+                    gcs_lost_return_active_ ||
                     waiting_for_waypoint_velocity_handoff_ ||
                     strike_yaw_align_pending_;  // 2026-08-19 Fix A1
                 const bool armed = use_sim_ || current_mavros_state_.armed;
