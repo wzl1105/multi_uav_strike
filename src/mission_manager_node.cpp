@@ -870,6 +870,13 @@ private:
     double gcs_lost_return_longitude_ = 0.0;
     double gcs_lost_return_altitude_m_ = 20.0;  // 相对 PX4 Home 的 ENU 高度
     double gcs_lost_return_radius_m_ = 3.0;
+    // === 2026-09-13: GS 失联 grace 计时 ===
+    //   starling_bridge KCP 6s 心跳周期内 tick1s publish tzs/gcs_link_state,
+    //   应用层额外等 gcs_lost_grace_sec_ 才真正触发返航 — 给 GS 短抖重连留余量。
+    //   0 = 老行为(收到 false 立即触发);负数 = 关闭 grace(永远不触发)。
+    double gcs_lost_grace_sec_ = 120.0;          // 默认 2 分钟
+    ros::Time gcs_link_first_unhealthy_at_;       // healthy→false 边沿时刻(grace 计时起点)
+    bool gcs_link_in_grace_ = false;              // 当前是否在 grace 期内
     double offboard_takeover_prestream_sec_ = 1.0;
     double offboard_takeover_min_altitude_m_ = 1.5;
     bool posctl_taskflow_takeover_enabled_ = true;
@@ -1037,6 +1044,8 @@ public:
         nh_private_.param<double>("gcs_lost_return_longitude", gcs_lost_return_longitude_, 0.0);
         nh_private_.param<double>("gcs_lost_return_altitude_m", gcs_lost_return_altitude_m_, 20.0);
         nh_private_.param<double>("gcs_lost_return_radius_m", gcs_lost_return_radius_m_, 3.0);
+        // === 2026-09-13: GS 失联 grace(秒),见 gcs_lost_grace_sec_ 默认值 ===
+        nh_private_.param<double>("gcs_lost_grace_sec", gcs_lost_grace_sec_, 120.0);
         nh_private_.param<bool>("posctl_taskflow_takeover_enabled", posctl_taskflow_takeover_enabled_, true);
         nh_private_.param<double>("offboard_takeover_prestream_sec", offboard_takeover_prestream_sec_, 1.0);
         nh_private_.param<double>("offboard_takeover_min_altitude_m", offboard_takeover_min_altitude_m_, 1.5);
@@ -1949,6 +1958,9 @@ public:
         gcs_link_healthy_ = msg->data;
         if (msg->data) {
             gcs_link_ever_seen_ = true;
+            // === 2026-09-13: GS 恢复 — 清 grace 期,不退出返航(等新 TaskFlow) ===
+            gcs_link_in_grace_ = false;
+            gcs_link_first_unhealthy_at_ = ros::Time();  // reset
             if (!was_healthy) {
                 ROS_WARN("[MissionManager] GCS link connected%s",
                          gcs_lost_return_active_ ? "; keep return-point HOLD until a new TaskFlow" : "");
@@ -1956,9 +1968,26 @@ public:
             return;
         }
 
+        // === healthy→false 边沿 ===
         if (was_healthy && gcs_link_ever_seen_) {
-            ROS_ERROR("[MissionManager] GCS heartbeat lost");
-            startGcsLostReturn();
+            // grace < 0: 完全关闭返航触发(老行为禁用)
+            if (gcs_lost_grace_sec_ < 0.0) {
+                ROS_WARN("[MissionManager] GCS heartbeat unhealthy; grace=%.1fs (<0), "
+                         "suppress return trigger", gcs_lost_grace_sec_);
+                return;
+            }
+            // grace == 0: 立即触发(老行为)
+            if (gcs_lost_grace_sec_ == 0.0) {
+                ROS_ERROR("[MissionManager] GCS heartbeat lost (grace=0, immediate)");
+                startGcsLostReturn();
+                return;
+            }
+            // grace > 0: 进入 grace 期,等主循环判定超时再触发
+            gcs_link_in_grace_ = true;
+            gcs_link_first_unhealthy_at_ = ros::Time::now();
+            ROS_WARN("[MissionManager] GCS heartbeat unhealthy; starting %.1fs grace "
+                     "before return trigger (GCS may recover)",
+                     gcs_lost_grace_sec_);
         }
     }
 
@@ -1975,10 +2004,19 @@ public:
                      is_pose_received_ ? -current_pose_.pose.position.z : NAN);
             return;
         }
-        if (!ref_initialized_ || gcs_lost_return_latitude_ == 0.0 ||
-            gcs_lost_return_longitude_ == 0.0) {
-            ROS_ERROR("[MissionManager] GCS-loss return disabled for this event: Home or configured return GPS invalid");
+        if (!ref_initialized_) {
+            ROS_ERROR("[MissionManager] GCS-loss return disabled for this event: PX4 Home not initialized");
             return;
+        }
+        // === 2026-09-13: Home fallback ===
+        //   用户没配 gcs_lost_return_lat/lon (0,0) → 默认飞回 PX4 Home,
+        //   这是最自然的"返航"语义,免得强制用户填 GPS。
+        //   配了非 0 仍走配置固定点 (老行为,适合"集合点"场景)。
+        if (gcs_lost_return_latitude_ == 0.0 && gcs_lost_return_longitude_ == 0.0) {
+            gcs_lost_return_latitude_ = ref_lat_;
+            gcs_lost_return_longitude_ = ref_lon_;
+            ROS_WARN("[MissionManager] GCS-loss return: no configured GPS, using PX4 Home (%.7f, %.7f)",
+                     ref_lat_, ref_lon_);
         }
         if (current_mavros_state_.mode == "AUTO.LAND" || current_mavros_state_.mode == "AUTO.RTL") {
             ROS_WARN("[MissionManager] GCS-loss return ignored while PX4 mode=%s",
@@ -1986,49 +2024,70 @@ public:
             return;
         }
 
-        std_msgs::String stop_cmd;
-        stop_cmd.data = "stop";
-        waypoint_control_pub_.publish(stop_cmd);
-        disableGuidance();
+        // === 2026-09-13: 预清理旧 setpoint 源(避免 TRACK/STRIKE → Return 期间打架) ===
+        //   背景:taskFlowCallback 内部 pushCurrentSkillToExecutor (L2646) 在
+        //   disableGuidance (L2683-2722) 之前 — 直接调 callback 会让
+        //   waypoint_executor 收到 Skill msg 比 guidance_control_node 收到 disable msg
+        //   更早,中间有几 ms 重叠。
+        //   而且 UAV 可能在 TAKEOFF/HOVERING 期间触发 (setpoint_thread 在跑)。
+        //   修法:这里手动先停 guidance + mission_manager setpoint,确保后续 callback
+        //   注入的 waypoint_executor 是唯一 setpoint 来源。
+        if (is_guidance_active_) {
+            ROS_WARN("[MissionManager] GCS-loss return: disabling residual guidance (was in TRACK/STRIKE)");
+            disableGuidance();
+        }
+        if (setpoint_running_) {
+            ROS_WARN("[MissionManager] GCS-loss return: stopping mission_manager setpoint_thread");
+            stopSetpointPublisher();
+        }
+
+        // === 构造合成 Return skill (skill_type=103) TaskFlow,直接调 taskFlowCallback 注入 ===
+        //   复用现有 Return skill → triggerPx4Landing() 流程:
+        //     飞回 → waypoint_executor ARRIVE→COMPLETE → triggerPx4Landing → AUTO.LAND
+        //   走 waypoint (避障) + 自动降落,跟 GS 主动下发的 Return 行为一致。
+        multi_uav_strike::TaskFlow::Ptr synthetic(new multi_uav_strike::TaskFlow());
+        synthetic->flow_id  = "synthetic-return-" + std::to_string(ros::Time::now().sec);
+        synthetic->issued_at_us = ros::Time::now().toNSec() / 1000;
+        synthetic->device_id = self_device_id_;
+
+        multi_uav_strike::Skill ret;
+        ret.skill_id    = "synthetic-return";
+        ret.skill_type  = 103;       // Return
+        ret.priority    = 90;        // 与正常 Return 一致
+        ret.cruise_speed = 8.0f;     // 返航速度,后续可加 yaml 参数
+        ret.task_speed   = 8.0f;
+        ret.formation   = 0;
+        ret.gimbal_pitch = 0.0f;
+        ret.target_type  = 0;
+
+        // arrive_path: 1 个 waypoint (Home / rally point 上方 gcs_lost_return_altitude_m)
+        geometry_msgs::PoseStamped wp;
+        wp.header.frame_id = "";
+        wp.pose.position.x = gcs_lost_return_latitude_;   // waypoint_executor 按字段名 lat
+        wp.pose.position.y = gcs_lost_return_longitude_;  // waypoint_executor 按字段名 lon
+        wp.pose.position.z = gcs_lost_return_altitude_m_;
+        wp.pose.orientation.w = 1.0;
+        ret.arrive_path.poses.push_back(wp);
+        // skill_area_path 留空 → advanceSegmentPhase() 走 L2469-2471
+        //   "ARRIVE + skill_area empty → COMPLETE" 直接路径
+
+        synthetic->skills.push_back(ret);
+
+        ROS_ERROR("[MissionManager] GCS-loss return ACTIVE: injecting synthetic Return skill, "
+                  "target=(%.7f, %.7f), alt=%.1fm, flow_id=%s",
+                  gcs_lost_return_latitude_, gcs_lost_return_longitude_,
+                  gcs_lost_return_altitude_m_, synthetic->flow_id.c_str());
+
+        // taskFlowCallback 内部 L2216-2220 会清 gcs_lost_return_active_,
+        // 必须放到 callback 之后再置位 (见下方)。
+        taskFlowCallback(synthetic);
+
+        // === callback 后再置位 flag — 让 missionTimerCallback 早退 (L5008-5012),
+        //     阻止 work_mode search/track handler 在 Return ARRIVE 飞行期间并行干扰。
+        //   triggerPx4Landing() 在 Return COMPLETE 时会再清这个 flag,
+        //   移交到 phase=PHASE_RETURNING 由状态机自身 gating。
         gcs_lost_return_active_ = true;
         gcs_lost_return_arrived_ = false;
-        current_phase_ = MissionPhase::PHASE_RETURNING;
-
-        if (!setpoint_running_) startSetpointPublisher();
-        takeoff_setpoint_.pose.position.x = gpsDeltaE(ref_lon_, gcs_lost_return_longitude_, ref_lat_);
-        takeoff_setpoint_.pose.position.y = gpsDeltaN(ref_lat_, gcs_lost_return_latitude_);
-        takeoff_setpoint_.pose.position.z = gcs_lost_return_altitude_m_;
-
-        if (current_mavros_state_.mode != "OFFBOARD") {
-            ros::Duration(std::max(0.2, offboard_takeover_prestream_sec_)).sleep();
-            suppress_recovery_ = true;
-            const bool ok = setMode("OFFBOARD");
-            suppress_recovery_ = false;
-            if (!ok) {
-                ROS_ERROR("[MissionManager] GCS-loss return failed to enter OFFBOARD; retaining current PX4 mode");
-                gcs_lost_return_active_ = false;
-                current_phase_ = MissionPhase::PHASE_OVERRIDDEN;
-                return;
-            }
-        }
-        ROS_ERROR("[MissionManager] GCS-loss return ACTIVE: target=(%.7f, %.7f), home-relative altitude=%.1fm, radius=%.1fm",
-                  gcs_lost_return_latitude_, gcs_lost_return_longitude_,
-                  gcs_lost_return_altitude_m_, gcs_lost_return_radius_m_);
-        publishMissionState();
-    }
-
-    void updateGcsLostReturn() {
-        if (!gcs_lost_return_active_ || gcs_lost_return_arrived_ || !is_gps_received_) return;
-        const double distance = std::hypot(
-            gpsDeltaN(current_gps_.latitude, gcs_lost_return_latitude_),
-            gpsDeltaE(current_gps_.longitude, gcs_lost_return_longitude_, current_gps_.latitude));
-        ROS_WARN_THROTTLE(2.0, "[MissionManager] GCS-loss return: %.1fm remaining", distance);
-        if (distance <= gcs_lost_return_radius_m_) {
-            gcs_lost_return_arrived_ = true;
-            current_phase_ = MissionPhase::PHASE_HOLDING;
-            ROS_ERROR("[MissionManager] GCS-loss return point reached (%.1fm); holding configured position", distance);
-            publishMissionState();
-        }
     }
 
     /**
@@ -4936,8 +4995,23 @@ public:
             return;
         }
 
-        // 地面站失联返航拥有高于普通任务状态机的优先级；到点后保持同一位置 setpoint。
-        updateGcsLostReturn();
+        // === 2026-09-13: GS 失联 grace 超时 → 触发返航 ===
+        //   收到 healthy→false 后进入 grace 期,主循环每 tick 检查是否超时。
+        //   超时后才调 startGcsLostReturn()(走原有的 5 闸检查)。
+        //   grace 期内 GS 恢复 → callback 里清 gcs_link_in_grace_,这里不会触发。
+        //   注:不再调 updateGcsLostReturn() — 返航已改走 Return skill
+        //   (waypoint_executor 抵达后由 advanceSegmentPhase 走 COMPLETE,
+        //    然后 mission_manager 调 triggerPx4Landing AUTO.LAND 落地)。
+        if (gcs_link_in_grace_ && !gcs_lost_return_active_) {
+            const double unhealthy_sec =
+                (ros::Time::now() - gcs_link_first_unhealthy_at_).toSec();
+            if (unhealthy_sec >= gcs_lost_grace_sec_) {
+                gcs_link_in_grace_ = false;
+                ROS_ERROR("[MissionManager] GCS grace %.1fs elapsed (unhealthy since %.1fs); "
+                          "triggering return", gcs_lost_grace_sec_, unhealthy_sec);
+                startGcsLostReturn();
+            }
+        }
 
         // PX4 SITL: 运行起飞状态机
         if (!use_sim_) {
@@ -5696,6 +5770,14 @@ public:
         landing_start_time_          = ros::Time::now();
         landing_complete_logged_     = false;
         current_phase_               = MissionPhase::PHASE_RETURNING;
+
+        // 2026-09-13:清 gcs_lost_return_active_,mission_manager 接手控制。
+        //   startGcsLostReturn() 把这个 flag 置位是为了让 missionTimerCallback
+        //   早退阻止 work_mode search/track handler 在返航 ARRIVE 期间并行干扰。
+        //   现在 phase=PHASE_RETURNING,主循环的 work_mode gate 改由状态机自身
+        //   负责 (advanceSkillStateMachine / 搜索/跟踪 handler 各自的 phase 守卫),
+        //   这个 flag 完成使命清掉避免泄漏。
+        gcs_lost_return_active_      = false;
 
         ROS_WARN("[MissionManager] ===== Return-skill  PX4 AUTO.LAND triggered =====");
 
