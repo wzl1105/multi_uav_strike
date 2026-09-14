@@ -57,6 +57,9 @@
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/CommandLong.h>
 #include <mavros_msgs/HomePosition.h>
+//===========rc识别=============
+#include <mavros_msgs/RCIn.h>
+//===========rc识别=============
 #include <tf/transform_datatypes.h> // 用于RPY转四元数
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -349,6 +352,9 @@ private:
     ros::Subscriber guidance_velocity_active_sub_; // guidance 已实际发出速度的接管确认
     ros::Subscriber inter_uav_status_sub_; // 多机心跳(/inter_uav/uav_status) — 多机 gather 同步用
     ros::Subscriber gcs_link_state_sub_;   // starling_bridge KCP/GCS 链路健康状态
+    //===========rc识别=============
+    ros::Subscriber rc_in_sub_;            // 遥控器全程识别开关
+    //===========rc识别=============
 
     // ============== Service Client ==============
     ros::ServiceClient set_mode_client_; // PX4 SITL: 模式切换
@@ -359,6 +365,9 @@ private:
 
     // ============== PX4 起飞 ==============
     ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
+    //===========rc识别=============
+    ros::Publisher manual_recognition_pub_; // 给 target_estimator 的统一手动识别状态
+    //===========rc识别=============
     bool waiting_for_waypoint_velocity_handoff_ = false;
     bool waiting_for_guidance_velocity_handoff_ = false;
     // === 2026-08-25 fix: TRACK 锁目标时不 yield waypoint_executor,导致 chase
@@ -860,6 +869,19 @@ private:
     //   PX4 OFFBOARD 失流 failsafe。这个 latch 让闸门在那 1s 内保持 true。
     bool        strike_yaw_align_pending_         = false;
 
+    //===========rc识别=============
+    // 遥控器手动全程识别（只聚类和回传，不触发跟踪/打击）
+    bool manual_recognition_rc_enabled_ = true;
+    int manual_recognition_rc_channel_ = 8;       // 参数按遥控器编号从1开始
+    int manual_recognition_rc_on_pwm_ = 1700;
+    int manual_recognition_rc_off_pwm_ = 1300;
+    double manual_recognition_rc_timeout_sec_ = 1.0;
+    bool manual_recognition_active_ = false;
+    ros::Time last_rc_in_time_;
+    ros::Timer manual_recognition_watchdog_timer_;
+    std::unordered_map<uint64_t, ReportedTarget> manual_reported_clusters_;
+    //===========rc识别=============
+
     // ============== 地面站失联固定点返航 ==============
     bool gcs_lost_return_enabled_ = false;
     bool gcs_link_healthy_ = false;
@@ -1039,6 +1061,21 @@ public:
         nh_private_.param<double>("world_ref_lat", world_ref_lat_, 36.058);
         nh_private_.param<double>("world_ref_lon", world_ref_lon_, 114.549);
         nh_private_.param<double>("world_ref_alt", world_ref_alt_, 75.0);
+        //===========rc识别=============
+        nh_private_.param<bool>("manual_recognition_rc_enabled", manual_recognition_rc_enabled_, true);
+        nh_private_.param<int>("manual_recognition_rc_channel", manual_recognition_rc_channel_, 8);
+        nh_private_.param<int>("manual_recognition_rc_on_pwm", manual_recognition_rc_on_pwm_, 1700);
+        nh_private_.param<int>("manual_recognition_rc_off_pwm", manual_recognition_rc_off_pwm_, 1300);
+        nh_private_.param<double>("manual_recognition_rc_timeout_sec",
+                                  manual_recognition_rc_timeout_sec_, 1.0);
+        manual_recognition_rc_channel_ = std::max(1, manual_recognition_rc_channel_);
+        if (manual_recognition_rc_off_pwm_ >= manual_recognition_rc_on_pwm_) {
+            ROS_WARN("[MissionManager] manual recognition RC thresholds invalid (%d >= %d); using 1300/1700",
+                     manual_recognition_rc_off_pwm_, manual_recognition_rc_on_pwm_);
+            manual_recognition_rc_off_pwm_ = 1300;
+            manual_recognition_rc_on_pwm_ = 1700;
+        }
+        //===========rc识别=============
         nh_private_.param<bool>("gcs_lost_return_enabled", gcs_lost_return_enabled_, false);
         nh_private_.param<double>("gcs_lost_return_latitude", gcs_lost_return_latitude_, 0.0);
         nh_private_.param<double>("gcs_lost_return_longitude", gcs_lost_return_longitude_, 0.0);
@@ -1260,6 +1297,10 @@ public:
             mavros_state_sub_ = nh_.subscribe(
                 "mavros/state", 10,
                 &MissionManager::mavrosStateCallback, this);
+            //===========rc识别=============
+            rc_in_sub_ = nh_.subscribe("mavros/rc/in", 10,
+                                       &MissionManager::rcInCallback, this);
+            //===========rc识别=============
 
             // PX4 SITL: 模式切换 service client
             set_mode_client_ = nh_.serviceClient<mavros_msgs::SetMode>(
@@ -1380,6 +1421,14 @@ public:
         status_pub_ = nh_.advertise<std_msgs::String>(
             "mission/status", 10);
 
+        //===========rc识别=============
+        manual_recognition_pub_ = nh_.advertise<std_msgs::Bool>(
+            "recognition/manual_enable", 1, true);
+        std_msgs::Bool manual_initial;
+        manual_initial.data = false;
+        manual_recognition_pub_.publish(manual_initial);
+        //===========rc识别=============
+
         uav_pose_nwu_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "quad/pose_nwu", 10);  // NWU姿态发布(RViz用)
 
@@ -1445,6 +1494,11 @@ public:
         mission_timer_ = nh_.createTimer(
             ros::Duration(1.0 / mission_loop_rate_),
             &MissionManager::missionTimerCallback, this);
+
+        //===========rc识别=============
+        manual_recognition_watchdog_timer_ = nh_.createTimer(
+            ros::Duration(0.1), &MissionManager::manualRecognitionWatchdogCallback, this);
+        //===========rc识别=============
 
         // === Phase 2: MissionState 1Hz 定频上报 ===
         mission_state_timer_ = nh_.createTimer(
@@ -1926,6 +1980,55 @@ public:
             is_obstacle_detected_ = false;
         }
     }
+
+    //===========rc识别=============
+    void setManualRecognitionState(bool enabled, const char* reason, int pwm = -1) {
+        if (manual_recognition_active_ == enabled) return;
+        manual_recognition_active_ = enabled;
+        manual_reported_clusters_.clear();
+
+        std_msgs::Bool state;
+        state.data = enabled;
+        manual_recognition_pub_.publish(state);
+        if (pwm >= 0) {
+            ROS_WARN("[MissionManager] Manual recognition %s: CH%d=%d (%s). "
+                     "Mode is report-only; tracking/strike remain unchanged.",
+                     enabled ? "ENABLED" : "DISABLED",
+                     manual_recognition_rc_channel_, pwm, reason);
+        } else {
+            ROS_WARN("[MissionManager] Manual recognition %s (%s)",
+                     enabled ? "ENABLED" : "DISABLED", reason);
+        }
+    }
+
+    void rcInCallback(const mavros_msgs::RCIn::ConstPtr& msg) {
+        if (!manual_recognition_rc_enabled_) return;
+        last_rc_in_time_ = ros::Time::now();
+        const size_t index = static_cast<size_t>(manual_recognition_rc_channel_ - 1);
+        if (index >= msg->channels.size()) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[MissionManager] RC recognition channel CH%d unavailable: RCIn has %zu channels",
+                manual_recognition_rc_channel_, msg->channels.size());
+            setManualRecognitionState(false, "configured RC channel unavailable");
+            return;
+        }
+
+        const int pwm = static_cast<int>(msg->channels[index]);
+        if (!manual_recognition_active_ && pwm >= manual_recognition_rc_on_pwm_) {
+            setManualRecognitionState(true, "RC high", pwm);
+        } else if (manual_recognition_active_ && pwm <= manual_recognition_rc_off_pwm_) {
+            setManualRecognitionState(false, "RC low", pwm);
+        }
+    }
+
+    void manualRecognitionWatchdogCallback(const ros::TimerEvent&) {
+        if (!manual_recognition_rc_enabled_ || !manual_recognition_active_) return;
+        if (last_rc_in_time_.isZero() ||
+            (ros::Time::now() - last_rc_in_time_).toSec() > manual_recognition_rc_timeout_sec_) {
+            setManualRecognitionState(false, "RC input timeout");
+        }
+    }
+    //===========rc识别=============
 
     /**
      * starling_bridge 转发的 PX4 EXTENDED_SYS_STATE(#245) vtol_state
@@ -3820,7 +3923,59 @@ public:
      *   6. cluster.cluster_id 未在 reported_to_gs_ / strike_dispatched_ 内(dedup by id)
      *   7. cluster 与 reported_to_gs_ 已有位置 < report_dedup_radius_m_ 且 label 同 → 跳过(dedup by pos)
      */
+    //===========rc识别=============
+    void processManualRecognitionClusters(
+        const multi_uav_strike::ClusterState::ConstPtr& msg) {
+        const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
+        const double dedup_radius_sq = report_dedup_radius_m_ * report_dedup_radius_m_;
+
+        for (const auto& cluster : msg->targets) {
+            // 手动模式也只回传当前有效观测，不复活聚类器缓存中的历史目标。
+            if (cluster.last_seen_us != 0 && now_us >= cluster.last_seen_us) {
+                const double age_sec = (now_us - cluster.last_seen_us) / 1e6;
+                if (age_sec > max_report_cluster_age_sec_) {
+                    ROS_WARN_THROTTLE(2.0,
+                        "[MissionManager] Manual recognition skips stale Cluster[%lu], age=%.2fs",
+                        cluster.cluster_id, age_sec);
+                    continue;
+                }
+            }
+            if (isTargetIgnored(cluster.label, cluster.ned_x, cluster.ned_y)) continue;
+            if (manual_reported_clusters_.count(cluster.cluster_id)) continue;
+
+            bool position_duplicate = false;
+            for (const auto& item : manual_reported_clusters_) {
+                if (item.second.label != cluster.label) continue;
+                const double dx = cluster.ned_x - item.second.ned_x;
+                const double dy = cluster.ned_y - item.second.ned_y;
+                if (dx * dx + dy * dy < dedup_radius_sq) {
+                    position_duplicate = true;
+                    break;
+                }
+            }
+            if (position_duplicate) continue;
+
+            // 手动开关严格使用普通发现目标 type=3；不写 tracked_target_、primary_target，
+            // 不进入原 SEARCH_TRACK/SEARCH_STRIKE 分支。
+            multi_uav_strike::DetectTarget target =
+                buildDetectTarget(cluster, /*target_type=*/3);
+            detect_target_pub_.publish(target);
+            multi_uav_strike::DetectTargets batch;
+            batch.targets.push_back(target);
+            detect_targets_pub_.publish(batch);
+            manual_reported_clusters_[cluster.cluster_id] =
+                {cluster.label, cluster.ned_x, cluster.ned_y};
+            ROS_WARN("[MissionManager] Manual recognition Cluster[%lu] label=%s -> report type=3 only",
+                     cluster.cluster_id, cluster.label.c_str());
+        }
+    }
+
     void clusterStatesCallback(const multi_uav_strike::ClusterState::ConstPtr& msg) {
+        if (manual_recognition_active_) {
+            processManualRecognitionClusters(msg);
+            return;
+        }
+        //===========rc识别=============
         if (current_work_mode_ == WorkMode::IDLE) {
             return;
         }

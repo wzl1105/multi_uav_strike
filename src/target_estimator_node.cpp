@@ -291,6 +291,10 @@ public:
         //   waypoint / SEARCH 阶段 enable=false,候选 primary 显示紫色等 GS 接管。
         guidance_enable_sub_ = nh_.subscribe("guidance/enable", 10,
                                              &TargetClusterer::guidanceEnableCallback, this);
+        //===========rc识别=============
+        manual_recognition_sub_ = nh_.subscribe("recognition/manual_enable", 10,
+                                               &TargetClusterer::manualRecognitionCallback, this);
+        //===========rc识别=============
         // === 2026-08-27: 订阅 /waypoint_executor/skill — 缓存 target_type ===
         //   GS 通过 starling_bridge→kcp_comm.cpp:729 把 skill_params.target_type
         //   透传到 Skill.msg.target_type (bit0=person, bit1=car),再由
@@ -361,7 +365,9 @@ public:
         // area has been reached.  The latch is deliberately retained when the
         // mission subsequently enters Attack(105), so perception does not stop
         // or restart at the Attack path's first waypoint.
-        if (!isFirstWaypointGateOpen()) return;
+        //===========rc识别=============
+        if (!manual_recognition_active_ && !isFirstWaypointGateOpen()) return;
+        //===========rc识别=============
         //=============一定打击=========//
 
         const auto& frame = msg->detections.front();
@@ -1008,6 +1014,27 @@ public:
         }
     }
 
+    //===========rc识别=============
+    void manualRecognitionCallback(const std_msgs::Bool::ConstPtr& msg) {
+        if (manual_recognition_active_ == msg->data) return;
+        manual_recognition_active_ = msg->data;
+        size_t cleared_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(clusters_mtx_);
+            cleared_count = clusters_.size();
+            clusters_.clear();
+            primary_cluster_id_ = 0;
+        }
+        multi_uav_strike::ClusterState empty_state;
+        cluster_states_pub_.publish(empty_state);
+        publishEmptyGps();
+        ROS_WARN("[TargetClusterer] Manual recognition %s; cluster session reset (%zu cleared). "
+                 "Search waypoint gate is %s",
+                 manual_recognition_active_ ? "ENABLED" : "DISABLED", cleared_count,
+                 manual_recognition_active_ ? "BYPASSED" : "RESTORED");
+    }
+    //===========rc识别=============
+
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         if (use_sim_) {
             current_uav_pose_.pose.position.x =  msg->pose.position.x;
@@ -1420,6 +1447,9 @@ private:
     ros::Subscriber guidance_mode_sub_;             // /guidance/mode → TRACK 时绕过 yaw_rate 门控
     ros::Subscriber guidance_enable_sub_;            // /guidance/enable → 区分 tracked (橙) vs primary (紫)
     ros::Subscriber waypoint_skill_sub_;             // /waypoint_executor/skill → 缓存 Attack(105) target_type
+    //===========rc识别=============
+    ros::Subscriber manual_recognition_sub_;          // 遥控器手动全程识别状态
+    //===========rc识别=============
 
     ros::Publisher cluster_event_pub_;
     ros::Publisher cluster_states_pub_;
@@ -1479,6 +1509,9 @@ private:
     bool waypoint_status_received_ = false;
     bool current_skill_executing_ = false;
     bool cluster_skill_active_ = false;
+    //===========rc识别=============
+    bool manual_recognition_active_ = false;
+    //===========rc识别=============
     // === 2026-08-24: TRACK 模式旁路 YOLO yaw_rate 门控 ===
     //   guidance/mode=="track" 时 chase yaw_rate 通常 0.27~0.46 rad/s,超过默认
     //   max_cluster_yaw_rate_rad_s=0.2 → YOLO batch 持续被丢 → cluster stale →
