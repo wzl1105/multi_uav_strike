@@ -767,7 +767,8 @@ private:
 
     // === Phase 2+: Skill 流运行时数据 ===
     std::vector<SkillRuntime> skill_queue_;  // 多条 Skill 顺序排队
-    size_t current_skill_index_;             // 当前推进中的 skill 下标(0-based)
+    size_t current_skill_index_ = 0;        // 当前推进中的 skill 下标(0-based;无 TaskFlow 时 = 0,
+                                            //   skill_queue_.size() 也是 0,比较 0<0=FALSE 安全)
     bool has_task_flow_;                     // 是否有有效任务流(true 时不接收入参覆盖)
     std::string current_flow_id_;            // 当前任务流的 flow_id(上报 MissionState 用)
     int self_device_id_;                    // 本机 device_id(任务流的 device_id,默认自身)
@@ -8105,30 +8106,29 @@ public:
         const bool pilot_takeover = !mode_is_offboard;
 
         // === 2026-08-17:决定云台控制状态机 ===
-        //   LOCKED:    起飞前(GROUND_IDLE,无论 mode) /
-        //              RETURNING / TAKING_OFF-not-complete(仅 mode == OFFBOARD)
+        //   LOCKED:    (已弃用主动赋值 — 2026-09-14,见下)
         //   SKILL:     102 Search IN_TASK 或 105 Attack IN_TASK(仅 OFFBOARD 路径生效;
         //              接管时新状态仍按此规则计算,实际由 isStrikeActiveAutonomous 抑制 strike)
-        //   FREE:      其它 — 接管或 OFFBOARD 非 LOCKED/SKILL 阶段
+        //   FREE:      其它 — 接管或 OFFBOARD 非 SKILL 阶段 (含 GROUND_IDLE / TAKING_OFF /
+        //              HOVERING / WAYPOINT_FOLLOW / RETURNING / HOLDING / FAILED / OVERRIDDEN)
+        // === 2026-09-14: 用户反馈 "任何时候都希望听 GS 的云台指令",把 GROUND_IDLE /
+        //   TAKING_OFF-not-complete / RETURNING 三个 phase 强制 LOCKED 的守卫删除。
+        //   这三个 phase 现在落到默认 FREE_FOLLOW_USER,base = gimbal_pitch_default_
+        //   (默认 0°,yaml 可改),GS angle/rate 可正常下发,SKILL_FOLLOW_USER 阶段的
+        //   rate > angle > base+offset 优先级链不变。
+        //   STRIKE/TRACK autonomous 仍由 L8190-8194 锁定(目标跟踪是任务需求,安全优先)。
+        //   LOCKED_AT_ZERO 枚举 + 360 sentinel publish 路径保留作防御性兜底(future
+        //   e-stop 等紧急锁定可重新启用),但不主动赋值。
         GimbalControlState new_state = GimbalControlState::FREE_FOLLOW_USER;
-        if (current_phase_ == MissionPhase::PHASE_GROUND_IDLE) {
-            // 起飞前无论 mode 都锁 360 (锁框架角,用户协议)
-            new_state = GimbalControlState::LOCKED_AT_ZERO;
-        } else if (mode_is_offboard) {
-            // 仅 OFFBOARD 自主阶段保留 RETURNING / TAKING_OFF-not-complete 锁
-            if (current_phase_ == MissionPhase::PHASE_RETURNING ||
-                (current_phase_ == MissionPhase::PHASE_TAKING_OFF &&
-                 takeoff_state_ != TakeoffState::TAKEOFF_COMPLETE)) {
-                new_state = GimbalControlState::LOCKED_AT_ZERO;
-            } else if (current_skill_index_ < skill_queue_.size()) {
-                const auto& sr = skill_queue_[current_skill_index_];
-                if (sr.state == SkillState::IN_TASK &&
-                    (sr.msg.skill_type == 102 || sr.msg.skill_type == 105)) {
-                    new_state = GimbalControlState::SKILL_FOLLOW_USER;
-                }
+        if (mode_is_offboard && current_skill_index_ < skill_queue_.size()) {
+            const auto& sr = skill_queue_[current_skill_index_];
+            if (sr.state == SkillState::IN_TASK &&
+                (sr.msg.skill_type == 102 || sr.msg.skill_type == 105)) {
+                new_state = GimbalControlState::SKILL_FOLLOW_USER;
             }
         }
-        // pilot_takeover && phase != GROUND_IDLE → new_state = FREE_FOLLOW_USER (默认)
+        // pilot_takeover (mode != OFFBOARD) → new_state = FREE_FOLLOW_USER (默认)
+        // GROUND_IDLE / TAKING_OFF-not-complete / RETURNING → new_state = FREE_FOLLOW_USER (默认)
 
         // === 状态切换副作用:LOCKED 进入时清零 user_offset ===
         if (new_state != current_gimbal_state_) {
@@ -8158,7 +8158,7 @@ public:
         if (current_phase_ != last_gimbal_latch_phase_ ||
             current_skill_index_ != last_gimbal_latch_skill_index_) {
             if (gimbal_attitude_cmd_valid_) {
-                ROS_WARN("[MissionManager] Phase/skill change (%d → %d, skill %d → %d) "
+                ROS_WARN("[MissionManager] Phase/skill change (%d → %d, skill %d → %zu) "
                          "→ gimbal angle latch cleared",
                          static_cast<int>(last_gimbal_latch_phase_),
                          static_cast<int>(current_phase_),
@@ -8172,8 +8172,9 @@ public:
 
         std_msgs::Float32 msg;
         if (current_gimbal_state_ == GimbalControlState::LOCKED_AT_ZERO) {
-            // 起飞前 / (OFFBOARD 自主) 降落中 / TAKING_OFF-not-complete:
-            // 360 度 sentinel,框架锁死 0 度(用户协议)。
+            // === 2026-09-14: LOCKED_AT_ZERO 已不再主动赋值(用户希望"任何时候都跟 GS"),
+            //   此分支保留作防御性兜底 — future 紧急锁定(e-stop 等)可重新启用。
+            //   360 度 sentinel,框架锁死 0 度(用户协议)。
             msg.data = 360.0f;
         } else {
             // === 选取 base:SKILL 用任务默认(朝 cluster/WP2/search),
