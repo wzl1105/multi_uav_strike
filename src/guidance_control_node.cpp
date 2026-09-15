@@ -370,6 +370,13 @@ private:
     ros::Time terminal_image_chase_enter_time_;
     // chase enter/exit 边沿日志 (2026-08-20),last=true/false 翻转时打 WARN
     bool   last_chase_log_active_                    = false;
+    //=====没有图像不打击=====//
+    // 末段进入图像导引区后，如果当前没有新鲜图像，则锁存当前位置悬停。
+    // 该保护与 bbox/高度打击保护完全独立，绝不触发拉烟服务。
+    bool terminal_no_image_hold_enabled_ = true;
+    bool terminal_no_image_hold_latched_ = false;
+    geometry_msgs::PoseStamped terminal_no_image_hold_pose_;
+    //=====没有图像不打击=====//
     // 本次 Attack 一旦得到有效世界坐标便锁存；图像或 cluster 后续消失时
     // GEO 继续使用该坐标，直到 guidance 被明确关闭。
     bool strike_target_latched_valid_ = false;
@@ -728,6 +735,10 @@ public:
                                   strike_terminal_image_chase_latch_sec_, 0.5);
         nh_private_.param<double>("strike_terminal_image_chase_center_band",
                                   strike_terminal_image_chase_center_band_, 0.06);
+        //=====没有图像不打击=====//
+        nh_private_.param<bool>("strike_terminal_no_image_hold_enabled",
+                                terminal_no_image_hold_enabled_, true);
+        //=====没有图像不打击=====//
         strike_terminal_image_chase_min_horiz_m_ =
             std::max(strike_terminal_image_chase_min_horiz_m_, 0.0);
         strike_terminal_image_chase_latch_sec_ =
@@ -1353,6 +1364,10 @@ public:
             // === 2026-08-20: 重置 chase latch, 新一轮 strike 不继承上一次末尾状态 ===
             terminal_image_chase_active_ = false;
             terminal_image_chase_enter_time_ = ros::Time();
+            //=====没有图像不打击=====//
+            terminal_no_image_hold_latched_ = false;
+            terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
             strike_test_bbox_metric_ = 0.0;
@@ -1464,6 +1479,10 @@ public:
             last_strike_cmd_valid_ = false;
             last_strike_cmd_time_ = ros::Time();
             strike_target_latched_valid_ = false;
+            //=====没有图像不打击=====//
+            terminal_no_image_hold_latched_ = false;
+            terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
             strike_test_bbox_metric_ = 0.0;
@@ -1497,6 +1516,10 @@ public:
             //   进入 strike 时 image 还没收到就误触发 chase, 跳过必要的前置检查。
             terminal_image_chase_active_ = false;
             terminal_image_chase_enter_time_ = ros::Time();
+            //=====没有图像不打击=====//
+            terminal_no_image_hold_latched_ = false;
+            terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
             strike_test_bbox_metric_ = 0.0;
@@ -1750,6 +1773,82 @@ public:
             strike_test_position_hold_pose_.pose.position.y,
             strike_test_position_hold_pose_.pose.position.z);
     }
+
+    //=====没有图像不打击=====//
+    bool terminalImageFresh(double* image_age_out = nullptr) const {
+        const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
+        const bool stamp_valid = image_target_received_ &&
+            current_image_target_.stamp_us > 0 &&
+            now_us >= current_image_target_.stamp_us;
+        const double image_age = stamp_valid
+            ? (now_us - current_image_target_.stamp_us) * 1e-6
+            : std::numeric_limits<double>::infinity();
+        if (image_age_out) *image_age_out = image_age;
+        return stamp_valid && current_image_target_.visible &&
+               image_age <= image_visible_timeout_sec_ &&
+               image_ray_filter_valid_;
+    }
+
+    bool maybeLatchTerminalNoImageHold(double horizontal_distance_m) {
+        if (!terminal_no_image_hold_enabled_ || current_mode_ != "strike" ||
+            terminal_no_image_hold_latched_ || !is_uav_pose_received_ ||
+            !strike_terminal_image_chase_enabled_ ||
+            !(horizontal_distance_m > 0.1 &&
+              horizontal_distance_m <= strike_terminal_image_chase_min_horiz_m_)) {
+            return terminal_no_image_hold_latched_;
+        }
+
+        double image_age = std::numeric_limits<double>::infinity();
+        if (terminalImageFresh(&image_age)) {
+            return false;
+        }
+
+        const auto& q = current_uav_pose_.pose.orientation;
+        const double yaw_nwu = std::atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+        terminal_no_image_hold_pose_.header.frame_id = "map";
+        double output_yaw = 0.0;
+        if (use_sim_) {
+            terminal_no_image_hold_pose_.pose.position.x = current_uav_pose_.pose.position.x;
+            terminal_no_image_hold_pose_.pose.position.y = -current_uav_pose_.pose.position.y;
+            terminal_no_image_hold_pose_.pose.position.z = -current_uav_pose_.pose.position.z;
+            output_yaw = -yaw_nwu;
+        } else {
+            terminal_no_image_hold_pose_.pose.position.x = -current_uav_pose_.pose.position.y;
+            terminal_no_image_hold_pose_.pose.position.y = current_uav_pose_.pose.position.x;
+            terminal_no_image_hold_pose_.pose.position.z = current_uav_pose_.pose.position.z;
+            output_yaw = M_PI_2 + yaw_nwu;
+        }
+        output_yaw = std::atan2(std::sin(output_yaw), std::cos(output_yaw));
+        terminal_no_image_hold_pose_.pose.orientation.z = std::sin(0.5 * output_yaw);
+        terminal_no_image_hold_pose_.pose.orientation.w = std::cos(0.5 * output_yaw);
+        terminal_no_image_hold_latched_ = true;
+        terminal_image_chase_active_ = false;
+        ROS_ERROR("[TERMINAL NO-IMAGE GUARD] POSITION HOLD LATCHED: "
+                  "horiz=%.2fm threshold=%.2fm image_age=%.3fs; smoke disabled for this hold",
+                  horizontal_distance_m, strike_terminal_image_chase_min_horiz_m_, image_age);
+        return true;
+    }
+
+    void publishTerminalNoImageHold() {
+        if (!terminal_no_image_hold_latched_) return;
+        terminal_no_image_hold_pose_.header.stamp = ros::Time::now();
+        strike_test_position_hold_pub_.publish(terminal_no_image_hold_pose_);
+        if (use_sim_) {
+            std_msgs::Int16 mode_msg;
+            mode_msg.data = flight_mode_position_;
+            flight_mode_pub_.publish(mode_msg);
+        }
+        std_msgs::Bool active;
+        active.data = true;
+        velocity_active_pub_.publish(active);
+        // 这里故意不调用 maybeTriggerStrikeTestSmoke()：无图悬停不是命中保护。
+        ROS_WARN_THROTTLE(1.0,
+            "[TERMINAL NO-IMAGE GUARD] publishing latched position hold");
+    }
+    //=====没有图像不打击=====//
 
     bool maybeLatchStrikeTestAltitudeGuard() {
         if (!strike_test_guard_enabled_ || current_mode_ != "strike" ||
@@ -2577,6 +2676,14 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
             return;
         }
 
+        //=====没有图像不打击=====//
+        // 末段无图保护锁存后由 position setpoint 独占，不再发布速度指令。
+        if (terminal_no_image_hold_latched_ && current_mode_ == "strike") {
+            publishTerminalNoImageHold();
+            return;
+        }
+        //=====没有图像不打击=====//
+
         //=============打击保护bbox=========//
         // 高度硬保护在目标有效性检查之前执行，目标突然丢失也不会绕过 4m 保护。
         maybeLatchStrikeTestAltitudeGuard();
@@ -2662,6 +2769,13 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                     if (strike_guidance_logic_ == "image_geo_fallback") {
                         geometry_msgs::Twist vel_cmd;
                         computeImageGeoStrikeVelocity(vel_cmd);
+                        //=====没有图像不打击=====//
+                        if (maybeLatchTerminalNoImageHold(
+                                strikeDescentGeometry().horizontal)) {
+                            publishTerminalNoImageHold();
+                            break;
+                        }
+                        //=====没有图像不打击=====//
                         evaluateStrike();
                         filterVelocityCmd(vel_cmd);
                         //=============打击保护bbox=========//
@@ -2817,6 +2931,12 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
                     //   切 chase 后 3D 速度由相机射线主导, 几何天然同步, 不刹停。
                     //   chase 中仍跑 filterVelocityCmd (指令斜率限制), 不跑 pre-commit guard。
                     const StrikeTargetGeometry pn_chase_geometry = strikeDescentGeometry();
+                    //=====没有图像不打击=====//
+                    if (maybeLatchTerminalNoImageHold(pn_chase_geometry.horizontal)) {
+                        publishTerminalNoImageHold();
+                        break;
+                    }
+                    //=====没有图像不打击=====//
                     maybeApplyTerminalImageChase(vel_cmd, pn_chase_geometry);
 
                     // 保存 pitch 门控后的 NED 指令；One Euro 也统一在 NED 下运行。
