@@ -372,7 +372,11 @@ public:
 
         const auto& frame = msg->detections.front();
         YawRateSample matched_yaw_rate;
-        if (!findNearestYawRate(frame, matched_yaw_rate)) {
+        //===========rc识别=============
+        // 手动识别不依赖偏航角速度样本，也不受偏航角速度门槛限制；
+        // 关闭手动识别后，程控仍完整执行原有角速度门控。
+        if (!manual_recognition_active_ &&
+            !findNearestYawRate(frame, matched_yaw_rate)) {
             ROS_WARN_THROTTLE(2.0,
                 "[TargetClusterer] Skip YOLO batch: no valid yaw-rate sample "
                 "frame_seq=%u det=%.6f",
@@ -389,7 +393,8 @@ public:
         //   YOLO 反复 skip → cluster 1.5s STALE → primary 跳 WP2 fallback →
         //   target switched jump=8.4m,CHASE 直接退出 → pilot override。
         //   进 strike 后 yaw_rate 旁路放行,waypoint/SEARCH 阶段保留门控。
-        if (!guidance_mode_is_track_ && !is_attack_active_ &&
+        if (!manual_recognition_active_ &&
+            !guidance_mode_is_track_ && !is_attack_active_ &&
             std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
             max_cluster_yaw_rate_rad_s_ + 1e-9) {
             ROS_WARN_THROTTLE(1.0,
@@ -400,6 +405,7 @@ public:
                 max_cluster_yaw_rate_rad_s_);
             return;
         }
+        //===========rc识别=============
 
         // camera/pose carries both the camera origin and the stabilized world
         // orientation. Each detection selects its nearest timestamped sample.
@@ -411,7 +417,10 @@ public:
 
     // 单条 detection → 反投影地面点 → 命中已有 cluster (label + 2D 距离) 或新建
     void processSingleDetection(const multi_uav_strike::YoloDetection& det) {
-        if (!det.is_in_fov) return;
+        //===========rc识别=============
+        // 手动识别开启时，检测节点给出的 bbox 均允许进入聚类；程控仍保留 FOV 门控。
+        if (!manual_recognition_active_ && !det.is_in_fov) return;
+        //===========rc识别=============
         if (!is_camera_pose_received_) return;
 
         // === 2026-07-16: Plan A 像素空间 EMA ===
@@ -518,7 +527,12 @@ public:
             //   is_attack_active_ 由 mission_state_cb 维护 (skill_type==105 && phase 4/5)
             //   搜索阶段仍走原 min_hit_count_ 抗误检
             c.hit_count++;
-            const int cur_min_hit = is_attack_active_ ? attack_min_hit_count_ : min_hit_count_;
+            //===========rc识别=============
+            // 手动识别首次有效投影即可晋升；程控使用原来的 Search/Attack 门槛。
+            const int cur_min_hit = manual_recognition_active_
+                ? 1
+                : (is_attack_active_ ? attack_min_hit_count_ : min_hit_count_);
+            //===========rc识别=============
             if (!c.is_promoted && static_cast<int>(c.hit_count) >= cur_min_hit) {
                 c.is_promoted = true;
                 emitClusterEvent(c);
@@ -569,19 +583,26 @@ public:
         nc.is_promoted     = false;
         clusters_[nc.id]   = nc;
 
+        //===========rc识别=============
+        const int cur_min_hit_new = manual_recognition_active_
+            ? 1
+            : (is_attack_active_ ? attack_min_hit_count_ : min_hit_count_);
+        //===========rc识别=============
         ROS_INFO_THROTTLE(1.0, "[TargetClusterer] NEW tentative id=%lu label=%s "
                               "(nwu=%.1f,%.1f,%.1f conf=%.2f hit=%u/%d, total=%zu)",
                            nc.id, nc.label.c_str(), nc.ned_x, nc.ned_y, nc.ned_alt,
-                           nc.best_confidence, nc.hit_count, min_hit_count_,
+                           nc.best_confidence, nc.hit_count, cur_min_hit_new,
                            clusters_.size());
 
         // 若 min_hit_count_ ≤ 1 (关闭门禁),立即晋升并发 event
         //   === 2026-07-31: Attack 阶段门槛也参与判断 ===
-        const int cur_min_hit_new = is_attack_active_ ? attack_min_hit_count_ : min_hit_count_;
+        //===========rc识别=============
+        // 手动识别时 cur_min_hit_new=1，因此首帧立即成为正式聚类并进入上报链路。
         if (cur_min_hit_new <= 1) {
             clusters_[nc.id].is_promoted = true;
             emitClusterEvent(clusters_[nc.id]);
         }
+        //===========rc识别=============
     }
 
     // ClusterEvent stores the promoted target position in NWU coordinates.

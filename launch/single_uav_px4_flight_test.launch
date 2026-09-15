@@ -262,22 +262,7 @@
   <!-- ====================================================================== -->
   <!-- 12. ROSBag 自动记录                                                      -->
   <!-- ====================================================================== -->
-  <arg name="record_bag" default="true"/>
-  <arg name="bag_dir" default="/home/rpdzkj/tzs_ws/LOG"/>
-  <arg name="bag_prefix" default="multi_uav_flight"/>
-
-  <group if="$(arg record_bag)">
-  <node pkg="rosbag"
-        type="record"
-        name="flight_rosbag_record"
-        output="screen"
-        required="false"
-        args="-a
-              --split
-              --size=2048
-              --buffsize=1024
-              -x '.*(/ros_short_image$|/ros_ir_image$|/ros_long_image$|/ros_vis_image_res$|/ros_ir_image_res$|/ros_zoom_image$|/starling_gimbal/training_sample$).*'
-              -o $(arg bag_dir)/$(arg bag_prefix)"/>
-  </group>
+  
 
 </launch>
+
