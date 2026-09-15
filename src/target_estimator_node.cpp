@@ -174,6 +174,13 @@ public:
         //   切到 attack_min_hit_count/attack_tentative_ttl_sec,避免飞行过程中
         //   短停留目标被 1s TTL + 20 hit 门槛组合提早 DROP。
         p.param<int>   ("attack_min_hit_count",     attack_min_hit_count_,     6);
+        //===========rc识别=============
+        // 手动识别使用独立晋升门槛，不修改搜索/打击程控参数。
+        p.param<int>   ("manual_recognition_min_hit_count",
+                        manual_recognition_min_hit_count_, 3);
+        manual_recognition_min_hit_count_ =
+            std::max(1, manual_recognition_min_hit_count_);
+        //===========rc识别=============
         p.param<double>("attack_tentative_ttl_sec", attack_tentative_ttl_sec_, 2.0);
         // === 2026-07-16: Plan B — 世界空间 EMA ===
         //   现在 EMA 直接作用于 cand_tx/cand_ty(米),不再有相机机动滞后问题。
@@ -528,9 +535,9 @@ public:
             //   搜索阶段仍走原 min_hit_count_ 抗误检
             c.hit_count++;
             //===========rc识别=============
-            // 手动识别首次有效投影即可晋升；程控使用原来的 Search/Attack 门槛。
+            // 手动识别使用独立门槛；程控使用原来的 Search/Attack 门槛。
             const int cur_min_hit = manual_recognition_active_
-                ? 1
+                ? manual_recognition_min_hit_count_
                 : (is_attack_active_ ? attack_min_hit_count_ : min_hit_count_);
             //===========rc识别=============
             if (!c.is_promoted && static_cast<int>(c.hit_count) >= cur_min_hit) {
@@ -585,7 +592,7 @@ public:
 
         //===========rc识别=============
         const int cur_min_hit_new = manual_recognition_active_
-            ? 1
+            ? manual_recognition_min_hit_count_
             : (is_attack_active_ ? attack_min_hit_count_ : min_hit_count_);
         //===========rc识别=============
         ROS_INFO_THROTTLE(1.0, "[TargetClusterer] NEW tentative id=%lu label=%s "
@@ -597,7 +604,7 @@ public:
         // 若 min_hit_count_ ≤ 1 (关闭门禁),立即晋升并发 event
         //   === 2026-07-31: Attack 阶段门槛也参与判断 ===
         //===========rc识别=============
-        // 手动识别时 cur_min_hit_new=1，因此首帧立即成为正式聚类并进入上报链路。
+        // 手动门槛可单独设为1；默认3帧，达到门槛后才进入正式聚类和上报链路。
         if (cur_min_hit_new <= 1) {
             clusters_[nc.id].is_promoted = true;
             emitClusterEvent(clusters_[nc.id]);
@@ -1414,6 +1421,9 @@ private:
     double tentative_ttl_sec_ = 1.0;    // 未晋升的 tentative 在这么久没刷新就丢弃
     // === 2026-07-31: Attack 阶段专享聚类门槛 ===
     int    attack_min_hit_count_     = 6;
+    //===========rc识别=============
+    int    manual_recognition_min_hit_count_ = 3;
+    //===========rc识别=============
     double attack_tentative_ttl_sec_ = 2.0;
     bool   is_attack_active_         = false;  // mission_state_cb 维护
     double ema_alpha_        = 0.3;

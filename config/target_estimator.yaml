@@ -53,6 +53,9 @@ tentative_ttl_sec: 1.0        # 未晋升的 tentative cluster 无新命中后�
 #   3 hit 已足够抗单帧 YOLO 误检 (假阳率 < 1e-3)
 attack_min_hit_count: 3
 attack_tentative_ttl_sec: 2.0
+# 手动摇杆识别使用独立门槛；同一聚类连续命中3帧后才晋升并上报。
+# 不影响上面的搜索 min_hit_count 和打击 attack_min_hit_count。
+manual_recognition_min_hit_count: 3
 ema_alpha: 0.3                # 新观测权重(0=完全保留旧值, 1=完全用新值)
                               # === 2026-07-16: Plan B 世界空间 EMA ===
                               # EMA 直接作用于 cand 世界坐标 (米),相机机动零滞后。

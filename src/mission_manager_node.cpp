@@ -873,9 +873,10 @@ private:
     //===========rc识别=============
     // 遥控器手动全程识别（只聚类和回传，不触发跟踪/打击）
     bool manual_recognition_rc_enabled_ = true;
-    int manual_recognition_rc_channel_ = 8;       // 参数按遥控器编号从1开始
-    int manual_recognition_rc_on_pwm_ = 1700;
-    int manual_recognition_rc_off_pwm_ = 1300;
+    int manual_recognition_rc_channel_ = 9;       // 参数按遥控器编号从1开始
+    // CH9 低电平有效：<= on 开启，>= off 关闭，中间区保持原状态。
+    int manual_recognition_rc_on_pwm_ = 1600;
+    int manual_recognition_rc_off_pwm_ = 1700;
     double manual_recognition_rc_timeout_sec_ = 1.0;
     bool manual_recognition_active_ = false;
     ros::Time last_rc_in_time_;
@@ -1064,17 +1065,17 @@ public:
         nh_private_.param<double>("world_ref_alt", world_ref_alt_, 75.0);
         //===========rc识别=============
         nh_private_.param<bool>("manual_recognition_rc_enabled", manual_recognition_rc_enabled_, true);
-        nh_private_.param<int>("manual_recognition_rc_channel", manual_recognition_rc_channel_, 8);
-        nh_private_.param<int>("manual_recognition_rc_on_pwm", manual_recognition_rc_on_pwm_, 1700);
-        nh_private_.param<int>("manual_recognition_rc_off_pwm", manual_recognition_rc_off_pwm_, 1300);
+        nh_private_.param<int>("manual_recognition_rc_channel", manual_recognition_rc_channel_, 9);
+        nh_private_.param<int>("manual_recognition_rc_on_pwm", manual_recognition_rc_on_pwm_, 1600);
+        nh_private_.param<int>("manual_recognition_rc_off_pwm", manual_recognition_rc_off_pwm_, 1700);
         nh_private_.param<double>("manual_recognition_rc_timeout_sec",
                                   manual_recognition_rc_timeout_sec_, 1.0);
         manual_recognition_rc_channel_ = std::max(1, manual_recognition_rc_channel_);
-        if (manual_recognition_rc_off_pwm_ >= manual_recognition_rc_on_pwm_) {
-            ROS_WARN("[MissionManager] manual recognition RC thresholds invalid (%d >= %d); using 1300/1700",
-                     manual_recognition_rc_off_pwm_, manual_recognition_rc_on_pwm_);
-            manual_recognition_rc_off_pwm_ = 1300;
-            manual_recognition_rc_on_pwm_ = 1700;
+        if (manual_recognition_rc_on_pwm_ >= manual_recognition_rc_off_pwm_) {
+            ROS_WARN("[MissionManager] active-low RC thresholds invalid (%d >= %d); using 1600/1700",
+                     manual_recognition_rc_on_pwm_, manual_recognition_rc_off_pwm_);
+            manual_recognition_rc_on_pwm_ = 1600;
+            manual_recognition_rc_off_pwm_ = 1700;
         }
         //===========rc识别=============
         nh_private_.param<bool>("gcs_lost_return_enabled", gcs_lost_return_enabled_, false);
@@ -2015,10 +2016,11 @@ public:
         }
 
         const int pwm = static_cast<int>(msg->channels[index]);
-        if (!manual_recognition_active_ && pwm >= manual_recognition_rc_on_pwm_) {
-            setManualRecognitionState(true, "RC high", pwm);
-        } else if (manual_recognition_active_ && pwm <= manual_recognition_rc_off_pwm_) {
-            setManualRecognitionState(false, "RC low", pwm);
+        // 第九通道为低电平有效：低档开启识别，高档关闭识别。
+        if (!manual_recognition_active_ && pwm <= manual_recognition_rc_on_pwm_) {
+            setManualRecognitionState(true, "RC low", pwm);
+        } else if (manual_recognition_active_ && pwm >= manual_recognition_rc_off_pwm_) {
+            setManualRecognitionState(false, "RC high", pwm);
         }
     }
 

@@ -11,10 +11,10 @@ mission_loop_rate: 50.0
 # 仅放开YOLO聚类和普通目标(type=3)回传，不改变WorkMode，不触发跟踪、制导或打击。
 manual_recognition_rc_enabled: true
 # 通道号按遥控器界面从1开始；必须先用 rostopic echo /uav0/mavros/rc/in 确认。
-manual_recognition_rc_channel: 8
+manual_recognition_rc_channel: 9
 # 高/低阈值形成迟滞，中间区间保持上一次状态，避免PWM抖动反复开关。
-manual_recognition_rc_on_pwm: 1700
-manual_recognition_rc_off_pwm: 1300
+manual_recognition_rc_on_pwm: 1600
+manual_recognition_rc_off_pwm: 1700
 # RC消息超时自动关闭识别开关，不改变飞控模式。
 manual_recognition_rc_timeout_sec: 1.0
 
