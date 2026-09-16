@@ -904,6 +904,10 @@ private:
     double offboard_takeover_prestream_sec_ = 1.0;
     double offboard_takeover_min_altitude_m_ = 1.5;
     bool posctl_taskflow_takeover_enabled_ = true;
+    //======控制接管=============//
+    int offboard_takeover_min_setpoint_count_ = 20;
+    double offboard_takeover_confirm_sec_ = 0.3;
+    //======控制接管=============//
 
     // === Attack(105) 多机协同参数 ===
     double      attack_safety_margin_m_         = 3.0;   // 协同:每架距目标保留距离
@@ -1088,6 +1092,16 @@ public:
         nh_private_.param<bool>("posctl_taskflow_takeover_enabled", posctl_taskflow_takeover_enabled_, true);
         nh_private_.param<double>("offboard_takeover_prestream_sec", offboard_takeover_prestream_sec_, 1.0);
         nh_private_.param<double>("offboard_takeover_min_altitude_m", offboard_takeover_min_altitude_m_, 1.5);
+        //======控制接管=============//
+        nh_private_.param<int>("offboard_takeover_min_setpoint_count",
+                               offboard_takeover_min_setpoint_count_, 20);
+        nh_private_.param<double>("offboard_takeover_confirm_sec",
+                                  offboard_takeover_confirm_sec_, 0.3);
+        offboard_takeover_min_setpoint_count_ =
+            std::max(1, offboard_takeover_min_setpoint_count_);
+        offboard_takeover_confirm_sec_ =
+            std::max(0.1, offboard_takeover_confirm_sec_);
+        //======控制接管=============//
         // 单机自动模式:默认 true → home 到位后把 world_ref 覆盖成本机 home,
         //   使 x/y offset=0,单机永远在原点;多机 launch 设 false 并注入共享 world_ref。
         nh_private_.param<bool>("world_ref_auto", world_ref_auto_, true);
@@ -2340,13 +2354,9 @@ public:
                      "TaskFlow id=%s triggering OFFBOARD takeover (prestream %.1fs)",
                      current_mavros_state_.mode.c_str(), msg->flow_id.c_str(),
                      offboard_takeover_prestream_sec_);
-            current_phase_ = MissionPhase::PHASE_HOLDING;
-            if (!setpoint_running_) startSetpointPublisher();
-            takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
-            ros::Duration(std::max(0.2, offboard_takeover_prestream_sec_)).sleep();
-            suppress_recovery_ = true;
-            const bool ok = setMode("OFFBOARD");
-            suppress_recovery_ = false;
+            //======控制接管=============//
+            const bool ok = takeoverOffboardFromManual(msg->flow_id);
+            //======控制接管=============//
             if (!ok) {
                 ROS_ERROR("[MissionManager] OFFBOARD takeover failed (mode=%s); TaskFlow id=%s rejected",
                           current_mavros_state_.mode.c_str(), msg->flow_id.c_str());
@@ -2450,9 +2460,9 @@ public:
             } else {
                 ROS_WARN("[MissionManager] >>>> New TaskFlow during OVERRIDE — proactively requesting OFFBOARD "
                          "(flow_id=%s, skills=%lu)", msg->flow_id.c_str(), msg->skills.size());
-                suppress_recovery_ = true;
-                bool ok = setMode("OFFBOARD");
-                suppress_recovery_ = false;
+                //======控制接管=============//
+                const bool ok = takeoverOffboardFromManual(msg->flow_id);
+                //======控制接管=============//
                 if (!ok) {
                     ROS_ERROR("[MissionManager] >>>> OFFBOARD switch failed (pilot may have re-overridden) — "
                               "dropping new TaskFlow flow_id=%s. GS should retry or send SET_MODE(50000) first.",
@@ -6188,6 +6198,104 @@ public:
             setpoint_thread_.join();
         }
     }
+
+    //======控制接管=============//
+    // 飞手切到 POSCTL/ALTCTL 等模式后，地面站新 TaskFlow 重新接管的唯一入口。
+    // 先用当前位置 setpoint 建立稳定输入流，再请求 OFFBOARD；接管失败时
+    // 恢复调用前的 mission phase，不循环强抢遥控器控制权。
+    bool takeoverOffboardFromManual(const std::string& flow_id) {
+        if (!current_mavros_state_.connected || !current_mavros_state_.armed ||
+            !is_pose_received_) {
+            ROS_ERROR("[MissionManager] OFFBOARD takeover rejected: connected=%d armed=%d pose=%d "
+                      "flow_id=%s",
+                      current_mavros_state_.connected ? 1 : 0,
+                      current_mavros_state_.armed ? 1 : 0,
+                      is_pose_received_ ? 1 : 0,
+                      flow_id.c_str());
+            return false;
+        }
+
+        const MissionPhase phase_before_takeover = current_phase_;
+        const bool override_before_takeover = is_fcu_overridden_;
+        const bool publisher_was_running = setpoint_running_;
+
+        // 在预热期间 mavros/state 仍是非 OFFBOARD。必须先抑制快照恢复，否则
+        // PHASE_HOLDING 会让 override 边沿误触发 executeRecoveryFromOverride()。
+        suppress_recovery_ = true;
+        current_phase_ = MissionPhase::PHASE_HOLDING;
+
+        const int setpoint_count_before = setpoint_publish_count_;
+        if (!setpoint_running_) {
+            startSetpointPublisher();
+        }
+        // startSetpointPublisher() 锁存当前 XY/航向；高度使用当前 NED 位置转 ENU。
+        takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
+
+        const ros::Time prestream_start = ros::Time::now();
+        ros::Rate prestream_rate(50.0);
+        while (ros::ok() &&
+               (ros::Time::now() - prestream_start).toSec() <
+                   std::max(0.2, offboard_takeover_prestream_sec_)) {
+            ros::spinOnce();
+            prestream_rate.sleep();
+        }
+
+        const int published_count = setpoint_publish_count_ - setpoint_count_before;
+        if (published_count < offboard_takeover_min_setpoint_count_) {
+            ROS_ERROR("[MissionManager] OFFBOARD takeover aborted: only %d position setpoints "
+                      "published (need >=%d), flow_id=%s",
+                      published_count, offboard_takeover_min_setpoint_count_, flow_id.c_str());
+            current_phase_ = phase_before_takeover;
+            is_fcu_overridden_ = override_before_takeover;
+            suppress_recovery_ = false;
+            if (!publisher_was_running && setpoint_running_) {
+                stopSetpointPublisher();
+            }
+            return false;
+        }
+
+        ROS_WARN("[MissionManager] OFFBOARD takeover prestream ready: %d setpoints, requesting mode "
+                 "(flow_id=%s)", published_count, flow_id.c_str());
+        if (!setMode("OFFBOARD")) {
+            current_phase_ = phase_before_takeover;
+            is_fcu_overridden_ = override_before_takeover;
+            suppress_recovery_ = false;
+            if (!publisher_was_running && setpoint_running_) {
+                stopSetpointPublisher();
+            }
+            return false;
+        }
+
+        // setMode() 确认到首帧 OFFBOARD 后，再连续观察一小段时间。
+        // 如果遥控器模式通道仍然强制 POSCTL，这里会拒绝本次 TaskFlow。
+        const ros::Time confirm_start = ros::Time::now();
+        ros::Rate confirm_rate(20.0);
+        while (ros::ok() &&
+               (ros::Time::now() - confirm_start).toSec() < offboard_takeover_confirm_sec_) {
+            ros::spinOnce();
+            if (current_mavros_state_.mode != "OFFBOARD") {
+                ROS_ERROR("[MissionManager] OFFBOARD takeover unstable: PX4 returned to '%s' "
+                          "during %.2fs confirmation, flow_id=%s",
+                          current_mavros_state_.mode.c_str(), offboard_takeover_confirm_sec_,
+                          flow_id.c_str());
+                current_phase_ = phase_before_takeover;
+                is_fcu_overridden_ = override_before_takeover;
+                suppress_recovery_ = false;
+                if (!publisher_was_running && setpoint_running_) {
+                    stopSetpointPublisher();
+                }
+                return false;
+            }
+            confirm_rate.sleep();
+        }
+
+        is_fcu_overridden_ = false;
+        suppress_recovery_ = false;
+        ROS_WARN("[MissionManager] OFFBOARD takeover stable for %.2fs; accepting flow_id=%s",
+                 offboard_takeover_confirm_sec_, flow_id.c_str());
+        return true;
+    }
+    //======控制接管=============//
 
     bool setMode(const std::string& mode) {
         mavros_msgs::SetMode set_mode;

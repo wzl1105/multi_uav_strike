@@ -46,6 +46,12 @@ gcs_lost_grace_sec: 120.0
 posctl_taskflow_takeover_enabled: true
 offboard_takeover_prestream_sec: 1.0
 offboard_takeover_min_altitude_m: 1.5
+#======控制接管=============#
+# 切 OFFBOARD 前至少要真实发出的当前位置 setpoint 帧数。
+offboard_takeover_min_setpoint_count: 20
+# setMode 首次成功后继续确认 OFFBOARD 稳定的时间，防止遥控器立即抢回。
+offboard_takeover_confirm_sec: 0.3
+#======控制接管=============#
 low_speed_threshold: 12.0
 target_lock_confidence: 0.7
 spiral_approach_duration: 10.0
