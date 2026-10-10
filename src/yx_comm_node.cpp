@@ -409,7 +409,29 @@ private:
         total_count_ = it->second.repeat_count;
         sent_count_ = 0;
         last_send_time_ = ros::Time(0);
+        const bool was_active = sending_active_;
         sending_active_ = true;
+        // === 2026-10-10: burst 启动前清空 recv_buf_, 防止 burst 完 (b) 恢复 ===
+        //   拿老字节去 parseUplink 凑 0xAA 0x55 误触发 CRC fail 假错。
+        //   kernel 串口驱动层 buffer 不归我们管, 但应用层 recv_buf_ 必须清。
+        //   只在 !was_active 时清 (allow_interrupt 复用 already-active 序列不要
+        //   把 in-flight 期间合法累积的字节也清掉, 否则可能丢真上行)。
+        if (!was_active) {
+            recv_buf_.clear();
+        }
+        // === 2026-10-10: 记录 485 总线被 burst 独占, (b)(c) 临时停摆 ===
+        //   现场反馈 `rostopic pub /trigger_smoke` 时好时坏, 根因 485 半双工
+        //   冲突: sendSingleFrame() 切 TX 时 ser_.read() 还在 RX 抢总线 → YX 端漏收。
+        //   burst 期间 (runTimerCb 走 if (sending_active_) return;) 跳过 ser_.read()
+        //   和 publishStatus(), 整个 485 只服务下行 burst 帧。burst 完恢复。
+        //   只在 sending_active_ 由 false → true 跳变时打 (allow_interrupt 复用
+        //   already-active 序列时不要重复刷屏)。
+        if (!was_active) {
+            ROS_WARN("[yx_comm] YX uplink + status suspended during burst "
+                     "(%s 0x%02X, %d frames @ %.0fms, 485 half-duplex exclusive)",
+                     current_cmd_name_.c_str(), current_cmd_code_, total_count_,
+                     send_interval_sec_ * 1000.0);
+        }
         ROS_WARN("[yx_comm] %s -> %s (0x%02X), starting burst %d frames @ %.0fms",
                  source, current_cmd_name_.c_str(), current_cmd_code_, total_count_,
                  send_interval_sec_ * 1000.0);
@@ -488,10 +510,19 @@ private:
                 last_send_time_ = now;
                 if (sent_count_ >= total_count_) {
                     sending_active_ = false;
-                    ROS_INFO("[yx_comm] burst %s complete (%d frames sent)",
+                    ROS_INFO("[yx_comm] burst %s complete (%d frames sent); "
+                             "YX uplink + status resumed",
                              current_cmd_name_.c_str(), sent_count_);
                 }
             }
+        }
+
+        // === 2026-10-10: SENDING 期间 (b)(c) skip, 485 总线给 burst 独占 ===
+        //   详见 startCommandSequence 注释. 整段 (b)(c) 包括 ser_.read() 和
+        //   publishStatus() (后者走 ROS topic 不占 485, 但本 tick 一起 skip 更
+        //   简洁, GS 端 status 5s 延迟可接受, burst 完立即恢复).
+        if (sending_active_) {
+            return;
         }
 
         // (b) 接收 + 解析上行帧
