@@ -90,12 +90,30 @@ strike_test_bbox_filter_alpha: 0.4
 strike_test_smoke_enabled: false
 # yx_comm.launch 默认在根命名空启动，因此使用绝对 Service 名。
 strike_test_smoke_service: "/trigger_smoke"
-strike_test_smoke_min_hold_sec: 1.0
+strike_test_smoke_min_hold_sec: 0.2
 strike_test_smoke_max_xy_speed_mps: 0.5
 strike_test_smoke_max_z_speed_mps: 0.3
 strike_test_smoke_max_position_error_m: 0.8
-strike_test_smoke_stable_confirm_sec: 1.0
+strike_test_smoke_stable_confirm_sec: 0.2
 # //=============打击保护bbox=========//
+
+# === 2026-10-10: 手动拉烟双入口(rc_in 杆量 + ros topic) ===
+# 现场反馈 strike_test_smoke 自动路径偶尔不触发(可能是稳定条件过严或硬件),
+#   补一条手动入口作为现场兜底。armed-only 门控已写在 tryManualSmokeTrigger
+#   里,不必再额外配。
+# 两路入口互不影响,可独立开关,内部 1.0s 最小间隔防连发。
+# 默认 rc_enabled=false(topic 路径默认开),用户用 topic 按钮或后续硬件触发。
+manual_smoke_rc_enabled: false
+# 通道号按遥控器界面从 1 开始,先用 rostopic echo /uav0/mavros/rc/in 确认。
+manual_smoke_rc_channel: 9
+# 高/低阈值形成迟滞,中间区间不响应,避免 PWM 抖动反复触发。
+manual_smoke_rc_on_pwm: 1600
+manual_smoke_rc_off_pwm: 1700
+# RC 消息超时不再触发(只是日志告警,真正触发每次 callback 仍按瞬时 PWM)。
+manual_smoke_rc_timeout_sec: 1.0
+# topic 入口:发 True 边沿触发一次,持续 True 不会反复触发。
+manual_smoke_topic_enabled: true
+manual_smoke_topic: "/yx/cmd/trigger_smoke"
 
 # === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===
 #   2026-08-25 引入的 4 个 track_* 独立参数已删除。TRACK 阶段 GS 未发

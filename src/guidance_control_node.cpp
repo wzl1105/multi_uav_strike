@@ -11,6 +11,7 @@
 #include <mavros_msgs/Thrust.h>
 #include <mavros_msgs/HomePosition.h>
 #include <mavros_msgs/State.h>
+#include <mavros_msgs/RCIn.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <cmath>
@@ -55,6 +56,10 @@ private:
     //===================制导修改====================
     ros::Subscriber primary_image_target_sub_;
     //===================制导修改====================
+    //===================manual smoke trigger====================
+    ros::Subscriber rc_in_manual_smoke_sub_;     // mavros/rc/in 杆量入口（拉烟手动触发）
+    ros::Subscriber manual_smoke_topic_sub_;     // /yx/cmd/trigger_smoke 话题入口（边沿触发）
+    //===================manual smoke trigger====================
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -77,6 +82,7 @@ private:
 
     // Timer for guidance computation
     ros::Timer guidance_timer_;
+    ros::Timer manual_smoke_watchdog_timer_;  // 1Hz,只跑 manual smoke RC watchdog
 
     // Current state
     geometry_msgs::PoseStamped current_uav_pose_;
@@ -431,6 +437,21 @@ private:
     ros::Time strike_test_smoke_stable_since_;
     bool strike_test_smoke_request_attempted_ = false;
     //=============打击保护bbox=========//
+    //=============manual smoke trigger (rc_in + topic)================
+    bool manual_smoke_rc_enabled_ = false;
+    int manual_smoke_rc_channel_ = 9;
+    int manual_smoke_rc_on_pwm_ = 1600;
+    int manual_smoke_rc_off_pwm_ = 1700;
+    double manual_smoke_rc_timeout_sec_ = 1.0;
+    bool manual_smoke_topic_enabled_ = true;
+    std::string manual_smoke_topic_ = "/yx/cmd/trigger_smoke";
+    // 边沿 latch:上一次 topic 触发时间,用于去抖,以及最近一次成功 service call
+    ros::Time last_manual_smoke_topic_time_;
+    ros::Time last_manual_smoke_call_time_;
+    ros::Time last_manual_smoke_rc_in_time_;
+    // 是否已"激活"——topic 模式下,只对每个 True 边沿触发一次
+    bool manual_smoke_topic_active_ = false;
+    //=============manual smoke trigger (rc_in + topic)================
 
 public:
     GuidanceControlNode() : nh_private_("~"),
@@ -460,6 +481,12 @@ public:
         guidance_timer_ = nh_.createTimer(
             ros::Duration(1.0 / 50.0),
             &GuidanceControlNode::guidanceTimerCallback,
+            this);
+
+        // 手动拉烟 watchdog:独立 1Hz timer,不挂在 50Hz 控制循环里
+        manual_smoke_watchdog_timer_ = nh_.createTimer(
+            ros::Duration(1.0),
+            &GuidanceControlNode::manualSmokeWatchdogCallback,
             this);
 
         ROS_INFO("Guidance Control Node initialized with strategy: %s (disabled by default)",
@@ -777,6 +804,25 @@ public:
                                   strike_test_smoke_max_position_error_m_, 0.8);
         nh_private_.param<double>("strike_test_smoke_stable_confirm_sec",
                                   strike_test_smoke_stable_confirm_sec_, 1.0);
+
+        // === 手动拉烟(rc_in 杆量 + topic 双入口,与 strike_test_smoke 自动流程并行)===
+        // 现场反馈:目前 strike_test_smoke 偶尔不触发(可能是稳定条件过严或硬件),
+        //   加手动兜底,任意 arm 状态下都可由用户主动调一次。
+        // 杆量迟滞阈值与 manual_recognition 同一套路,topic 边沿触发,两路可独立开关。
+        nh_private_.param<bool>("manual_smoke_rc_enabled",
+                                manual_smoke_rc_enabled_, false);
+        nh_private_.param<int>("manual_smoke_rc_channel",
+                               manual_smoke_rc_channel_, 9);
+        nh_private_.param<int>("manual_smoke_rc_on_pwm",
+                               manual_smoke_rc_on_pwm_, 1600);
+        nh_private_.param<int>("manual_smoke_rc_off_pwm",
+                               manual_smoke_rc_off_pwm_, 1700);
+        nh_private_.param<double>("manual_smoke_rc_timeout_sec",
+                                  manual_smoke_rc_timeout_sec_, 1.0);
+        nh_private_.param<bool>("manual_smoke_topic_enabled",
+                                manual_smoke_topic_enabled_, true);
+        nh_private_.param<std::string>("manual_smoke_topic",
+                                       manual_smoke_topic_, "/yx/cmd/trigger_smoke");
         nh_private_.param<double>("strike_test_bbox_center_band",
                                   strike_test_bbox_center_band_, 0.25);
         nh_private_.param<double>("strike_test_bbox_min_confidence",
@@ -839,6 +885,16 @@ public:
             ROS_WARN("[STRIKE TEST GUARD] DISABLED: original strike command path is unchanged");
         }
         //=============打击保护bbox=========//
+        // === 手动拉烟启动回显(两路入口 + 服务名)===
+        ROS_WARN("[MANUAL SMOKE] rc_enabled=%d ch=%d on<=%d off>=%d timeout=%.1fs | "
+                 "topic_enabled=%d topic=%s | service=%s (armed-only, see tryManualSmokeTrigger)",
+                 static_cast<int>(manual_smoke_rc_enabled_),
+                 manual_smoke_rc_channel_,
+                 manual_smoke_rc_on_pwm_, manual_smoke_rc_off_pwm_,
+                 manual_smoke_rc_timeout_sec_,
+                 static_cast<int>(manual_smoke_topic_enabled_),
+                 manual_smoke_topic_.c_str(),
+                 strike_test_smoke_service_.c_str());
 
         // === 2026-08-27: 末段水平速度缩放下限 (腾电机余量给垂直) ===
         nh_private_.param<double>("strike_terminal_horizontal_scale_floor",
@@ -929,6 +985,22 @@ public:
             mission_state_sub_ = nh_.subscribe(
                 "mission/mission_state", 10,
                 &GuidanceControlNode::missionStateCallback, this);
+
+            // 手动拉烟两路入口
+            //   - rc_in 杆量(低电平触发,迟滞阈值 yaml 可调)
+            //   - /yx/cmd/trigger_smoke 边沿触发(std_msgs/Bool, true 即触发)
+            //  两条入口互不影响,可独立开关。
+            rc_in_manual_smoke_sub_ = nh_.subscribe(
+                "mavros/rc/in", 10,
+                &GuidanceControlNode::rcInManualSmokeCallback, this);
+            manual_smoke_topic_sub_ = nh_.subscribe(
+                manual_smoke_topic_, 10,
+                &GuidanceControlNode::manualSmokeTopicCallback, this);
+        } else {
+            // 仿真也接 topic 入口,方便 SIL/HITL 联调
+            manual_smoke_topic_sub_ = nh_.subscribe(
+                manual_smoke_topic_, 10,
+                &GuidanceControlNode::manualSmokeTopicCallback, this);
         }
 
         //===================制导修改====================
@@ -1557,6 +1629,127 @@ public:
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
 
+    //===================manual smoke trigger (rc_in + topic)================
+    /**
+     * rc_in 杆量入口:低电平(<= on_pwm)触发一次拉烟,高电平(>= off_pwm)允许再次触发。
+     * 迟滞避免 PWM 抖动反复开/关。RC 消息丢失超过 timeout_sec 不再触发。
+     * 与 mission_manager manual_recognition 同一套路,但武装门由本节点 mavros_armed_ 把控。
+     */
+    void rcInManualSmokeCallback(const mavros_msgs::RCIn::ConstPtr& msg) {
+        if (!manual_smoke_rc_enabled_) return;
+        last_manual_smoke_rc_in_time_ = ros::Time::now();
+        const size_t index = static_cast<size_t>(manual_smoke_rc_channel_ - 1);
+        if (index >= msg->channels.size()) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[MANUAL SMOKE] RC channel CH%d unavailable: RCIn has %zu channels",
+                manual_smoke_rc_channel_, msg->channels.size());
+            return;
+        }
+        const int pwm = static_cast<int>(msg->channels[index]);
+        if (pwm <= manual_smoke_rc_on_pwm_) {
+            tryManualSmokeTrigger("RC low", pwm);
+        } else if (pwm >= manual_smoke_rc_off_pwm_) {
+            // 显式归零 latch:无 latch 状态机,只要再次拉低就再触发一次
+            ROS_INFO_THROTTLE(5.0, "[MANUAL SMOKE] RC high pwm=%d, ready for next trigger", pwm);
+        }
+    }
+
+    /**
+     * /yx/cmd/trigger_smoke 边沿触发:每个 True 边沿触发一次拉烟。
+     * 持续 True 不会反复触发(用 manual_smoke_topic_active_ latch)。
+     * 可用于 GS 主动调触发按钮,或后续接外部硬件。
+     */
+    void manualSmokeTopicCallback(const std_msgs::Bool::ConstPtr& msg) {
+        if (!manual_smoke_topic_enabled_) return;
+        if (msg->data && !manual_smoke_topic_active_) {
+            tryManualSmokeTrigger("topic edge", -1);
+        }
+        manual_smoke_topic_active_ = msg->data;
+    }
+
+    /**
+     * 统一触发入口:调 /trigger_smoke 之前做"已武装"门控(防止地面误碰),
+     * 加 200ms 最小间隔防连发,失败 200ms 后重试最多 3 次(覆盖 RS-485 SENDING
+     * 短窗 + GPIO 瞬时未就绪等一次性失败)。
+     * 与自动 strike_test_smoke_ 互不影响(各自走自己的 _attempted_ 状态)。
+     */
+    void tryManualSmokeTrigger(const char* reason, int pwm) {
+        // === 门 1:必须 armed(mavros state 还没收到时也算不通过) ===
+        if (!mavros_state_received_ || !mavros_armed_) {
+            ROS_WARN_THROTTLE(2.0,
+                "[MANUAL SMOKE] REJECT (%s pwm=%d): UAV not armed (mavros_state_received=%d armed=%d). "
+                "Manual trigger is in-flight only; arm the UAV first.",
+                reason, pwm,
+                static_cast<int>(mavros_state_received_),
+                static_cast<int>(mavros_armed_));
+            return;
+        }
+        // === 门 2:200ms 最小间隔(防 RC 抖动 + topic 边沿重发) ===
+        const ros::Time now = ros::Time::now();
+        if (!last_manual_smoke_call_time_.isZero() &&
+            (now - last_manual_smoke_call_time_).toSec() < 0.2) {
+            ROS_WARN_THROTTLE(2.0,
+                "[MANUAL SMOKE] REJECT (%s pwm=%d): within 200ms of last call (%.2fs ago)",
+                reason, pwm,
+                (now - last_manual_smoke_call_time_).toSec());
+            return;
+        }
+        // === service 可达性 ===
+        if (!strike_test_smoke_client_.exists() &&
+            !strike_test_smoke_client_.waitForExistence(ros::Duration(0.2))) {
+            ROS_ERROR_THROTTLE(2.0,
+                "[MANUAL SMOKE] FAIL (%s pwm=%d): service %s not available",
+                reason, pwm, strike_test_smoke_service_.c_str());
+            return;
+        }
+
+        // === 失败重试:最多 3 次,每次间隔 200ms ===
+        //   - 成功:立刻返回,更新 last_manual_smoke_call_time_
+        //   - 失败:ROS_WARN 提示,200ms 后再调一次;超过 3 次彻底放弃
+        // 一次性的 RS-485 SENDING 短窗 / GPIO 瞬时未就绪 会被这次重试覆盖掉
+        constexpr int kMaxRetries = 3;            // 总共 3 次
+        constexpr double kRetryIntervalSec = 0.2; // 间隔 200ms
+        for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+            std_srvs::Trigger srv;
+            const bool rpc_ok = strike_test_smoke_client_.call(srv);
+            last_manual_smoke_call_time_ = ros::Time::now();
+            if (rpc_ok && srv.response.success) {
+                ROS_WARN("[MANUAL SMOKE] >>>> TRIGGERED (%s pwm=%d) attempt=%d: %s",
+                         reason, pwm, attempt, srv.response.message.c_str());
+                return;
+            }
+            ROS_WARN("[MANUAL SMOKE] attempt %d/%d %s (%s pwm=%d): %s",
+                     attempt, kMaxRetries,
+                     rpc_ok ? "service rejected" : "RPC error",
+                     reason, pwm,
+                     rpc_ok ? srv.response.message.c_str() : "n/a");
+            if (attempt < kMaxRetries) {
+                ros::Duration(kRetryIntervalSec).sleep();
+            }
+        }
+        ROS_ERROR("[MANUAL SMOKE] GIVE UP (%s pwm=%d): %d attempts failed in %.2fs",
+                  reason, pwm, kMaxRetries, kMaxRetries * kRetryIntervalSec);
+    }
+
+    /**
+     * RC 输入 watchdog:超 1.0s 没消息 + 杆量拉低过,自动清 latch(虽然无 latch 状态机,
+     * 但用户期望"长时间无 RC 输入就别响应",保留这套便于将来扩 latch)。
+     * 实际触发只看每次 callback 的瞬时 PWM,不会误触发。
+     * 由 manual_smoke_watchdog_timer_ 1Hz 调度。
+     */
+    void manualSmokeWatchdogCallback(const ros::TimerEvent&) {
+        if (!manual_smoke_rc_enabled_) return;
+        if (last_manual_smoke_rc_in_time_.isZero()) return;
+        if ((ros::Time::now() - last_manual_smoke_rc_in_time_).toSec() >
+            manual_smoke_rc_timeout_sec_) {
+            // 不再清任何 latch,仅 throttled 提示
+            ROS_WARN_THROTTLE(5.0,
+                "[MANUAL SMOKE] RC input stale (>%.1fs), manual RC trigger ignored",
+                manual_smoke_rc_timeout_sec_);
+        }
+    }
+    //===================manual smoke trigger (rc_in + topic)================
+
     void uavSpeedCallback(const std_msgs::Float32::ConstPtr& msg) {
         const double speed = static_cast<double>(msg->data);
         if (speed <= 0.0) {
@@ -1733,22 +1926,48 @@ public:
             return;
         }
 
-        // 先锁存“已尝试”，避免 50Hz timer 因 Service 失败而重复触发多组 0x4E。
-        strike_test_smoke_request_attempted_ = true;
+        // 2026-10-10: 失败重试 3 次,200ms 间隔,治"有时不触发"
+        //   旧逻辑: request_attempted_ 置位 + service 失败 → 本 strike 静默放弃
+        //   新逻辑: 第一次失败不锁 latch,允许接下来 200ms×3 轮重试;只有 3 次都失败
+        //           才锁 latch 避免 50Hz timer 死磕 YX 板
         if (!(strike_test_smoke_client_.exists() ||
               strike_test_smoke_client_.waitForExistence(ros::Duration(0.2)))) {
             ROS_ERROR("[STRIKE TEST GUARD] smoke service unavailable: %s; "
                       "request will not be retried in this strike",
                       strike_test_smoke_service_.c_str());
+            // service 完全不存在 = 永久失败,这次直接锁 latch 避免死磕
+            strike_test_smoke_request_attempted_ = true;
             return;
         }
 
-        std_srvs::Trigger srv;
-        const bool rpc_ok = strike_test_smoke_client_.call(srv);
-        ROS_ERROR("[STRIKE TEST GUARD] smoke service call: rpc=%s accepted=%s message='%s'",
-                  rpc_ok ? "OK" : "FAILED",
-                  rpc_ok ? (srv.response.success ? "true" : "false") : "n/a",
-                  rpc_ok ? srv.response.message.c_str() : "n/a");
+        constexpr int kMaxRetries = 3;
+        constexpr double kRetryIntervalSec = 0.2;
+        bool final_ok = false;
+        std::string final_msg = "n/a";
+        for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+            std_srvs::Trigger srv;
+            const bool rpc_ok = strike_test_smoke_client_.call(srv);
+            if (rpc_ok && srv.response.success) {
+                ROS_WARN("[STRIKE TEST GUARD] smoke service ACCEPTED attempt=%d: %s",
+                         attempt, srv.response.message.c_str());
+                final_ok = true;
+                break;
+            }
+            final_msg = rpc_ok ? srv.response.message.c_str() : "RPC error";
+            ROS_WARN("[STRIKE TEST GUARD] smoke service attempt %d/%d %s: %s",
+                     attempt, kMaxRetries,
+                     rpc_ok ? "rejected" : "RPC error",
+                     final_msg.c_str());
+            if (attempt < kMaxRetries) {
+                ros::Duration(kRetryIntervalSec).sleep();
+            }
+        }
+        // 全部失败或成功 都锁 latch — 重试是给"瞬时失败"机会,3 次都失败就不再继续
+        strike_test_smoke_request_attempted_ = true;
+        if (!final_ok) {
+            ROS_ERROR("[STRIKE TEST GUARD] smoke GIVE UP after %d attempts: %s",
+                      kMaxRetries, final_msg.c_str());
+        }
     }
 
     void publishStrikeTestPositionHold() {

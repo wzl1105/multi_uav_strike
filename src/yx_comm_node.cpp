@@ -419,7 +419,13 @@ private:
     bool triggerSmokeCallback(std_srvs::Trigger::Request&,
                               std_srvs::Trigger::Response& res) {
         std::string error;
-        res.success = startCommandSequence(4, "/trigger_smoke", false, &error);
+        // 2026-10-10: 拉烟优先级高于其它指令,允许打断 in-flight 序列。
+        // 理由: 现场反馈"有时不触发"——0x69/0x87/0x4E/0xD2 等 burst 都是 10 帧 @50ms
+        //   (=500ms), 期间任何第二次 /trigger_smoke 都会被原来的 allow_interrupt=false
+        //   直接拒掉。拉烟是应急收尾动作, 必须保触发; 打断的代价是当前在跑的指令
+        //   计数被 reset (YX 端校验逻辑需要连续 N 帧, 中断的序列对 YX 端而言是无效帧,
+        //   本来也不期望有 ACK 反馈)。和 /yx/cmd 走 cmd=4 时的 allow_interrupt=true 一致。
+        res.success = startCommandSequence(4, "/trigger_smoke", true, &error);
         if (res.success) {
             res.message = "Smoke trigger accepted: sending 0x4E burst (10 frames); "
                           "no completion feedback is required";

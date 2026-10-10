@@ -2,15 +2,60 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-set "TGT_IP=%~1"
-if "%~1"=="" (
-    set /p "TGT_IP=Target IP: "
-    if not defined TGT_IP exit /b 1
+REM ============================================================
+REM Interactive flow (double-click):
+REM   1. Target IP: [192.168.1.151]    (default shown, Enter to accept)
+REM   2. Action? [D=deploy / Q=query]   (D default, Enter to deploy)
+REM
+REM Command-line forms (skip prompts):
+REM   deploy_windows.bat [target_ip]              deploy, prompt for action if no IP
+REM   deploy_windows.bat query [target_ip]        query only
+REM ============================================================
+
+set "ACTION="
+set "ARG_IP="
+
+REM parse args
+if /i "%~1"=="query" (
+    set "ACTION=query"
+    set "ARG_IP=%~2"
+) else if /i "%~1"=="deploy" (
+    set "ACTION=deploy"
+    set "ARG_IP=%~2"
+) else (
+    set "ARG_IP=%~1"
 )
 
+set "TGT_IP=%ARG_IP%"
+if "%TGT_IP%"=="" (
+    set /p "TGT_IP=Target IP [192.168.1.151]: "
+    if not defined TGT_IP set "TGT_IP=192.168.1.151"
+)
+
+if not defined ACTION goto :ASK_ACTION
+goto :ARGS_DONE
+
+:ASK_ACTION
+echo.
+echo What do you want to do on %TGT_IP% ?
+set /p "ACTION_CHOICE=  [D]eploy (default)  /  [Q]uery version: "
+if /i "%ACTION_CHOICE%"=="Q" (
+    set "ACTION=query"
+) else (
+    set "ACTION=deploy"
+)
+
+:ARGS_DONE
 set "SSH_USER=root"
 set "TGT_BASE=/home/rpdzkj/tzs_ws"
 set "SERVICES=tzs_ws-multi tzs_ws-payload"
+set "PKG_NAME=multi_uav_strike"
+REM package.xml is synced by deploy into src/<pkg>/; that's the source of truth
+REM on the board (devel/share/<pkg>/package.xml only exists after a local build).
+set "PKG_XML=%TGT_BASE%/src/%PKG_NAME%/package.xml"
+set "LOCAL_XML=%~dp0..\..\package.xml"
+
+if /i "%ACTION%"=="query" goto :DO_QUERY
 
 where tar >nul 2>&1 || (echo ERROR: tar.exe not found & pause & exit /b 1)
 where ssh >nul 2>&1 || (echo ERROR: ssh.exe not found & pause & exit /b 1)
@@ -68,3 +113,81 @@ rmdir /S /Q "!WORKDIR!" 2>nul
 
 pause
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :DO_QUERY  -  query package version on target board
+REM Prints: target IP / remote version / local dev version (if found)
+REM ============================================================
+:DO_QUERY
+where ssh >nul 2>&1 || (echo ERROR: ssh.exe not found & pause & exit /b 1)
+
+set "SSH_OPTS=-o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o ConnectTimeout=5 -o LogLevel=ERROR"
+
+echo.
+echo ============================================================
+echo Querying %PKG_NAME% version on %SSH_USER%@%TGT_IP%
+echo ============================================================
+
+REM Probe SSH first
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: cannot SSH to %SSH_USER%@%TGT_IP%
+    pause
+    exit /b 1
+)
+
+REM --- remote version: read <version> from src/<pkg>/package.xml ---
+REM Use sed (universally available on Rockchip boards) to extract the value.
+REM Fallback chain: src/ first, then devel/share/ if src/ missing.
+set "REMOTE_VER_FOUND="
+for /f "usebackq delims=" %%V in (`ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "sed -n 's:^  *<version>\(.*\)</version>:\1:p' '%PKG_XML%' 2>/dev/null || sed -n 's:^  *<version>\(.*\)</version>:\1:p' '%TGT_BASE%/devel/share/%PKG_NAME%/package.xml' 2>/dev/null"`) do (
+    if not "%%V"=="" (
+        set "REMOTE_VER=%%V"
+        set "REMOTE_VER_FOUND=1"
+    )
+)
+if not defined REMOTE_VER_FOUND (
+    REM Distinguish "file missing entirely" from "tag present but empty"
+    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "test -f '%PKG_XML%' -o -f '%TGT_BASE%/devel/share/%PKG_NAME%/package.xml'" >nul 2>&1
+    if errorlevel 1 set "REMOTE_VER=NOT_FOUND"
+)
+
+REM --- local dev version (best-effort, for compare) ---
+REM Use findstr with literal string (no regex) and a strict substring to
+REM avoid cmd's ^< / ^> escape rules in /R mode.
+set "LOCAL_VER="
+if exist "%LOCAL_XML%" (
+    for /f "usebackq delims=" %%V in (`findstr /C:"<version>" "%LOCAL_XML%"`) do (
+        for /f "tokens=2 delims=<>" %%P in ("%%V") do (
+            if not "%%P"=="" set "LOCAL_VER=%%P"
+        )
+    )
+)
+
+echo.
+if defined REMOTE_VER_FOUND goto :PRINT_REMOTE
+if /i "%REMOTE_VER%"=="NOT_FOUND" goto :REMOTE_MISSING
+echo Board version  : NOT FOUND ^<version^> tag missing in package.xml
+goto :REMOTE_DONE
+:REMOTE_MISSING
+echo Board version  : NOT FOUND
+echo                 checked: %PKG_XML%
+echo                          %TGT_BASE%/devel/share/%PKG_NAME%/package.xml
+goto :REMOTE_DONE
+:PRINT_REMOTE
+echo Board version  : %REMOTE_VER%
+:REMOTE_DONE
+
+if defined LOCAL_VER (
+    echo Local dev ver  : %LOCAL_VER%
+) else (
+    echo Local dev ver  : ^<not found at %LOCAL_XML%^>
+)
+
+echo.
+echo Inspection path : %SSH_USER%@%TGT_IP%:%PKG_XML%
+echo ============================================================
+pause
+endlocal
+exit /b 0
