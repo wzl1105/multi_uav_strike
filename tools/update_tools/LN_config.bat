@@ -2,6 +2,10 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+REM Clean up any leftover askpass temp files from previous runs (in case the
+REM   previous bat exited via an error path and skipped its cleanup).
+del /Q "%TEMP%\lnconfig_askpass.bat" 2>nul
+
 REM ============================================================
 REM LN_config.bat -- board operations entry (Windows double-click or CLI)
 REM
@@ -70,11 +74,26 @@ REM package.xml is synced by deploy into src/<pkg>/; that's the source of truth
 REM on the board (devel/share/<pkg>/package.xml only exists after a local build).
 set "PKG_XML=%TGT_BASE%/src/%PKG_NAME%/package.xml"
 set "DEVEL_XML=%TGT_BASE%/devel/share/%PKG_NAME%/package.xml"
-set "SSH_MASTER_PATH=%TEMP%\ssh-master-lnconfig-%RANDOM%"
-REM   No quotes around %SSH_MASTER_PATH% inside -o ControlPath: nested double
-REM   quotes inside a set "..." statement get consumed by cmd.exe, leaving the
-REM   control socket path malformed ("getsockname failed: Bad file descriptor").
-set "SSH_OPTS=-o ControlMaster=auto -o ControlPath=%SSH_MASTER_PATH% -o ControlPersist=600 -o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o ConnectTimeout=5 -o LogLevel=ERROR"
+REM   Earlier versions used "-o ControlMaster=auto -o ControlPath=%TEMP%\..."
+REM   to multiplex SSH. That breaks on Windows OpenSSH: the first connection
+REM   in a fresh process fails with "mux_client_request_session: read from
+REM   master failed: Connection reset by peer", and the remote command never
+REM   runs. With cmd.exe's >nul 2>nul stderr suppression the failure is
+REM   masked and looks like an empty result. Each ssh/scp here now opens a
+REM   fresh connection (slower, but reliable). The master path variable is
+REM   kept as a no-op so any code that still references it does not break.
+set "SSH_MASTER_PATH="
+set "SSH_OPTS=-o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o ConnectTimeout=5 -o LogLevel=ERROR"
+set "ASKPASS_FILE=%TEMP%\lnconfig_askpass.bat"
+
+REM Trigger the askpass setup once. Runs before any ssh call so every action
+REM   (query/grab/trigger/deploy) starts with SSH_ASKPASS+DISPLAY set and
+REM   ssh never prompts for a password mid-script.
+REM   The subprogram itself is at the bottom of this file (cmd.exe falls
+REM   through any subroutine placed inline above this call, which would run
+REM   the password prompt without ever reaching the `call :SETUP_ASKPASS`
+REM   here -- see :SETUP_ASKPASS comment block at end of file).
+call :SETUP_ASKPASS
 
 if /i "%ACTION%"=="query" goto :DO_QUERY
 if /i "%ACTION%"=="grab" goto :DO_GRAB
@@ -144,6 +163,7 @@ echo.
 echo Inspection path : %SSH_USER%@%TGT_IP%:%PKG_XML%
 echo ============================================================
 pause
+del /Q "%TEMP%\lnconfig_askpass.bat" 2>nul
 endlocal
 exit /b 0
 
@@ -161,14 +181,9 @@ echo ============================================================
 echo Grabbing latest bag from %SSH_USER%@%TGT_IP%:%BAG_DIR%
 echo ============================================================
 
-REM SSH ControlMaster: first ssh prompts for password, subsequent ssh/scp reuse the socket
-REM   Required because each ssh call here would otherwise re-prompt for password
-set "SSH_MASTER_PATH=%TEMP%\ssh-master-lnconfig-%RANDOM%"
-
-REM SSH_OPTS (with ControlMaster) is set globally near the top of the file.
-REM   Do NOT re-set it here: the previous G-only set was a leftover from when
-REM   ControlMaster was per-segment, and it had nested-quote bugs that broke
-REM   ControlPath ("getsockname failed: Bad file descriptor").
+REM SSH_OPTS (with ControlMaster) is set globally near the top of the file
+REM   (line ~73-77). All ssh/scp in this segment reuse the same master, so
+REM   the user only types the password once at the probe below.
 REM Probe SSH (also opens master)
 REM   stdout suppressed (true outputs nothing), but stderr MUST stay visible
 REM   so the password prompt from ssh.exe is shown to the user. With "2>&1"
@@ -200,13 +215,17 @@ if exist "%PID_TMP%" (
 )
 if defined ROSBAG_PID (
     echo [grab] detected rosbag record PID: %ROSBAG_PID%
-    echo [grab] sending SIGINT (graceful, lets .active finalize to .bag)...
+    echo [grab] sending SIGINT - graceful, lets .active finalize to .bag ...
     ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "kill -INT %ROSBAG_PID% 2>&1" >nul
-    echo [grab] waiting 4s for rosbag to finalize...
-    timeout /t 4 /nobreak >nul
-    echo [grab] finalize wait done
-    REM ensure it's dead (busybox pgrep may not have -f; SIGINT usually enough)
-    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "kill -0 %ROSBAG_PID% 2>/dev/null && kill -KILL %ROSBAG_PID% 2>/dev/null" >nul
+    REM Poll for .active -> .bag rename in a subroutine. 4s was too short:
+    REM   ls then scp could race the rename, so scp would fail with
+    REM   "No such file or directory" on a still-renaming .active. Poll once
+    REM   a second up to 30s, warn and continue on timeout instead of
+    REM   force-kill (a KILL would leave an un-finalized .bag and lose data).
+    REM   Polling is in a :SUB (call'd) because labels inside `if (...)` blocks
+    REM   confuse cmd.exe's parser ("3 was unexpected at this time" on the
+    REM   `if %WAITED% GEQ 30` check).
+    call :GRAB_POLL_FINALIZE
 ) else (
     echo [grab] no rosbag record process running, skipping kill
 )
@@ -217,9 +236,29 @@ REM    board may not have awk, so use powershell on the local output.
 echo [grab] listing bag files on board...
 set "GROUP_FILES_TMP=%TEMP%\tzs_grab_files_%RANDOM%.txt"
 ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "ls -1 '%BAG_DIR%'/multi_uav_flight_*.bag* 2>/dev/null" > "%GROUP_FILES_TMP%" 2>nul
-echo [grab] list done
+REM errorlevel MUST be checked right after ssh, not after the echo below
+REM   (echo resets errorlevel to 0, so the check would always pass and a real
+REM   ssh failure would silently fall through to the PowerShell parse step,
+REM   which then reports a misleading "parse failed" on an empty file).
 if errorlevel 1 (
     echo ERROR: ssh ls failed
+    del "%GROUP_FILES_TMP%" 2>nul
+    pause
+    exit /b 1
+)
+echo [grab] list done
+
+REM Empty-file check: if the board has zero .bag files, the generic
+REM   "parse failed" below would just print a blank sample and leave the
+REM   user guessing. Catch the empty case first and tell them exactly
+REM   which directory was empty.
+set "FILE_NONEMPTY="
+for /f "usebackq delims=" %%L in ("%GROUP_FILES_TMP%") do (
+    if not "%%L"=="" set "FILE_NONEMPTY=1"
+)
+if not defined FILE_NONEMPTY (
+    echo ERROR: no multi_uav_flight_*.bag* found under %SSH_USER%@%TGT_IP%:%BAG_DIR%
+    echo        board LOG dir is empty, or filenames don't match multi_uav_flight_N_M.bag[.active]
     del "%GROUP_FILES_TMP%" 2>nul
     pause
     exit /b 1
@@ -269,7 +308,47 @@ del "%GROUP_FILES_TMP%" "%GROUP_FILES%" 2>nul
 echo.
 echo [grab] DONE. Press any key to close this window...
 pause
+del /Q "%TEMP%\lnconfig_askpass.bat" 2>nul
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :GRAB_POLL_FINALIZE  -  poll for .active -> .bag rename after SIGINT
+REM   Called from :DO_GRAB right after `kill -INT $ROSBAG_PID`.
+REM   In a subroutine (not inline) because labels inside `if (...) (...)` blocks
+REM   confuse cmd.exe's parser and break the `if %WAITED% GEQ 30` check.
+REM   File-based read (not for /f backtick) to avoid the cmd.exe crash issue
+REM   noted in line 187-190.
+REM ============================================================
+:GRAB_POLL_FINALIZE
+echo [grab] waiting for .active to rename to .bag (poll, max 30s)...
+set "WAITED=0"
+set "ACTIVE_TMP=%TEMP%\tzs_grab_active_%RANDOM%.txt"
+goto :GRAB_POLL_CHECK
+:GRAB_POLL_NEXT
+if %WAITED% GEQ 30 (
+    echo [grab] WARNING: .active still present after 30s, proceeding anyway
+    echo                 rosbag may be slow to finalize, or SIGINT was not received
+    del "%ACTIVE_TMP%" 2>nul
+    goto :GRAB_POLL_DONE
+)
+REM   ping -n 2 sleeps ~1s on all Windows hosts. `timeout /t 1` is fragile:
+REM   git-bash ships its own timeout.exe that, when first on PATH, breaks the
+REM   /t flag. ping is in %SystemRoot%\System32 and is always available.
+ping -n 2 127.0.0.1 >nul
+set /a WAITED+=1
+:GRAB_POLL_CHECK
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "ls -1 '%BAG_DIR%'/multi_uav_flight_*.bag.active 2>/dev/null | head -1" > "%ACTIVE_TMP%" 2>nul
+set "ACTIVE_LEFT="
+if exist "%ACTIVE_TMP%" (
+    for /f "usebackq delims=" %%A in ("%ACTIVE_TMP%") do (
+        if not defined ACTIVE_LEFT set "ACTIVE_LEFT=%%A"
+    )
+)
+if defined ACTIVE_LEFT goto :GRAB_POLL_NEXT
+del "%ACTIVE_TMP%" 2>nul
+:GRAB_POLL_DONE
+echo [grab] finalize wait done (waited %WAITED%s)
 exit /b 0
 
 REM ============================================================
@@ -304,7 +383,41 @@ REM board-local publisher + subscriber + roscore.
 REM Default -1 (no --latch, no timeout): rostopic registers with master, publishes one
 REM message, then the publisher self-exits after 3s. Whole SSH command returns
 REM in ~5s. No SIGTERM risk killing the publisher before XMLRPC register finishes.
-ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "bash -c 'SETUP=\$(ls /opt/ros/*/setup.bash 2>/dev/null | head -1); if [ -z \"\$SETUP\" ]; then echo no /opt/ros/*/setup.bash found; exit 1; fi; source \"\$SETUP\"; export ROS_HOSTNAME=localhost; export ROS_MASTER_URI=http://localhost:11311; rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool \"data: true\" 2>&1'" || (
+REM   Inlining the bash script via "bash -c '...'" runs into cmd.exe escape
+REM   hell: cmd's `$(...)`/`>`/`<`/`>`/pipe parsing keeps eating parts of the
+REM   script (every `^` workaround has its own leaky corner). Cleaner: write
+REM   the script to a local temp file, scp it to the board, ssh-exec it.
+set "TRIGGER_SCRIPT=%TEMP%\lnconfig_trigger.sh"
+(
+    echo #!/bin/bash
+    echo set -e
+    echo SETUP=^$(ls /opt/ros/^*/setup.bash 2^>^/dev/null ^| head -1^)
+    echo if [ -z "$SETUP" ]; then echo "no /opt/ros/*/setup.bash found" exit 1; fi
+    echo source "$SETUP"
+    echo export ROS_HOSTNAME=localhost
+    echo export ROS_MASTER_URI=http://localhost:11311
+    echo rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool "data: true"
+) > "%TRIGGER_SCRIPT%"
+REM   cmd's `>` redirection writes CRLF; the board-side bash then treats the
+REM   trailing `\r` as part of the previous token (e.g. `set -e\r` is not a
+REM   valid set option -- "set: -: invalid option"). Strip to LF via PowerShell
+REM   which is guaranteed to be on every Windows host. We tried `dos2unix` first
+REM   but it lives in git-bash's /usr/bin and is not on cmd.exe's PATH.
+REM   We also tried `-Command` with `"`r`n"` arg, but cmd's `"` quote-pass-through
+REM   to PowerShell corrupts the backtick escapes -- the resulting file ends up
+REM   with literal `\` before each LF instead of being stripped. Using
+REM   `powershell -File` with the PS code written to a .ps1 file (where cmd
+REM   echoes backticks literally into the file bytes, then PowerShell parses
+REM   them on read) is the only reliable path.
+set "STRIP_PSSCRIPT=%TEMP%\lnconfig_strip.ps1"
+(
+    echo $in = $args[0]
+    echo $out = $args[1]
+    echo ^(Get-Content -LiteralPath $in -Raw^) -replace "`r`n","`n" ^| Set-Content -LiteralPath $out -NoNewline
+) > "%STRIP_PSSCRIPT%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%STRIP_PSSCRIPT%" "%TRIGGER_SCRIPT%" "%TRIGGER_SCRIPT%" >nul 2>&1
+scp %SSH_OPTS% "%TRIGGER_SCRIPT%" %SSH_USER%@%TGT_IP%:/tmp/lnconfig_trigger.sh >nul
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "bash /tmp/lnconfig_trigger.sh; rm -f /tmp/lnconfig_trigger.sh" || (
     echo ERROR: trigger failed, board-side rostopic pub reported an error (see above)
     pause
     endlocal
@@ -312,6 +425,7 @@ ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "bash -c 'SETUP=\$(ls /opt/ros/*/setup.bash 2
 )
 echo === TRIGGER DONE ===
 pause
+del /Q "%TEMP%\lnconfig_askpass.bat" 2>nul
 endlocal
 exit /b 0
 
@@ -379,5 +493,40 @@ ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "sudo systemctl daemon-reload && sudo systemc
 rmdir /S /Q "!WORKDIR!" 2>nul
 
 pause
+del /Q "%TEMP%\lnconfig_askpass.bat" 2>nul
 endlocal
+exit /b 0
+
+REM ============================================================
+REM :SETUP_ASKPASS  -  prompt once for password, feed every ssh/scp via SSH_ASKPASS
+REM   Windows OpenSSH ssh.exe honours the SSH_ASKPASS env var when DISPLAY is
+REM   set: it spawns SSH_ASKPASS and reads the password from stdout. We set
+REM   both here so subsequent ssh/scp calls NEVER prompt.
+REM   Password is written to a %TEMP%\<random>.bat file (not %USERPROFILE%),
+REM   so it lives only for the current bat invocation and is cleaned up at
+REM   each action's endlocal.
+REM   The user types the password ONCE per bat run (not once per ssh call).
+REM   No board-side changes needed; no SSH keys required; works on any
+REM   fresh Windows host with OpenSSH already installed.
+REM
+REM   Placement: this subroutine is at the BOTTOM of the file on purpose.
+REM   cmd.exe falls through into any subroutine that sits inline in the main
+REM   flow -- so placing it before the `call :X` would run the password
+REM   prompt unprompted (without ever reaching the `call :SETUP_ASKPASS`).
+REM   Putting it at end-of-file guarantees it only runs via the explicit call.
+REM ============================================================
+:SETUP_ASKPASS
+echo.
+set /p "PWD_INPUT=SSH password for %SSH_USER%@%TGT_IP%: "
+if "%PWD_INPUT%"=="" (
+    echo ERROR: empty password, aborting
+    pause
+    exit /b 1
+)
+(
+    echo @echo off
+    echo echo %PWD_INPUT%
+) > "%ASKPASS_FILE%"
+set "SSH_ASKPASS=%ASKPASS_FILE%"
+set "DISPLAY=forced"
 exit /b 0

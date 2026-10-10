@@ -22,73 +22,31 @@ The format below is intentionally minimal — one line per version, no headers.
   `nopic_nostrike`. They are NOT part of 0.0.1.
 
 ## 0.0.2 (on nopic_nostrike, 2026-10-10)
-- Smoke trigger priority fix: `/trigger_smoke` service now allows interrupting
-  in-flight YX command sequences (`allow_interrupt=true`). Root cause for
-  "smoke not firing sometimes": the 0x69/0x87/0x4E/0xD2 bursts are 10 frames
-  @ 50ms = 500ms, and a second `/trigger_smoke` call within 500ms was rejected
-  with `allow_interrupt=false`. Smoke is an end-of-task emergency action;
-  guarantee its execution. Aligned with `/yx/cmd` (cmd=4) which already
-  used `allow_interrupt=true`. Touches `yx_comm_node.cpp:419-431`.
-- Smoke trigger retry: both auto (`maybeTriggerStrikeTestSmoke`) and manual
-  (`tryManualSmokeTrigger`) paths now retry up to 3 times at 200ms interval
-  on service failure. Old behavior: lock `request_attempted_=true` and give
-  up the entire strike on first failure. Root cause for "auto smoke never
-  fires on first try" — a 0x69 (stage2_release) tail-end collision lasted
-  ~500ms, smoke call was rejected, latch was set, no recovery for the rest
-  of the strike. New behavior: first failure does NOT lock the latch, retry
-  3x200ms; only after all 3 fail is the latch set. Service-unavailable is
-  treated as permanent (lock immediately) since retrying won't help.
-- Manual smoke debounce: 1.0s -> 0.2s minimum interval between calls.
-  Aligns with "instant feedback" intent for the manual override path.
-- Manual smoke trigger via two new entry points (independent of existing
-  strike_test_smoke auto path):
-  - `mavros/rc/in` channel with on/off PWM hysteresis (default off, low-side
-    active). Mirrors `manual_recognition_rc_*` style.
-  - `std_msgs/Bool` on `/yx/cmd/trigger_smoke`, edge-triggered latch.
-- Safety gate: armed-only. Disarm on ground -> both paths REJECT with WARN.
-  1.0s minimum interval between calls to debounce RC PWM jitter / topic re-pub.
-- New params (guidance_control.yaml): `manual_smoke_rc_enabled`,
-  `manual_smoke_rc_channel`, `manual_smoke_rc_on_pwm`,
-  `manual_smoke_rc_off_pwm`, `manual_smoke_rc_timeout_sec`,
-  `manual_smoke_topic_enabled`, `manual_smoke_topic`.
-- `deploy_windows.bat query <ip>` subcommand to inspect version on the board.
-- 飞手接管后停发 detect_target / detect_targets: 105 Attack 流程在执行中
-  且飞手把 OFFBOARD 切走时,mission_manager 不再往 GCS 上行定位信息。
-  接管 = 任务终止,接管后 UAV 不受机载控制,绿球位置不可信,
-  type=1 (strike trigger / strike commit) 也无意义。飞手松开回 OFFBOARD
-  立即恢复,无需新 TaskFlow。
-- 拉烟触发条件简化: 位置锁存 (高度 ≤4m 硬保护 或 bbox hover 持续 N 帧)
-  即触发拉烟,不再等 0.2s 速度/位置稳定。原"速度未达阈值永远不触发"
-  是"有时不触发"主因之一。删除 5 个 yaml 参数和 7 个 cpp 字段。
-- Attack 阶段 primary 选择改用 YOLO back-projection 优先 (Step 1.5):
-  跟踪最近 1.5s 内的 YOLO bbox 反投影到地面的 (cluster, gx, gy),
-  选其中离 WP2 最近且 label 匹配的 cluster 当 primary,先于
-  closest-to-WP2 fallback 执行。修 12-00-54 bag cluster 2 失 YOLO
-  期间被 stale filter 排除,fresh 但错的 cluster 抢占 primary 的 bug。
-  yaml 新参数 `yolo_back_proj_window_sec`。
-- flight_test mavros 白名单加 `manual_control` plugin:
-  `launch/single_uav_px4_flight_test.launch` plugin_whitelist 显式收紧版
-  没列 manual_control,`/uav0/mavros/manual_control/send` 无订阅者,发
-  消息被 ROS 排队丢弃。加 'manual_control' 后 mavros 启动加载 plugin,
-  ROS 端可正常订阅,FCU 端需在非 OFFBOARD 模式 (POSCTL/MANUAL) 下生效。
-  `tzs_ctl.launch` 走 mavros 默认启动本就在白名单,不动。
-- 运维脚本改名 deploy_linux.sh / deploy_windows.bat → LN_config.sh /
-  LN_config.bat。功能不变(更通用名字,因为不止 deploy 还能查版本、拉
-  bag、触发拉烟),旧的命令行形式 `./deploy_linux.sh query <ip>` 也兼容
-  不变(同文件同签名),后续如果有人引用旧名 git log 仍能查到。
-- 菜单加 G/T 两项 (linux + windows 对齐):
-  - [G] 拉最新 bag: SSH 上板子 `rosnode kill /record_<N>`, 板子端
-    finalize .active → .bag, 按 `multi_uav_flight_<N>_<M>.bag` 文件名
-    N 取最大那一组,整组 scp 回脚本运行目录 (linux = $PWD, windows
-    = %cd%,都已 cd 到脚本所在目录)。**不删**板子 bag。
-  - [T] 手动触发拉烟: 弹 `Are you sure you want to trigger smoke on
-    <ip> ? [y/N]`, 输 y 才 SSH 上板子发
-    `rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool "data: true"`。
-    默认 N 防误操作,armed gate 由板子端 guidance_control
-    `manual_smoke_bypass_armed_gate` 决定 (脚本不绕 safety)。
-    关键环境变量: `ROS_HOSTNAME=localhost` (不写 `$(hostname)`)。
-    根因: 板子 `/etc/hosts` 把 `rockchip` 写死到 `192.168.1.152`,
-    但板子网卡实际是 `192.168.1.156`,publisher URI 解析到不存在的
-    IP → subscriber 主动连失败,echo 收不到消息。`localhost` 永远走
-    lo 127.0.0.1,板子端 publisher + subscriber + roscore 互连永远通。
-    ROS_MASTER_URI 也用 `http://localhost:11311` (板子本机 roscore)。
+
+相对 0.0.1 的变化。
+
+### 新功能
+- 手动拉烟触发: RC PWM (低边沿, hysteresis, armed-only) + `/yx/cmd/trigger_smoke`
+  Bool topic (边沿触发), 0.2s 防抖。跟 strike_test_smoke 自动路径独立。
+- `LN_config.{sh,bat}` 菜单加 `[G] 拉最新 bag`、`[T] 手动拉烟`、`[Q] 查板子版本`。
+  之前的 deploy 脚本只能 deploy。
+- `LN_config.bat` 整段脚本 SSH 密码**只问 1 次** (旧版问 5+ 次; SSH_ASKPASS
+  模式绕开 Windows OpenSSH ControlMaster bug,旧版在 Windows 上静默失败)。
+
+### 用户能感知的 bug 修复
+- `/trigger_smoke` 在 500ms YX burst 内不再被 reject (`allow_interrupt=true`)。
+- 拉烟 service 瞬时失败不再 latch + 终止整次 strike: 改成 3x200ms 重试,
+  3 次都失败才 latch。
+- 拉烟 0.2s 速度/位置稳定门槛删了: 位置锁存即触发。"有时不触发"根因之一。
+- Attack 选 primary 改用 YOLO back-projection 优先: 修 "YOLO 断流期间 stale
+  cluster 被 fresh 错 cluster 抢占" 的 bug。
+- 飞手接管期间 GCS 不再收到 `detect_target` / `detect_targets`, 松开自动恢复。
+- flight_test launch 收紧版 mavros plugin 白名单加 `manual_control`: RC override
+  在 POSCTL/MANUAL 模式下可达 FCU (旧版静默丢)。
+- `LN_config T` (trigger smoke) hostname drift 修: 板子端 `ROS_HOSTNAME=localhost`,
+  旧版 `$(hostname)` 解析到 `/etc/hosts` stale IP, echo subscriber 永远连不上
+  → T 操作在这块板子上等于无效。
+
+### 工具改名
+- `tools/update_tools/deploy_linux.sh` → `LN_config.sh`,
+  `deploy_windows.bat` → `LN_config.bat`。旧名作为同签名 alias 仍可用。
