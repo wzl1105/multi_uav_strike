@@ -51,8 +51,6 @@ The format below is intentionally minimal — one line per version, no headers.
   `manual_smoke_rc_channel`, `manual_smoke_rc_on_pwm`,
   `manual_smoke_rc_off_pwm`, `manual_smoke_rc_timeout_sec`,
   `manual_smoke_topic_enabled`, `manual_smoke_topic`.
-- New tools: `tools/update_tools/grab_bag.{sh,bat}` for on-site engineers
-  to stop rosbag and SCP the latest .bag to local without power-cycling.
 - `deploy_windows.bat query <ip>` subcommand to inspect version on the board.
 - 飞手接管后停发 detect_target / detect_targets: 105 Attack 流程在执行中
   且飞手把 OFFBOARD 切走时,mission_manager 不再往 GCS 上行定位信息。
@@ -74,3 +72,17 @@ The format below is intentionally minimal — one line per version, no headers.
   消息被 ROS 排队丢弃。加 'manual_control' 后 mavros 启动加载 plugin,
   ROS 端可正常订阅,FCU 端需在非 OFFBOARD 模式 (POSCTL/MANUAL) 下生效。
   `tzs_ctl.launch` 走 mavros 默认启动本就在白名单,不动。
+- 运维脚本改名 deploy_linux.sh / deploy_windows.bat → LN_config.sh /
+  LN_config.bat。功能不变(更通用名字,因为不止 deploy 还能查版本、拉
+  bag、触发拉烟),旧的命令行形式 `./deploy_linux.sh query <ip>` 也兼容
+  不变(同文件同签名),后续如果有人引用旧名 git log 仍能查到。
+- 菜单加 G/T 两项 (linux + windows 对齐):
+  - [G] 拉最新 bag: SSH 上板子 `rosnode kill /record_<N>`, 板子端
+    finalize .active → .bag, 按 `multi_uav_flight_<N>_<M>.bag` 文件名
+    N 取最大那一组,整组 scp 回脚本运行目录 (linux = $PWD, windows
+    = %cd%,都已 cd 到脚本所在目录)。**不删**板子 bag。
+  - [T] 手动触发拉烟: 弹 `Are you sure you want to trigger smoke on
+    <ip> ? [y/N]`, 输 y 才 SSH 上板子发
+    `rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool "data: true"`。
+    默认 N 防误操作,armed gate 由板子端 guidance_control
+    `manual_smoke_bypass_armed_gate` 决定 (脚本不绕 safety)。
