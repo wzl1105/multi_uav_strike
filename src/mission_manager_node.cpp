@@ -651,6 +651,31 @@ private:
         return current_work_mode_ == WorkMode::SEARCH_STRIKE;
     }
 
+    // === 2026-10-10: 飞手接管后停发 detect_target / detect_targets ===
+    //   触发:SkillRuntime::AttackPhase 离开 IDLE (APPROACHING/SEARCHING/ABANDONED,
+    //   即 105 Attack 流程在执行中) + 飞手把 OFFBOARD 切走
+    //   (is_fcu_overridden_=true,PX4 mode != "OFFBOARD",mavrosStateCallback L1805)。
+    //   语义:飞手接管 = 任务终止,mission_manager 不应再往 GCS 上行任何 detect_target,
+    //   包括 type=1 (strike trigger / strike commit) 主信号 — 因为:
+    //     - 状态: 飞手接管说明飞行员认为目标已处理/要改打别处,type=1 是"打到了"
+    //       的关键反馈,但接管后 UAV 不再受 mission_manager 控制,这个信号无意义
+    //     - 质量: 接管后 UAV 位置不被机载控制,绿球位置算出来也不准
+    //   跟 shouldSuppressPostAttackDetectPublish 的关系:
+    //     - 老 helper 拦 work_mode=SEARCH_STRIKE 期间的次要 type=3 (non-primary,
+    //       WP2 gate fail, no-match, stale, action=2 stash) — 不论接管没接管
+    //     - 新 helper 额外拦 type=1 (action=0 strike trigger, strike commit),
+    //       仅在飞手接管时 — 平时 type=1 仍要发(GS 端要看"打到了")
+    //   恢复: 飞手松开回到 OFFBOARD (is_fcu_overridden_=false) 立即恢复,
+    //   不需要等新 TaskFlow — 飞手只是临时切去手动,没说要"终止任务"。
+    //   注:不静默 primary_target_pub_ / attack_wp2_pub_ — 这俩不是 GCS 上行通道
+    //   (primary 给 estimator 推主目标,attack_wp2 一次性单帧且不会重发)。
+    //   helper 接受 sr(SkillRuntime 是 clusterStatesCallback / attackCmdCallback 里
+    //   skill_queue_[current_skill_index_] 的引用,所有 caller 都有)。
+    inline bool shouldSuppressDetectOnPilotOverride(const SkillRuntime& sr) const {
+        return sr.attack_phase_ != SkillRuntime::AttackPhase::IDLE
+            && is_fcu_overridden_;
+    }
+
     // 参数
     double mission_loop_rate_;
     double target_lock_confidence_;  // 目标锁定所需置信度
@@ -3647,6 +3672,11 @@ public:
             case 0: {
                 // 打击
                 dt.target_type = 1;
+                // === 2026-10-10: 飞手接管守护需要 sr。提前在 case 0 顶部取一次,
+                //   后续 attack_speed 解析 if block 和 publish 守护共用同一引用。 ===
+                const auto& sr_ref = (current_skill_index_ < skill_queue_.size())
+                    ? skill_queue_[current_skill_index_]
+                    : SkillRuntime{};
                 // === 2026-08-19: SEARCH_TRACK + attack_cmd 必须用 params_json.attack_speed ===
                 //   当前 skill 是 SEARCH_TRACK(102)时,sr.msg.task_speed = search_speed(来自
                 //   starling_bridge kcp_comm.cpp:715),而不是攻击速度。攻击意图必须用
@@ -3700,11 +3730,17 @@ public:
                 //   用户口径:"我要末端图像导引,但是接收到 attackCmd 之后才要"
                 //   此后 TRACK/STRIKE 末段 chase 几何下沉;ignore/stash/RTL → 关
                 attack_cmd_received_ = true;
-                detect_target_pub_.publish(dt);
-                {
-                    multi_uav_strike::DetectTargets batch;
-                    batch.targets.push_back(dt);
-                    detect_targets_pub_.publish(batch);
+                // === 2026-10-10: 飞手接管后停发 detect_target ===
+                //   attack_cmd 路径只在 SEARCH_TRACK/SKILL_FOLLOW_USER 等会调到这里
+                //   (SKILL_FOLLOW_USER 让 sr_ref.attack_phase_ 离开 IDLE),所以守护
+                //   即便在 SEARCH_TRACK 触发 strike 也能拦下(GS skill 105 才走这条)。
+                if (!shouldSuppressDetectOnPilotOverride(sr_ref)) {
+                    detect_target_pub_.publish(dt);
+                    {
+                        multi_uav_strike::DetectTargets batch;
+                        batch.targets.push_back(dt);
+                        detect_targets_pub_.publish(batch);
+                    }
                 }
                 break;
             }
@@ -4772,11 +4808,18 @@ public:
         }
 
         // 门控通过或非 Attack(105) → 正常 strike
-        detect_target_pub_.publish(dt);
-        {
-            multi_uav_strike::DetectTargets batch;
-            batch.targets.push_back(dt);
-            detect_targets_pub_.publish(batch);
+        // === 2026-10-10: 飞手接管后停发 detect_target ===
+        //   这是 strike commit 的真正生效点,工作_mode 已被 shouldSuppressPostAttackDetectPublish
+        //   拦过 (work_mode=SEARCH_STRIKE),但 SEARCH_TRACK 期间 attack_cmdCallback
+        //   走 SKILL_FOLLOW_USER 也能让 sr.attack_phase_ 离开 IDLE;此时这条 strike
+        //   commit 直接 publish 不经 work_mode 闸,所以补一道 pilot-override 闸。
+        if (!shouldSuppressDetectOnPilotOverride(sr)) {
+            detect_target_pub_.publish(dt);
+            {
+                multi_uav_strike::DetectTargets batch;
+                batch.targets.push_back(dt);
+                detect_targets_pub_.publish(batch);
+            }
         }
         reported_to_gs_[cluster.cluster_id]    = {cluster.label, cluster.ned_x, cluster.ned_y};
         strike_dispatched_[cluster.cluster_id] = 1;

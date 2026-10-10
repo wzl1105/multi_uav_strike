@@ -54,3 +54,11 @@ The format below is intentionally minimal — one line per version, no headers.
 - New tools: `tools/update_tools/grab_bag.{sh,bat}` for on-site engineers
   to stop rosbag and SCP the latest .bag to local without power-cycling.
 - `deploy_windows.bat query <ip>` subcommand to inspect version on the board.
+- 飞手接管后停发 detect_target / detect_targets: 105 Attack 流程在执行中
+  且飞手把 OFFBOARD 切走时,mission_manager 不再往 GCS 上行定位信息。
+  接管 = 任务终止,接管后 UAV 不受机载控制,绿球位置不可信,
+  type=1 (strike trigger / strike commit) 也无意义。飞手松开回 OFFBOARD
+  立即恢复,无需新 TaskFlow。
+- 拉烟触发条件简化: 位置锁存 (高度 ≤4m 硬保护 或 bbox hover 持续 N 帧)
+  即触发拉烟,不再等 0.2s 速度/位置稳定。原"速度未达阈值永远不触发"
+  是"有时不触发"主因之一。删除 5 个 yaml 参数和 7 个 cpp 字段。

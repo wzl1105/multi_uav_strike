@@ -426,15 +426,8 @@ private:
     geometry_msgs::PoseStamped strike_test_position_hold_pose_;
     bool strike_test_position_hold_latched_ = false;
     geometry_msgs::Point strike_test_hold_position_nwu_;
-    ros::Time strike_test_position_hold_latched_time_;
     bool strike_test_smoke_enabled_ = false;
     std::string strike_test_smoke_service_ = "/trigger_smoke";
-    double strike_test_smoke_min_hold_sec_ = 1.0;
-    double strike_test_smoke_max_xy_speed_mps_ = 0.5;
-    double strike_test_smoke_max_z_speed_mps_ = 0.3;
-    double strike_test_smoke_max_position_error_m_ = 0.8;
-    double strike_test_smoke_stable_confirm_sec_ = 1.0;
-    ros::Time strike_test_smoke_stable_since_;
     bool strike_test_smoke_request_attempted_ = false;
     //=============打击保护bbox=========//
     //=============manual smoke trigger (rc_in + topic)================
@@ -794,17 +787,6 @@ public:
                                 strike_test_smoke_enabled_, false);
         nh_private_.param<std::string>("strike_test_smoke_service",
                                        strike_test_smoke_service_, "/trigger_smoke");
-        nh_private_.param<double>("strike_test_smoke_min_hold_sec",
-                                  strike_test_smoke_min_hold_sec_, 1.0);
-        nh_private_.param<double>("strike_test_smoke_max_xy_speed_mps",
-                                  strike_test_smoke_max_xy_speed_mps_, 0.5);
-        nh_private_.param<double>("strike_test_smoke_max_z_speed_mps",
-                                  strike_test_smoke_max_z_speed_mps_, 0.3);
-        nh_private_.param<double>("strike_test_smoke_max_position_error_m",
-                                  strike_test_smoke_max_position_error_m_, 0.8);
-        nh_private_.param<double>("strike_test_smoke_stable_confirm_sec",
-                                  strike_test_smoke_stable_confirm_sec_, 1.0);
-
         // === 手动拉烟(rc_in 杆量 + topic 双入口,与 strike_test_smoke 自动流程并行)===
         // 现场反馈:目前 strike_test_smoke 偶尔不触发(可能是稳定条件过严或硬件),
         //   加手动兜底,任意 arm 状态下都可由用户主动调一次。
@@ -845,15 +827,6 @@ public:
             strike_test_min_altitude_m_, strike_test_bbox_trigger_max_altitude_m_);
         strike_test_bbox_active_threshold_ = strike_test_bbox_hover_threshold_;
         strike_test_min_altitude_m_ = std::max(0.0, strike_test_min_altitude_m_);
-        strike_test_smoke_min_hold_sec_ = std::max(0.0, strike_test_smoke_min_hold_sec_);
-        strike_test_smoke_max_xy_speed_mps_ =
-            std::max(0.0, strike_test_smoke_max_xy_speed_mps_);
-        strike_test_smoke_max_z_speed_mps_ =
-            std::max(0.0, strike_test_smoke_max_z_speed_mps_);
-        strike_test_smoke_max_position_error_m_ =
-            std::max(0.0, strike_test_smoke_max_position_error_m_);
-        strike_test_smoke_stable_confirm_sec_ =
-            std::max(0.0, strike_test_smoke_stable_confirm_sec_);
         strike_test_bbox_confirm_frames_ = std::max(1, strike_test_bbox_confirm_frames_);
         strike_test_bbox_timeout_sec_ = std::max(0.05, strike_test_bbox_timeout_sec_);
         strike_test_bbox_filter_alpha_ = clampValue(
@@ -1450,8 +1423,8 @@ public:
             strike_test_bbox_last_update_time_ = ros::Time();
             strike_test_position_hold_latched_ = false;
             strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
-            strike_test_position_hold_latched_time_ = ros::Time();
-            strike_test_smoke_stable_since_ = ros::Time();
+
+
             strike_test_smoke_request_attempted_ = false;
             //=============打击保护bbox=========//
             const double target_age = last_target_pose_receive_time_.isZero()
@@ -1565,8 +1538,8 @@ public:
             strike_test_bbox_last_update_time_ = ros::Time();
             strike_test_position_hold_latched_ = false;
             strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
-            strike_test_position_hold_latched_time_ = ros::Time();
-            strike_test_smoke_stable_since_ = ros::Time();
+
+
             strike_test_smoke_request_attempted_ = false;
             //=============打击保护bbox=========//
             //===================制导修改====================
@@ -1602,8 +1575,8 @@ public:
             strike_test_bbox_last_update_time_ = ros::Time();
             strike_test_position_hold_latched_ = false;
             strike_test_position_hold_pose_ = geometry_msgs::PoseStamped();
-            strike_test_position_hold_latched_time_ = ros::Time();
-            strike_test_smoke_stable_since_ = ros::Time();
+
+
             strike_test_smoke_request_attempted_ = false;
             //=============打击保护bbox=========//
             // === 2026-08-19: 进入 strike 重置闭环下降跟踪器 ===
@@ -1868,8 +1841,6 @@ public:
         strike_test_position_hold_pose_.pose.orientation.w =
             std::cos(0.5 * output_yaw);
         strike_test_hold_position_nwu_ = current_uav_pose_.pose.position;
-        strike_test_position_hold_latched_time_ = ros::Time::now();
-        strike_test_smoke_stable_since_ = ros::Time();
         strike_test_position_hold_latched_ = true;
         ROS_ERROR("[STRIKE TEST GUARD] POSITION HOLD LATCHED: "
                   "topic=%s position=(%.2f,%.2f,%.2f) yaw=%.1fdeg",
@@ -1881,48 +1852,14 @@ public:
     }
 
     void maybeTriggerStrikeTestSmoke() {
+        // === 2026-10-10: 简化触发条件,位置锁存就发,不再等 0.2s 速度/位置稳定 ===
+        //   原 6 个 gate 删后 3 个 (min_hold_sec / max_pos_err+max_xy/z_speed /
+        //   stable_confirm_sec)。位置锁存本身已经是"已命中"语义
+        //   (高度硬保护 ≤4m 或 bbox hover 持续 N 帧),不应再被 0.2s 速度等待卡住
+        //   (UAV 还在减速过程 → 速度误差超阈 → 永远不触发,实测"有时不触发"主因之一)。
         if (!strike_test_smoke_enabled_ || strike_test_smoke_request_attempted_ ||
             !strike_test_guard_enabled_ || current_mode_ != "strike" ||
             !strike_test_position_hold_latched_ || !has_prev_uav_position_) {
-            return;
-        }
-
-        const ros::Time now = ros::Time::now();
-        if (strike_test_position_hold_latched_time_.isZero() ||
-            (now - strike_test_position_hold_latched_time_).toSec() <
-                strike_test_smoke_min_hold_sec_) {
-            strike_test_smoke_stable_since_ = ros::Time();
-            return;
-        }
-
-        const double dx = current_uav_pose_.pose.position.x - strike_test_hold_position_nwu_.x;
-        const double dy = current_uav_pose_.pose.position.y - strike_test_hold_position_nwu_.y;
-        const double dz = current_uav_pose_.pose.position.z - strike_test_hold_position_nwu_.z;
-        const double position_error_m = std::sqrt(dx * dx + dy * dy + dz * dz);
-        const double xy_speed_mps = std::hypot(last_known_uav_velocity_ned_.x,
-                                               last_known_uav_velocity_ned_.y);
-        const double z_speed_mps = std::fabs(last_known_uav_velocity_ned_.z);
-        const bool stable =
-            std::isfinite(position_error_m) && std::isfinite(xy_speed_mps) &&
-            std::isfinite(z_speed_mps) &&
-            position_error_m <= strike_test_smoke_max_position_error_m_ &&
-            xy_speed_mps <= strike_test_smoke_max_xy_speed_mps_ &&
-            z_speed_mps <= strike_test_smoke_max_z_speed_mps_;
-
-        if (!stable) {
-            strike_test_smoke_stable_since_ = ros::Time();
-            ROS_WARN_THROTTLE(1.0,
-                "[STRIKE TEST GUARD] waiting stable before smoke: "
-                "pos_err=%.2fm xy_speed=%.2fm/s z_speed=%.2fm/s",
-                position_error_m, xy_speed_mps, z_speed_mps);
-            return;
-        }
-        if (strike_test_smoke_stable_since_.isZero()) {
-            strike_test_smoke_stable_since_ = now;
-            return;
-        }
-        if ((now - strike_test_smoke_stable_since_).toSec() <
-            strike_test_smoke_stable_confirm_sec_) {
             return;
         }
 
