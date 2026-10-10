@@ -438,6 +438,11 @@ private:
     double manual_smoke_rc_timeout_sec_ = 1.0;
     bool manual_smoke_topic_enabled_ = true;
     std::string manual_smoke_topic_ = "/yx/cmd/trigger_smoke";
+    // === 2026-10-10: 地面手动测试用,默认 false (安全),现场测试时 launch 临时设 true ===
+    // 现场需要先卸保险再地面手动测拉烟 (disarm 状态),bypass armed gate 让 topic/RC
+    // 在 disarm 时也能触发。注意:设了 true 之后地面开机就要小心,任何 True 边沿都
+    // 会直接向 YX 板发 0x4E,测完务必改回 false。
+    bool manual_smoke_bypass_armed_gate_ = false;
     // 边沿 latch:上一次 topic 触发时间,用于去抖,以及最近一次成功 service call
     ros::Time last_manual_smoke_topic_time_;
     ros::Time last_manual_smoke_call_time_;
@@ -805,6 +810,8 @@ public:
                                 manual_smoke_topic_enabled_, true);
         nh_private_.param<std::string>("manual_smoke_topic",
                                        manual_smoke_topic_, "/yx/cmd/trigger_smoke");
+        nh_private_.param<bool>("manual_smoke_bypass_armed_gate",
+                                manual_smoke_bypass_armed_gate_, false);
         nh_private_.param<double>("strike_test_bbox_center_band",
                                   strike_test_bbox_center_band_, 0.25);
         nh_private_.param<double>("strike_test_bbox_min_confidence",
@@ -1648,13 +1655,18 @@ public:
      */
     void tryManualSmokeTrigger(const char* reason, int pwm) {
         // === 门 1:必须 armed(mavros state 还没收到时也算不通过) ===
-        if (!mavros_state_received_ || !mavros_armed_) {
+        //   现场地面手动测时需要 disarm 也能触发,设 manual_smoke_bypass_armed_gate=true 绕过。
+        //   测完务必改回 false (yaml 默认)。
+        if (!manual_smoke_bypass_armed_gate_ &&
+            (!mavros_state_received_ || !mavros_armed_)) {
             ROS_WARN_THROTTLE(2.0,
-                "[MANUAL SMOKE] REJECT (%s pwm=%d): UAV not armed (mavros_state_received=%d armed=%d). "
-                "Manual trigger is in-flight only; arm the UAV first.",
+                "[MANUAL SMOKE] REJECT (%s pwm=%d): UAV not armed (mavros_state_received=%d armed=%d bypass=%d). "
+                "Manual trigger is in-flight only; arm the UAV first "
+                "(or set manual_smoke_bypass_armed_gate=true for ground test).",
                 reason, pwm,
                 static_cast<int>(mavros_state_received_),
-                static_cast<int>(mavros_armed_));
+                static_cast<int>(mavros_armed_),
+                static_cast<int>(manual_smoke_bypass_armed_gate_));
             return;
         }
         // === 门 2:200ms 最小间隔(防 RC 抖动 + topic 边沿重发) ===

@@ -110,6 +110,10 @@ manual_smoke_rc_timeout_sec: 1.0
 # topic 入口:发 True 边沿触发一次,持续 True 不会反复触发。
 manual_smoke_topic_enabled: true
 manual_smoke_topic: "/yx/cmd/trigger_smoke"
+# 地面手动测试用: true 时 disarm 状态也能手动触发拉烟。现场测完务必改回 false
+# (yaml 默认 false,launch 也别覆盖)。设 true 时任何 topic True 边沿或 RC 杆量都会
+# 直接向 YX 板发 0x4E,地面开机要小心。
+manual_smoke_bypass_armed_gate: true
 
 # === 2026-08-28: TRACK/STRIKE 共享 strike_terminal_image_chase_* 一组参数 ===
 #   2026-08-25 引入的 4 个 track_* 独立参数已删除。TRACK 阶段 GS 未发
