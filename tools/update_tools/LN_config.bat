@@ -3,17 +3,17 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 REM ============================================================
-REM LN_config.bat — 板子运维入口（Windows 双击或命令行）
+REM LN_config.bat -- board operations entry (Windows double-click or CLI)
 REM
-REM 菜单:
-REM   [D]eploy   覆盖 bundle 到板子, restart 服务
-REM   [Q]uery    只查板子 / 本地 package.xml 版本
-REM   [G]rab     停板子 rosbag record (rosnode kill), 拉最新 group 的 .bag(.active) 回 bat 运行目录
-REM   [T]rigger  手动触发拉烟 (ssh 到板子发 rostopic pub /yx/cmd/trigger_smoke), 发前 y/N 确认
+REM Menu:
+REM   [D]eploy   push bundle to board + restart services
+REM   [Q]uery    show board / local package.xml version
+REM   [G]rab     stop board rosbag record (rosnode kill), scp latest group .bag(.active) back to bat cwd
+REM   [T]rigger  manual smoke trigger (ssh to board, rostopic pub /yx/cmd/trigger_smoke), y/N confirm first
 REM
 REM Command-line forms (skip prompts):
-REM   LN_config.bat                          菜单 (问 IP → 问动作)
-REM   LN_config.bat <target_ip>              菜单 (IP 预填)
+REM   LN_config.bat                          menu (ask IP -> ask action)
+REM   LN_config.bat <target_ip>              menu (IP prefilled)
 REM   LN_config.bat query [target_ip]        query only
 REM   LN_config.bat deploy <ip> [bundle]     deploy only (skip menu)
 REM   LN_config.bat grab [target_ip]         grab latest bag
@@ -70,8 +70,11 @@ REM package.xml is synced by deploy into src/<pkg>/; that's the source of truth
 REM on the board (devel/share/<pkg>/package.xml only exists after a local build).
 set "PKG_XML=%TGT_BASE%/src/%PKG_NAME%/package.xml"
 set "DEVEL_XML=%TGT_BASE%/devel/share/%PKG_NAME%/package.xml"
-set "LOCAL_XML=%~dp0..\..\package.xml"
-set "SSH_OPTS=-o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o ConnectTimeout=5 -o LogLevel=ERROR"
+set "SSH_MASTER_PATH=%TEMP%\ssh-master-lnconfig-%RANDOM%"
+REM   No quotes around %SSH_MASTER_PATH% inside -o ControlPath: nested double
+REM   quotes inside a set "..." statement get consumed by cmd.exe, leaving the
+REM   control socket path malformed ("getsockname failed: Bad file descriptor").
+set "SSH_OPTS=-o ControlMaster=auto -o ControlPath=%SSH_MASTER_PATH% -o ControlPersist=600 -o StrictHostKeyChecking=no -o UserKnownHostsFile=nul -o ConnectTimeout=5 -o LogLevel=ERROR"
 
 if /i "%ACTION%"=="query" goto :DO_QUERY
 if /i "%ACTION%"=="grab" goto :DO_GRAB
@@ -90,34 +93,37 @@ echo Querying %PKG_NAME% version on %SSH_USER%@%TGT_IP%
 echo ============================================================
 
 REM Probe SSH first
-ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" >nul 2>&1
+REM   stderr stays visible (password prompt from ssh.exe); stdout suppressed
+REM   because "true" outputs nothing. "2>&1" would also suppress the prompt.
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" >nul
 if errorlevel 1 (
     echo ERROR: cannot SSH to %SSH_USER%@%TGT_IP%
     pause
     exit /b 1
 )
 
-REM --- remote version: read <version> from src/<pkg>/package.xml ---
+REM --- remote version: SSH only cats the file, parse <version> locally to avoid
+REM     sed/awk escape hell in cmd.exe (ssh "command-line line 0: missing argument").
 set "REMOTE_VER_FOUND="
-for /f "usebackq delims=" %%V in (`ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "sed -n 's:^  *<version>\(.*\)</version>:\1:p' '%PKG_XML%' 2>/dev/null || sed -n 's:^  *<version>\(.*\)</version>:\1:p' '%DEVEL_XML%' 2>/dev/null"`) do (
-    if not "%%V"=="" (
-        set "REMOTE_VER=%%V"
-        set "REMOTE_VER_FOUND=1"
-    )
-)
-if not defined REMOTE_VER_FOUND (
-    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "test -f '%PKG_XML%' -o -f '%DEVEL_XML%'" >nul 2>&1
-    if errorlevel 1 set "REMOTE_VER=NOT_FOUND"
-)
-
-REM --- local dev version (best-effort, for compare) ---
-set "LOCAL_VER="
-if exist "%LOCAL_XML%" (
-    for /f "usebackq delims=" %%V in (`findstr /C:"<version>" "%LOCAL_XML%"`) do (
-        for /f "tokens=2 delims=<>" %%P in ("%%V") do (
-            if not "%%P"=="" set "LOCAL_VER=%%P"
+set "TMP_PKG_XML=%TEMP%\tzs_pkg_xml_%RANDOM%.txt"
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "cat '%PKG_XML%' 2>/dev/null || cat '%DEVEL_XML%' 2>/dev/null" > "%TMP_PKG_XML%" 2>nul
+echo.
+if exist "%TMP_PKG_XML%" (
+    REM tokens=3 delims=<> picks the content BETWEEN the tags: <version>X</version>
+    REM tokens=2 would just give the literal "version" inside the opening tag.
+    for /f "usebackq tokens=3 delims=<>" %%P in (`findstr /C:"<version>" "%TMP_PKG_XML%"`) do (
+        if not defined REMOTE_VER_FOUND (
+            set "REMOTE_VER=%%P"
+            set "REMOTE_VER_FOUND=1"
         )
     )
+    del "%TMP_PKG_XML%" 2>nul
+)
+if not defined REMOTE_VER_FOUND (
+    REM Same as probe above: keep stderr visible (password prompt) if master
+    REM is somehow not yet established; stdout suppressed because "test -f" outputs nothing.
+    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "test -f '%PKG_XML%' -o -f '%DEVEL_XML%'" >nul
+    if errorlevel 1 set "REMOTE_VER=NOT_FOUND"
 )
 
 echo.
@@ -134,12 +140,6 @@ goto :REMOTE_DONE
 echo Board version  : %REMOTE_VER%
 :REMOTE_DONE
 
-if defined LOCAL_VER (
-    echo Local dev ver  : %LOCAL_VER%
-) else (
-    echo Local dev ver  : ^<not found at %LOCAL_XML%^>
-)
-
 echo.
 echo Inspection path : %SSH_USER%@%TGT_IP%:%PKG_XML%
 echo ============================================================
@@ -148,9 +148,9 @@ endlocal
 exit /b 0
 
 REM ============================================================
-REM :DO_GRAB  -  rosnode kill 板子 rosbag, scp 拉最新 group 的 .bag 回 bat 当前目录
-REM   bat 启动时已经 cd /d %~dp0 切到脚本所在目录, 直接落 %cd%。
-REM   严禁删板子 bag (跟 feedback_dont_delete_log_files.md 一致)。
+REM :DO_GRAB  -  rosnode kill board rosbag, scp latest group .bag to bat cwd
+REM   bat startup already did cd /d %~dp0 to script dir, files land in %cd%.
+REM   NEVER delete board bags (see feedback_dont_delete_log_files.md).
 REM ============================================================
 :DO_GRAB
 where ssh >nul 2>&1 || (echo ERROR: ssh.exe not found & pause & exit /b 1)
@@ -161,33 +161,63 @@ echo ============================================================
 echo Grabbing latest bag from %SSH_USER%@%TGT_IP%:%BAG_DIR%
 echo ============================================================
 
-REM Probe SSH first
-ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" >nul 2>&1
+REM SSH ControlMaster: first ssh prompts for password, subsequent ssh/scp reuse the socket
+REM   Required because each ssh call here would otherwise re-prompt for password
+set "SSH_MASTER_PATH=%TEMP%\ssh-master-lnconfig-%RANDOM%"
+
+REM SSH_OPTS (with ControlMaster) is set globally near the top of the file.
+REM   Do NOT re-set it here: the previous G-only set was a leftover from when
+REM   ControlMaster was per-segment, and it had nested-quote bugs that broke
+REM   ControlPath ("getsockname failed: Bad file descriptor").
+REM Probe SSH (also opens master)
+REM   stdout suppressed (true outputs nothing), but stderr MUST stay visible
+REM   so the password prompt from ssh.exe is shown to the user. With "2>&1"
+REM   the prompt is also redirected to nul, user never sees it, ssh times out,
+REM   then the cleanup "-O exit" below opens a fresh connection (no master
+REM   was actually established) and the user lands in an interactive shell.
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" >nul
 if errorlevel 1 (
     echo ERROR: cannot SSH to %SSH_USER%@%TGT_IP%
     pause
     exit /b 1
 )
 
-REM 1) find /record_<N> node, kill if running
-set "RECORD_NODE="
-for /f "usebackq delims=" %%N in (`ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "rosnode list 2>/dev/null | grep '^/record_' | head -1"`) do (
-    set "RECORD_NODE=%%N"
+REM 1) find rosbag record process by pgrep, get PID, send SIGINT (graceful, .active -> .bag)
+REM    Avoid rosnode list (which needs ROS env and may hang on board if login shell stalls)
+REM    SSH output redirected to a temp file, NOT captured by for /f backticks.
+REM    Backtick+for+f capturing ssh's stderr (which can contain "Warning: ..."
+REM    or pgrep error text) into a for /f parse has been seen to crash cmd.exe
+REM    on Windows (window flashes shut). File-based read avoids that.
+echo [grab] probing rosbag record process on board...
+set "ROSBAG_PID="
+set "PID_TMP=%TEMP%\tzs_rosbag_pid_%RANDOM%.txt"
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "pgrep -f 'rosbag record' | head -1" > "%PID_TMP%" 2>nul
+if exist "%PID_TMP%" (
+    for /f "usebackq delims=" %%P in ("%PID_TMP%") do (
+        if not defined ROSBAG_PID set "ROSBAG_PID=%%P"
+    )
+    del "%PID_TMP%" 2>nul
 )
-if defined RECORD_NODE (
-    echo [grab] killing rosbag node: %RECORD_NODE%
-    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "rosnode kill '%RECORD_NODE%' 2>&1" || true
-    REM 等待 finalize (.active -> .bag)
-    timeout /t 3 /nobreak >nul
+if defined ROSBAG_PID (
+    echo [grab] detected rosbag record PID: %ROSBAG_PID%
+    echo [grab] sending SIGINT (graceful, lets .active finalize to .bag)...
+    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "kill -INT %ROSBAG_PID% 2>&1" >nul
+    echo [grab] waiting 4s for rosbag to finalize...
+    timeout /t 4 /nobreak >nul
+    echo [grab] finalize wait done
+    REM ensure it's dead (busybox pgrep may not have -f; SIGINT usually enough)
+    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "kill -0 %ROSBAG_PID% 2>/dev/null && kill -KILL %ROSBAG_PID% 2>/dev/null" >nul
 ) else (
-    echo [grab] no /record_* node running, skipping kill
+    echo [grab] no rosbag record process running, skipping kill
 )
 
-REM 2) list bag files, 取 N 最大那一组
-REM    文件名: multi_uav_flight_<N>_<M>.bag(.active)
-REM    板子端没有 awk 也不一定, 用 for 循环在 forfiles / ls 输出里切。
+REM 2) list bag files, pick the group with the highest N
+REM    filename: multi_uav_flight_<N>_<M>.bag(.active)
+REM    board may not have awk, so use powershell on the local output.
+echo [grab] listing bag files on board...
 set "GROUP_FILES_TMP=%TEMP%\tzs_grab_files_%RANDOM%.txt"
 ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "ls -1 '%BAG_DIR%'/multi_uav_flight_*.bag* 2>/dev/null" > "%GROUP_FILES_TMP%" 2>nul
+echo [grab] list done
 if errorlevel 1 (
     echo ERROR: ssh ls failed
     del "%GROUP_FILES_TMP%" 2>nul
@@ -195,32 +225,32 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 找最大 N (用 powershell, cmd 没浮点解析, 一行搞定)
+REM Find max N (use powershell, cmd has no float parsing, one-liner)
 set "MAX_N=0"
 for /f "usebackq delims=" %%M in (`powershell -NoProfile -Command "$lines = Get-Content '%GROUP_FILES_TMP%'; $max = 0; foreach ($l in $lines) { $bn = Split-Path $l -Leaf; $parts = $bn -split '_'; if ($parts.Length -ge 4) { $n = 0; if ([int]::TryParse($parts[3], [ref]$n)) { if ($n -gt $max) { $max = $n } } } }; $max"`) do (
     set "MAX_N=%%M"
 )
 if "%MAX_N%"=="0" (
-    echo ERROR: 解析 bag 文件名失败, 样本:
+    echo ERROR: failed to parse bag filenames, sample:
     type "%GROUP_FILES_TMP%"
     del "%GROUP_FILES_TMP%" 2>nul
     pause
     exit /b 1
 )
 
-REM 过滤出 N == MAX_N 的所有行
+REM Filter to keep only lines where N == MAX_N
 set "GROUP_FILES=%TEMP%\tzs_grab_group_%RANDOM%.txt"
 powershell -NoProfile -Command "$lines = Get-Content '%GROUP_FILES_TMP%'; $target = %MAX_N%; $lines | Where-Object { $bn = Split-Path $_ -Leaf; $parts = $bn -split '_'; $n = 0; if ([int]::TryParse($parts[3], [ref]$n)) { $n -eq $target } }" > "%GROUP_FILES%" 2>nul
 
 echo [grab] latest group N=%MAX_N%, files:
 type "%GROUP_FILES%" | findstr /R "." >nul && type "%GROUP_FILES%" || (
-    echo ERROR: 过滤后没有匹配 N=%MAX_N% 的文件
+    echo ERROR: no files matched N=%MAX_N% after filter
     del "%GROUP_FILES_TMP%" "%GROUP_FILES%" 2>nul
     pause
     exit /b 1
 )
 
-REM 3) scp 拉回 bat 当前目录
+REM 3) scp back to bat cwd
 echo [grab] scp -^> %cd%
 for /f "usebackq delims=" %%R in ("%GROUP_FILES%") do (
     scp %SSH_OPTS% %SSH_USER%@%TGT_IP%:"%%R" "%cd%\\" || (
@@ -236,13 +266,15 @@ echo === GRAB DONE ===
 echo Local dir: %cd%
 dir /b multi_uav_flight_%MAX_N%_* 2>nul
 del "%GROUP_FILES_TMP%" "%GROUP_FILES%" 2>nul
+echo.
+echo [grab] DONE. Press any key to close this window...
 pause
 endlocal
 exit /b 0
 
 REM ============================================================
-REM :DO_TRIGGER  -  ssh 到板子发 rostopic pub 拉烟, 发前 y/N 确认
-REM   armed gate 由板子端 guidance_control 自行决定 (yaml: manual_smoke_bypass_armed_gate)
+REM :DO_TRIGGER  -  ssh to board and rostopic pub smoke, y/N confirm first
+REM   armed gate is enforced by board-side guidance_control (yaml: manual_smoke_bypass_armed_gate)
 REM ============================================================
 :DO_TRIGGER
 where ssh >nul 2>&1 || (echo ERROR: ssh.exe not found & pause & exit /b 1)
@@ -251,7 +283,7 @@ echo.
 echo ============================================================
 echo TRIGGER SMOKE on %SSH_USER%@%TGT_IP%
 echo   rostopic pub /yx/cmd/trigger_smoke std_msgs/Bool "data: true" -1
-echo   (板子端 armed gate 由 guidance_control manual_smoke_bypass_armed_gate 决定)
+echo   (board-side armed gate is enforced by guidance_control manual_smoke_bypass_armed_gate)
 echo ============================================================
 set /p "CONFIRM=Are you sure you want to trigger smoke on %TGT_IP% ? [y/N] "
 if /i not "%CONFIRM%"=="y" if /i not "%CONFIRM%"=="Y" if /i not "%CONFIRM%"=="yes" if /i not "%CONFIRM%"=="YES" (
@@ -261,8 +293,19 @@ if /i not "%CONFIRM%"=="y" if /i not "%CONFIRM%"=="Y" if /i not "%CONFIRM%"=="ye
     exit /b 0
 )
 echo [trigger] confirmed, sending...
-ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "bash -lc 'source /opt/ros/*/setup.bash 2>/dev/null; rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool \"data: true\" 2>&1'" || (
-    echo ERROR: 触发失败, 板子端 rostopic pub 报错 (见上)
+REM rostopic is a python3 script that needs PYTHONPATH set by sourcing setup.bash
+REM bash -c (not bash -lc) is fast and avoids login shell hang
+REM distro auto-detect: /opt/ros/<distro>/setup.bash
+REM ROS_HOSTNAME=localhost (not $(hostname)): 板子 /etc/hosts may have stale IP
+REM (e.g. 192.168.1.152) but the actual NIC is another IP (e.g. 192.168.1.156).
+REM Without localhost, publisher URI resolves to the stale IP, subscriber fails
+REM to connect. localhost always goes through lo 127.0.0.1, always works for
+REM board-local publisher + subscriber + roscore.
+REM Default -1 (no --latch, no timeout): rostopic registers with master, publishes one
+REM message, then the publisher self-exits after 3s. Whole SSH command returns
+REM in ~5s. No SIGTERM risk killing the publisher before XMLRPC register finishes.
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "bash -c 'SETUP=\$(ls /opt/ros/*/setup.bash 2>/dev/null | head -1); if [ -z \"\$SETUP\" ]; then echo no /opt/ros/*/setup.bash found; exit 1; fi; source \"\$SETUP\"; export ROS_HOSTNAME=localhost; export ROS_MASTER_URI=http://localhost:11311; rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool \"data: true\" 2>&1'" || (
+    echo ERROR: trigger failed, board-side rostopic pub reported an error (see above)
     pause
     endlocal
     exit /b 1
@@ -294,41 +337,44 @@ set "BUNDLE_ROOT="
 for /d %%D in ("!WORKDIR!\*") do if not defined BUNDLE_ROOT set "BUNDLE_ROOT=%%D"
 if not defined BUNDLE_ROOT (rmdir /S /Q "!WORKDIR!" 2>nul & echo ERROR: bundle root not found & pause & exit /b 1)
 
-set "SSH_OPTS_DEPLOY=-o StrictHostKeyChecking=no -o UserKnownHostsFile=nul"
+REM Deploy段: use the same SSH_OPTS as the rest of the script (has ControlMaster).
+REM   The previous dedicated SSH_OPTS_DEPLOY had no ControlMaster, so every ssh/scp
+REM   in the deploy segment re-prompted for password (10+ times per deploy).
+REM   With shared master + probe at startup, deploy asks once and reuses.
 
 echo.
 echo ============================================================
-echo Deploying to %TGT_IP% (each ssh/scp may prompt for password)
+echo Deploying to %TGT_IP% (SSH master reused, no password re-prompt)
 echo Press Ctrl+C to cancel
 echo ============================================================
 echo.
 
-ssh %SSH_OPTS_DEPLOY% %SSH_USER%@%TGT_IP% "true" || (rmdir /S /Q "!WORKDIR!" 2>nul & echo ERROR: SSH connect failed & pause & exit /b 1)
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "true" || (rmdir /S /Q "!WORKDIR!" 2>nul & echo ERROR: SSH connect failed & pause & exit /b 1)
 
-ssh %SSH_OPTS_DEPLOY% %SSH_USER%@%TGT_IP% "sudo systemctl stop %SERVICES% 2>/dev/null || true"
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "sudo systemctl stop %SERVICES% 2>/dev/null || true"
 
 for /d %%P in ("!BUNDLE_ROOT!\devel\lib\*") do (
-    if /i not "%%~nxP"=="python3" scp %SSH_OPTS_DEPLOY% -r "%%P\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/devel/lib/%%~nxP/
+    if /i not "%%~nxP"=="python3" scp %SSH_OPTS% -r "%%P\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/devel/lib/%%~nxP/
 )
 
 if exist "!BUNDLE_ROOT!\devel\lib\python3\dist-packages" (
-    for /d %%Q in ("!BUNDLE_ROOT!\devel\lib\python3\dist-packages\*") do scp %SSH_OPTS_DEPLOY% -r "%%Q\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/devel/lib/python3/dist-packages/%%~nxQ/
+    for /d %%Q in ("!BUNDLE_ROOT!\devel\lib\python3\dist-packages\*") do scp %SSH_OPTS% -r "%%Q\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/devel/lib/python3/dist-packages/%%~nxQ/
 )
 
 if exist "!BUNDLE_ROOT!\src" (
-    for /d %%S in ("!BUNDLE_ROOT!\src\*") do scp %SSH_OPTS_DEPLOY% -r "%%S\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/src/%%~nxS/
+    for /d %%S in ("!BUNDLE_ROOT!\src\*") do scp %SSH_OPTS% -r "%%S\*" %SSH_USER%@%TGT_IP%:%TGT_BASE%/src/%%~nxS/
 )
 
 REM Fix permissions: scp as root leaves dirs as drwx------, blocks rpdzkj
 REM (systemd User) from entering. Force all dirs under src/ and devel/lib/ to 755.
-ssh %SSH_OPTS_DEPLOY% %SSH_USER%@%TGT_IP% "find %TGT_BASE%/src %TGT_BASE%/devel/lib -type d -exec chmod 755 {} \;"
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "find %TGT_BASE%/src %TGT_BASE%/devel/lib -type d -exec chmod 755 {} \;"
 
 if exist "!BUNDLE_ROOT!\start_gimbal.sh" (
-    scp %SSH_OPTS_DEPLOY% "!BUNDLE_ROOT!\start_gimbal.sh" %SSH_USER%@%TGT_IP%:%TGT_BASE%/start_gimbal.sh
-    ssh %SSH_OPTS_DEPLOY% %SSH_USER%@%TGT_IP% "chmod +x %TGT_BASE%/start_gimbal.sh"
+    scp %SSH_OPTS% "!BUNDLE_ROOT!\start_gimbal.sh" %SSH_USER%@%TGT_IP%:%TGT_BASE%/start_gimbal.sh
+    ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "chmod +x %TGT_BASE%/start_gimbal.sh"
 )
 
-ssh %SSH_OPTS_DEPLOY% %SSH_USER%@%TGT_IP% "sudo systemctl daemon-reload && sudo systemctl restart %SERVICES%"
+ssh %SSH_OPTS% %SSH_USER%@%TGT_IP% "sudo systemctl daemon-reload && sudo systemctl restart %SERVICES%"
 
 rmdir /S /Q "!WORKDIR!" 2>nul
 

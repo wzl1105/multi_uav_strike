@@ -33,7 +33,6 @@ PKG_NAME="multi_uav_strike"
 PKG_XML="$TGT_BASE/src/$PKG_NAME/package.xml"
 DEVEL_XML="$TGT_BASE/devel/share/$PKG_NAME/package.xml"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_XML="$SCRIPT_DIR/../../package.xml"
 NO_RESTART="${NO_RESTART:-0}"
 SERVICES="${SERVICES:-tzs_ws-multi tzs_ws-payload}"
 
@@ -66,6 +65,19 @@ else
     ACTION="deploy"
 fi
 
+# === SSH ControlMaster: 第一次 ssh 输密码, 后续 ssh/scp 都复用, 不再问 ===
+#   query / grab / trigger / deploy 四段共用一个 master (避免每次 ssh 重新认证多问一次密码)
+#   必须在所有段之前定义, query 段 (L83) 也用 $SSH_BASE
+SSH_MASTER_PATH="/tmp/ssh-master-lnconfig-$$-${TGT_IP//./_}"
+cleanup_ssh_master() {
+    if [ -n "$SSH_MASTER_PATH" ]; then
+        ssh -o ControlPath="$SSH_MASTER_PATH" -O exit "$SSH_USER@$TGT_IP" 2>/dev/null || true
+        rm -f "$SSH_MASTER_PATH"
+    fi
+}
+trap cleanup_ssh_master EXIT
+SSH_BASE="ssh -o ControlMaster=auto -o ControlPath=$SSH_MASTER_PATH -o ControlPersist=600 -o ConnectTimeout=5 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
 # ===========================================================
 # Query
 # ===========================================================
@@ -83,23 +95,22 @@ if [ "$ACTION" = "query" ]; then
 
     REMOTE_VER=""
     REMOTE_VER_FOUND=0
-    REMOTE_VER=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
-        "grep -oP '(?<=<version>)[^<]+' '$PKG_XML' 2>/dev/null \
-         || grep -oP '(?<=<version>)[^<]+' '$DEVEL_XML' 2>/dev/null" 2>/dev/null | head -1 || true)
-    if [ -n "$REMOTE_VER" ]; then
-        REMOTE_VER_FOUND=1
+    # SSH only cats the file, parse <version> locally to avoid busybox grep
+    # (no -P Perl regex) and avoid sed/awk escape hell over SSH.
+    REMOTE_VER_RAW=$($SSH_BASE "$SSH_USER@$TGT_IP" \
+        "cat '$PKG_XML' 2>/dev/null || cat '$DEVEL_XML' 2>/dev/null" 2>/dev/null || true)
+    if [ -n "$REMOTE_VER_RAW" ]; then
+        REMOTE_VER=$(echo "$REMOTE_VER_RAW" | grep -oP '(?<=<version>)[^<]+' | head -1 || true)
+        if [ -n "$REMOTE_VER" ]; then
+            REMOTE_VER_FOUND=1
+        fi
+        # else: file exists but has no <version> tag → REMOTE_VER stays empty
+        #       and falls through to "version tag missing" branch in print
     else
-        if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
+        if ! $SSH_BASE "$SSH_USER@$TGT_IP" \
             "test -f '$PKG_XML' -o -f '$DEVEL_XML'" 2>/dev/null; then
             REMOTE_VER="NOT_FOUND"
         fi
-    fi
-
-    LOCAL_VER=""
-    if [ -f "$LOCAL_XML" ]; then
-        LOCAL_VER=$(grep -oP '(?<=<version>)[^<]+' "$LOCAL_XML" 2>/dev/null | head -1 || true)
     fi
 
     echo
@@ -111,12 +122,6 @@ if [ "$ACTION" = "query" ]; then
         echo "                          $DEVEL_XML"
     else
         echo "Board version  : NOT FOUND <version> tag missing in package.xml"
-    fi
-
-    if [ -n "$LOCAL_VER" ]; then
-        echo "Local dev ver  : $LOCAL_VER"
-    else
-        echo "Local dev ver  : <not found at $LOCAL_XML>"
     fi
 
     echo
@@ -135,32 +140,37 @@ if [ "$ACTION" = "grab" ]; then
     echo "============================================================"
     echo "Grabbing latest bag from $SSH_USER@$TGT_IP:$BAG_DIR"
     echo "============================================================"
+fi
 
-    if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        "$SSH_USER@$TGT_IP" "true" 2>/dev/null; then
+# 探活 + 建 master (grab / trigger / deploy 三段都跑, query 段在前面已经用 SSH_BASE 跑过)
+#   加 deploy 是因为 deploy 段之前没探活, SSH master 在第一次 deploy SSH 调用时才建,
+#   多问一次密码。加 deploy 后, 启动时探活先建 master, 后续 deploy ssh/rsync 全部复用, 不再问密码
+if [ "$ACTION" = "grab" ] || [ "$ACTION" = "trigger" ] || [ "$ACTION" = "deploy" ]; then
+    if ! $SSH_BASE "$SSH_USER@$TGT_IP" "true" 2>/dev/null; then
         echo "ERROR: cannot SSH to $SSH_USER@$TGT_IP"
         exit 1
     fi
+fi
 
-    # 1) 找 /record_<N> 节点, 如有就 rosnode kill (rosbag 收到 SIGINT finalize .active → .bag)
-    RECORD_NODE=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
-        "rosnode list 2>/dev/null | grep '^/record_' | head -1" 2>/dev/null || true)
-    if [ -n "$RECORD_NODE" ]; then
-        echo "[grab] killing rosbag node: $RECORD_NODE"
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
-            "rosnode kill '$RECORD_NODE' 2>&1 || true"
-        # 等 finalize
-        sleep 3
+if [ "$ACTION" = "grab" ]; then
+
+    # 1) 找 rosbag record 进程, 拿 PID 温柔 kill (发 SIGINT, .active 收尾变 .bag)
+    #   不依赖 rosnode / bash -lc (板子 ROS env 缺失 / login shell hang 都不会让 G 卡住)
+    #   rosbag 进程命令行特征: "rosbag record ..." (start_gimbal.sh L754)
+    echo "[grab] probing rosbag record process on board..."
+    ROSBAG_PID=$($SSH_BASE "$SSH_USER@$TGT_IP" \
+        "pgrep -f 'rosbag record' | head -1" 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -n "$ROSBAG_PID" ]; then
+        echo "[grab] detected rosbag record PID: $ROSBAG_PID"
+        echo "[grab] sending SIGINT (graceful, lets .active finalize to .bag)..."
+        $SSH_BASE "$SSH_USER@$TGT_IP" \
+            "kill -INT $ROSBAG_PID 2>&1; sleep 4; kill -0 $ROSBAG_PID 2>/dev/null && kill -KILL $ROSBAG_PID 2>/dev/null; true"
     else
-        echo "[grab] no /record_* node running, skipping kill"
+        echo "[grab] no rosbag record process running, skipping kill"
     fi
 
     # 2) 拉一组 (按 N 最大的 group, 整组所有 .bag / .bag.active 一次 scp)
-    REMOTE_BAGS=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
+    REMOTE_BAGS=$($SSH_BASE "$SSH_USER@$TGT_IP" \
         "ls -1 '$BAG_DIR'/multi_uav_flight_*.bag* 2>/dev/null" 2>/dev/null || true)
     if [ -z "$REMOTE_BAGS" ]; then
         echo "ERROR: $BAG_DIR 下找不到 multi_uav_flight_*.bag*"
@@ -196,8 +206,8 @@ if [ "$ACTION" = "grab" ]; then
     echo "[grab] scp → $LOCAL_DEST"
     while IFS= read -r remote_file; do
         [ -n "$remote_file" ] || continue
-        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR \
+        scp -o ControlMaster=auto -o ControlPath="$SSH_MASTER_PATH" -o ControlPersist=600 \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
             "$SSH_USER@$TGT_IP:$remote_file" "$LOCAL_DEST/" || {
             echo "ERROR: scp 失败 $remote_file"
             exit 1
@@ -226,13 +236,26 @@ if [ "$ACTION" = "trigger" ]; then
     case "$CONFIRM" in
         [Yy]|[Yy][Ee][Ss])
             echo "[trigger] confirmed, sending..."
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
-                "bash -lc 'source /opt/ros/*/setup.bash 2>/dev/null; rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool \"data: true\" 2>&1'" || {
-                echo "ERROR: 触发失败, 板子端 rostopic pub 报错 (见上)"
-                exit 1
-            }
-            echo "=== TRIGGER DONE ==="
+            # 关键: rostopic 是 python3 脚本, 调它必须 PYTHONPATH 包含 /opt/ros/<distro>/lib/python3/dist-packages
+            # 唯一可靠的来源是 source /opt/ros/<distro>/setup.bash。
+            # 之前用 'sh -c' + 直接绝对路径: sh 是 dash, source 不认, 而且跳过 source 后 PYTHONPATH 没设
+            # 改用 'bash -c' (不依赖 login shell, 比 'bash -lc' 快很多, 不 hang), 显式 source distro setup.bash
+            # distro 探测: ls /opt/ros/*/setup.bash 取第一个 (noetic/melodic/...)
+            # ROS_HOSTNAME=localhost (不写 $(hostname)): 板子 /etc/hosts 可能写死旧 IP (e.g. 192.168.1.152)
+            # 但板子网卡实际是另一个 IP (e.g. 192.168.1.156), publisher URI 解析到不存在的 IP
+            # → subscriber 主动连 publisher 失败, 收不到消息。localhost 永远走 lo 127.0.0.1,
+            # 同一台板子上 publisher + subscriber + roscore 互连永远通。
+            # 不加 --latch, 不加 timeout: -1 模式 rostopic 会自动注册 + 发 1 条 + 3s 后自我退出
+            # 之前 timeout 5 杀在 master XMLRPC 注册前 (Publishers: None); timeout 15 仍不稳
+            # 改用默认 -1 行为, 整条命令 5s 内自然返回, 不靠 SIGTERM 杀
+            TRIGGER_OUTPUT=$($SSH_BASE "$SSH_USER@$TGT_IP" \
+                "bash -c 'SETUP=\$(ls /opt/ros/*/setup.bash 2>/dev/null | head -1); if [ -z \"\$SETUP\" ]; then echo \"no /opt/ros/*/setup.bash found\"; exit 1; fi; source \"\$SETUP\"; export ROS_HOSTNAME=localhost; export ROS_MASTER_URI=http://localhost:11311; rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool \"data: true\" 2>&1'" 2>&1 || true)
+            echo "[trigger] board output:"
+            echo "$TRIGGER_OUTPUT" | sed 's/^/    /'
+            # -1 模式: publisher 注册到 master + 发 1 条 + 3s 后自退
+            # "publishing and latching message for 3.0 seconds" 出现即代表已注册并开始 publish
+            # 不再 info 验证 (publisher 已退, Publishers 必为 None, WARNING 是恒定误报)
+            echo "=== TRIGGER DONE (板子端 subscriber 已在 latch 窗口内收到 1 条消息) ==="
             ;;
         *)
             echo "[trigger] cancelled by user"
@@ -261,29 +284,21 @@ if [ ! -f "$BUNDLE" ]; then
     exit 1
 fi
 
-# SSH ControlMaster: 第一次 ssh 输密码,后续 ssh/rsync 都复用,不再问
-SSH_MASTER_PATH="/tmp/ssh-master-deploy-$$-${TGT_IP//./_}"
-cleanup_ssh_master() {
-    if [ -n "$SSH_MASTER_PATH" ]; then
-        ssh -o ControlPath="$SSH_MASTER_PATH" -O exit "$SSH_USER@$TGT_IP" 2>/dev/null || true
-        rm -f "$SSH_MASTER_PATH"
-    fi
-}
-trap cleanup_ssh_master EXIT
+# SSH ControlMaster: 复用外层 grab/trigger 段的 master (L143), 避免再问一次密码
+#   外层 trap cleanup_ssh_master EXIT 仍负责最后 cleanup
+RSYNC_SSH="$SSH_BASE"
 
-# 探活 + 建 master
+# 探活 (master 已建, 跑一次 true 确认还活着)
 echo "[deploy] probe $SSH_USER@$TGT_IP"
-if ! ssh -o ControlMaster=auto -o ControlPath="$SSH_MASTER_PATH" -o ControlPersist=600 -o ConnectTimeout=5 \
-    "$SSH_USER@$TGT_IP" "true" 2>&1; then
+if ! $SSH_BASE "$SSH_USER@$TGT_IP" "true" 2>&1; then
     echo "ERROR: 无法 SSH 到 $SSH_USER@$TGT_IP"
     exit 1
 fi
 
-RSYNC_SSH="ssh -o ControlPath=$SSH_MASTER_PATH"
-
 # 解压到临时目录
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# 链式 trap: deploy 退出时同时 cleanup 外层 lnconfig master + 删除临时目录
+trap 'cleanup_ssh_master; rm -rf "$WORK"' EXIT
 echo "[deploy] 解压 bundle → $WORK"
 tar -xzf "$BUNDLE" -C "$WORK"
 BUNDLE_ROOT=$(find "$WORK" -mindepth 1 -maxdepth 1 -type d | head -1)

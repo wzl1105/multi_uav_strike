@@ -86,3 +86,9 @@ The format below is intentionally minimal — one line per version, no headers.
     `rostopic pub -1 /yx/cmd/trigger_smoke std_msgs/Bool "data: true"`。
     默认 N 防误操作,armed gate 由板子端 guidance_control
     `manual_smoke_bypass_armed_gate` 决定 (脚本不绕 safety)。
+    关键环境变量: `ROS_HOSTNAME=localhost` (不写 `$(hostname)`)。
+    根因: 板子 `/etc/hosts` 把 `rockchip` 写死到 `192.168.1.152`,
+    但板子网卡实际是 `192.168.1.156`,publisher URI 解析到不存在的
+    IP → subscriber 主动连失败,echo 收不到消息。`localhost` 永远走
+    lo 127.0.0.1,板子端 publisher + subscriber + roscore 互连永远通。
+    ROS_MASTER_URI 也用 `http://localhost:11311` (板子本机 roscore)。
