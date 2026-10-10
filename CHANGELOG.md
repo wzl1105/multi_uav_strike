@@ -62,3 +62,15 @@ The format below is intentionally minimal — one line per version, no headers.
 - 拉烟触发条件简化: 位置锁存 (高度 ≤4m 硬保护 或 bbox hover 持续 N 帧)
   即触发拉烟,不再等 0.2s 速度/位置稳定。原"速度未达阈值永远不触发"
   是"有时不触发"主因之一。删除 5 个 yaml 参数和 7 个 cpp 字段。
+- Attack 阶段 primary 选择改用 YOLO back-projection 优先 (Step 1.5):
+  跟踪最近 1.5s 内的 YOLO bbox 反投影到地面的 (cluster, gx, gy),
+  选其中离 WP2 最近且 label 匹配的 cluster 当 primary,先于
+  closest-to-WP2 fallback 执行。修 12-00-54 bag cluster 2 失 YOLO
+  期间被 stale filter 排除,fresh 但错的 cluster 抢占 primary 的 bug。
+  yaml 新参数 `yolo_back_proj_window_sec`。
+- flight_test mavros 白名单加 `manual_control` plugin:
+  `launch/single_uav_px4_flight_test.launch` plugin_whitelist 显式收紧版
+  没列 manual_control,`/uav0/mavros/manual_control/send` 无订阅者,发
+  消息被 ROS 排队丢弃。加 'manual_control' 后 mavros 启动加载 plugin,
+  ROS 端可正常订阅,FCU 端需在非 OFFBOARD 模式 (POSCTL/MANUAL) 下生效。
+  `tzs_ctl.launch` 走 mavros 默认启动本就在白名单,不动。

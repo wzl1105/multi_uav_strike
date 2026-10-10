@@ -238,6 +238,10 @@ public:
         p.param<double>("kf_predict_freq", kf_predict_freq_, 50.0);
         // === 2026-08-24: stale_freeze 阈值 (cluster 长时间无观测视为丢失) ===
         p.param<double>("cluster_stale_freeze_sec", cluster_stale_freeze_sec_, 3.0);
+        // === 2026-10-10: YOLO back-projection primary selection window ===
+        //   Step 1.5 override 用最近 yolo_back_proj_window_sec 内的 back-projection
+        //   选 primary, 兼容 10Hz YOLO + 偶发漏帧, 不留太老避免 stale back-projection
+        p.param<double>("yolo_back_proj_window_sec", yolo_back_proj_window_sec_, 1.5);
         // marker 颜色
         p.param<double>("est_marker_r", est_marker_r_, 1.0);
         p.param<double>("est_marker_g", est_marker_g_, 1.0);
@@ -513,6 +517,19 @@ public:
         // 投影失败 (射线水平 / 朝后) — 既无法匹配已有 cluster 也无法新建,直接丢弃该 detection
         if (!cand_valid) return;
 
+        // === 2026-10-10: 跟踪最近 YOLO back-projection, 给 Step 1.5 primary override 用 ===
+        //   独立锁 recent_yolo_back_proj_mtx_, 不嵌套在 clusters_mtx_ 内 (无死锁风险)。
+        //   cluster_id 由 caller 传: KF 命中分支传 nearest_id, 新建分支传 nc.id。
+        auto push_back_proj = [&](uint64_t cluster_id) {
+            std::lock_guard<std::mutex> g(recent_yolo_back_proj_mtx_);
+            recent_yolo_back_proj_.push_back({cluster_id, cand_tx, cand_ty, observation_time});
+            while (!recent_yolo_back_proj_.empty() &&
+                   (observation_time - recent_yolo_back_proj_.front().stamp).toSec() >
+                       yolo_back_proj_window_sec_) {
+                recent_yolo_back_proj_.pop_front();
+            }
+        };
+
         if (nearest_id != 0) {
             // === 2026-08-23: 替换 2D EMA 为 4-state KF (Plan B + KF) ===
             //   静目标 (Q_vel→0): KF 速度衰减到 0, 等效位置 EMA, 行为零回归
@@ -559,6 +576,8 @@ public:
                     c.id, c.label.c_str(),
                     c.best_confidence, det.confidence, det.img_data.size());
             }
+            // === 2026-10-10: 提交 KF 命中分支的 back-projection,给 Step 1.5 primary override 用 ===
+            push_back_proj(nearest_id);
             return;
         }
 
@@ -610,6 +629,8 @@ public:
             emitClusterEvent(clusters_[nc.id]);
         }
         //===========rc识别=============
+        // === 2026-10-10: 提交新建分支的 back-projection (用新建 cluster 的 id 而非 nearest_id) ===
+        push_back_proj(nc.id);
     }
 
     // ClusterEvent stores the promoted target position in NWU coordinates.
@@ -1232,94 +1253,134 @@ public:
                 }
             }
         }
+
+        // === 2026-10-10: hoist WP2 GPS → NWU 坐标 + sanity 范围到 Step 1.5 之前 ===
+        //   Step 1.5 (YOLO back-projection) 和 Step 2 (closest-to-WP2) 都用同一组 WP2
+        //   坐标, 原版 Step 2 在 closest search 块内算 WP2, Step 1.5 拿不到 — 提到
+        //   外层, 两边都复用。变量在 Step 3 之前都在 scope 内。
+        bool wp2_coords_valid = false;
+        double wp2_n_outer = 0.0;
+        double wp2_nwu_y_outer = 0.0;
+        constexpr double kWp2SanityRange = 100.0;  // m
+        if (is_attack_active_ && attack_wp2_gps_valid_ && is_home_locked_) {
+            // WP2 GPS → NWU(相对 home, 与 cluster.ned_x/ned_y 同系)
+            //   c.ned_y 是 NWU y = west_m(正值=西)
+            //   GPS lon delta → east_m(正值=东), 转换: wp2_nwu_y = -east_m
+            //   bag 02-25-41 复盘: 符号反了导致 cluster 3 (N130 E100, WP2 处) 距离
+            //   被算成 200m, 所有 cluster 越界 sanity range, fallback 回最高置信度。
+            constexpr double DEG_PER_M_LAT = 1.0 / 111320.0;
+            const double cos_lat = std::cos(home_gps_.latitude * M_PI / 180.0);
+            if (std::isfinite(cos_lat) && std::fabs(cos_lat) > 1e-9) {
+                const double deg_per_m_lon = DEG_PER_M_LAT / cos_lat;
+                wp2_n_outer = (attack_wp2_gps_.latitude - home_gps_.latitude) /
+                                      DEG_PER_M_LAT;
+                const double wp2_east_m = (attack_wp2_gps_.longitude - home_gps_.longitude) /
+                                          deg_per_m_lon;
+                wp2_nwu_y_outer = -wp2_east_m;  // NWU y = west_m
+                wp2_coords_valid = true;
+            }
+        }
+
+        // === 2026-10-10: YOLO back-projection primary override (Step 1.5) ===
+        //   优先于 closest-to-WP2 fallback, 因为 raw back-projection 不受 stale filter 影响
+        //   (cluster 2 失 YOLO 期间, 之前帧的 back-projection 仍指向 sim id=1, 12-00-54 bag)
+        //   锁内只读 deque, 锁外查 clusters_ + label 过滤, 不构成嵌套锁, 死锁 = 0
+        //   WP2 NWU 坐标 (wp2_n_outer / wp2_nwu_y_outer / wp2_coords_valid) 在 Step 2 块之前
+        //   已经 hoist 算好 (L1323-1342 移上来), 这里直接复用
+        if (wp2_coords_valid) {
+            uint64_t best_cluster_id_bp = 0;
+            double best_dist_sq_bp = std::numeric_limits<double>::infinity();
+            size_t recent_size_bp = 0;
+            {
+                std::lock_guard<std::mutex> g(recent_yolo_back_proj_mtx_);
+                for (const auto& entry : recent_yolo_back_proj_) {
+                    const double dx = entry.gx - wp2_n_outer;
+                    const double dy = entry.gy - wp2_nwu_y_outer;
+                    const double d2 = dx*dx + dy*dy;
+                    // 仅在 WP2 sanity 范围内 (跟 Step 2 一致, 100m)
+                    if (d2 < best_dist_sq_bp && d2 < kWp2SanityRange * kWp2SanityRange) {
+                        best_dist_sq_bp = d2;
+                        best_cluster_id_bp = entry.cluster_id;
+                    }
+                }
+                recent_size_bp = recent_yolo_back_proj_.size();
+            }
+            if (best_cluster_id_bp != 0) {
+                // 锁外查 clusters_ + label 过滤 (跟 Step 2 现有 pattern 一致, 无锁读)
+                auto it_bp = clusters_.find(best_cluster_id_bp);
+                if (it_bp != clusters_.end() && it_bp->second.is_promoted &&
+                    labelMatchesCachedTargetType(it_bp->second.label)) {
+                    primary = &it_bp->second;
+                    ROS_INFO_THROTTLE(2.0,
+                        "[TargetClusterer] Primary: YOLO back-projection closest-to-WP2 "
+                        "cluster_id=%lu label=%s (back_proj_dist=%.1fm to WP2, %zu recent)",
+                        primary->id, primary->label.c_str(),
+                        std::sqrt(best_dist_sq_bp), recent_size_bp);
+                }
+            }
+        }
+
         if (primary == nullptr) {
             bool used_wp2_fallback = false;
-            // === 2026-08-28: hoist WP2 GPS → NWU 坐标 + sanity 范围到外层 ===
-            //   原来 wp2_n / wp2_nwu_y / kWp2SanityRange 是 closest-to-WP2 内层的
-            //   局部变量,highest-confidence fallback 拿不到。bag
-            //   uav0_strike_2026-08-28-00-06-08_0.bag:closest-to-WP2 因 attack_point
-            //   car 没被 YOLO 检出 (label-matched 候选 <100m 全空) → fall through 到
-            //   highest-confidence,但 highest-confidence 完全不查距离 → 挑了 119m 远
-            //   的 cluster[45]=car 当 primary → chase 跟到 6m horiz 完全错目标。
-            //   修法:在 attack + wp2_gps_valid + home_locked 三条件满足下,把 WP2
-            //   坐标 + sanity 半径提到外层,让 highest-confidence fallback 也能复用
-            //   同一个距离约束(跟 closest-to-WP2 一致),保证 Attack 阶段 fallback
-            //   不会选 WP2 100m 以外的 cluster 当 primary。
-            bool wp2_coords_valid = false;
-            double wp2_n_outer = 0.0;
-            double wp2_nwu_y_outer = 0.0;
-            constexpr double kWp2SanityRange = 100.0;  // m
-            if (is_attack_active_ && attack_wp2_gps_valid_ && is_home_locked_) {
-                // WP2 GPS → NWU(相对 home,与 cluster.ned_x/ned_y 同系)
-                //   c.ned_y 是 NWU y = west_m(正值=西)
-                //   GPS lon delta → east_m(正值=东),转换:wp2_nwu_y = -east_m
-                //   bag 02-25-41 复盘:符号反了导致 cluster 3 (N130 E100, WP2 处) 距离
-                //   被算成 200m,所有 cluster 越界 sanity range,fallback 回最高置信度。
-                constexpr double DEG_PER_M_LAT = 1.0 / 111320.0;
-                const double cos_lat = std::cos(home_gps_.latitude * M_PI / 180.0);
-                if (std::isfinite(cos_lat) && std::fabs(cos_lat) > 1e-9) {
-                    const double deg_per_m_lon = DEG_PER_M_LAT / cos_lat;
-                    wp2_n_outer = (attack_wp2_gps_.latitude - home_gps_.latitude) /
-                                          DEG_PER_M_LAT;
-                    const double wp2_east_m = (attack_wp2_gps_.longitude - home_gps_.longitude) /
-                                              deg_per_m_lon;
-                    wp2_nwu_y_outer = -wp2_east_m;  // NWU y = west_m
-                    wp2_coords_valid = true;
-                    const TargetCluster* closest = nullptr;
-                    double closest_dist_sq = std::numeric_limits<double>::infinity();
-                    for (const auto& kv : clusters_) {
-                        const TargetCluster& c = kv.second;
-                        if (!c.is_promoted) continue;
-                        // === 2026-08-24: stale promoted cluster 不参与 fallback 候选 ===
-                        //   uav0_strike_2026-08-24-17-04-42_0.bag 复盘:primary 9 stale 后
-                        //   primary_cluster_id_ 清零,fallback 仍按"最高 confidence"选 stale
-                        //   cluster,chase 拿去追 KF 冻结位置 → 鬼影。这里跟 line 1123 一致
-                        //   用 cluster_stale_freeze_sec_ 阈值过滤掉 stale 候选。
-                        if (c.last_seen_us != 0) {
-                            const double lsu_age = (now_stamp.toNSec() / 1000ULL -
-                                                    c.last_seen_us) * 1e-6;
-                            if (lsu_age > cluster_stale_freeze_sec_) continue;
-                        }
-                        // === 2026-08-27: closest-to-WP2 必须按 target_type 过滤 label ===
-                        //   20260827_1733_person2car.bag:GS 下发 target_type=[1]=person,
-                        //   但 cluster[1]=car 距 WP2 8.4m,cluster[2]=person 当时 stale
-                        //   (last_seen 115s 前),fallback 不读 label → 选 car 当 primary →
-                        //   UAV 追车位置 44s。这里要求:即使 cluster[2]=person stale,
-                        //   也不能把 car 拿上来当 primary;label 不匹配就直接跳过,
-                        //   没有任何 label-matched 候选时 → null → 回退到 attack_wp2
-                        //   GPS 位置本身 (publishPrimaryGps 不会被调用,后续 hit-circle
-                        //   会用 wp2 GPS 位置作为 fallback 中心)。
-                        if (!labelMatchesCachedTargetType(c.label)) {
-                            ROS_INFO_THROTTLE(2.0,
-                                "[TargetClusterer] WP2 fallback skip cluster[%lu] label=%s "
-                                "(target_type=0x%x no-match, won't promote to primary)",
-                                c.id, c.label.c_str(), current_skill_target_type_);
-                            continue;
-                        }
-                        const double dx = c.ned_x - wp2_n_outer;
-                        const double dy = c.ned_y - wp2_nwu_y_outer;
-                        const double dist_sq = dx*dx + dy*dy;
-                        if (dist_sq < closest_dist_sq) {
-                            closest_dist_sq = dist_sq;
-                            closest = &c;
-                        }
+            // === 2026-10-10: WP2 GPS → NWU 已在 Step 1.5 之前 hoist 算好 (wp2_coords_valid /
+            //   wp2_n_outer / wp2_nwu_y_outer / kWp2SanityRange), 这里直接复用, 不重算。
+            //   原 closest-to-WP2 search 块在 `if (is_attack_active_ && wp2_gps_valid &&
+            //   home_locked_)` 守护下, hoist 后改成 `if (wp2_coords_valid)` 同一条件。
+            if (wp2_coords_valid) {
+                const TargetCluster* closest = nullptr;
+                double closest_dist_sq = std::numeric_limits<double>::infinity();
+                for (const auto& kv : clusters_) {
+                    const TargetCluster& c = kv.second;
+                    if (!c.is_promoted) continue;
+                    // === 2026-08-24: stale promoted cluster 不参与 fallback 候选 ===
+                    //   uav0_strike_2026-08-24-17-04-42_0.bag 复盘:primary 9 stale 后
+                    //   primary_cluster_id_ 清零,fallback 仍按"最高 confidence"选 stale
+                    //   cluster,chase 拿去追 KF 冻结位置 → 鬼影。这里跟 line 1123 一致
+                    //   用 cluster_stale_freeze_sec_ 阈值过滤掉 stale 候选。
+                    if (c.last_seen_us != 0) {
+                        const double lsu_age = (now_stamp.toNSec() / 1000ULL -
+                                                c.last_seen_us) * 1e-6;
+                        if (lsu_age > cluster_stale_freeze_sec_) continue;
                     }
-                    if (closest != nullptr &&
-                        closest_dist_sq < kWp2SanityRange * kWp2SanityRange) {
-                        primary = closest;
-                        used_wp2_fallback = true;
+                    // === 2026-08-27: closest-to-WP2 必须按 target_type 过滤 label ===
+                    //   20260827_1733_person2car.bag:GS 下发 target_type=[1]=person,
+                    //   但 cluster[1]=car 距 WP2 8.4m,cluster[2]=person 当时 stale
+                    //   (last_seen 115s 前),fallback 不读 label → 选 car 当 primary →
+                    //   UAV 追车位置 44s。这里要求:即使 cluster[2]=person stale,
+                    //   也不能把 car 拿上来当 primary;label 不匹配就直接跳过,
+                    //   没有任何 label-matched 候选时 → null → 回退到 attack_wp2
+                    //   GPS 位置本身 (publishPrimaryGps 不会被调用,后续 hit-circle
+                    //   会用 wp2 GPS 位置作为 fallback 中心)。
+                    if (!labelMatchesCachedTargetType(c.label)) {
                         ROS_INFO_THROTTLE(2.0,
-                            "[TargetClusterer] Primary fallback: closest-to-WP2 cluster_id=%lu "
-                            "label=%s (dist=%.1fm, WP2 lat=%.7f lon=%.7f)",
-                            closest->id, closest->label.c_str(), std::sqrt(closest_dist_sq),
-                            attack_wp2_gps_.latitude, attack_wp2_gps_.longitude);
-                    } else {
-                        ROS_WARN_THROTTLE(5.0,
-                            "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS "
-                            "(or all label-filtered out by target_type=0x%x), "
-                            "falling back to highest-confidence",
-                            kWp2SanityRange, current_skill_target_type_);
+                            "[TargetClusterer] WP2 fallback skip cluster[%lu] label=%s "
+                            "(target_type=0x%x no-match, won't promote to primary)",
+                            c.id, c.label.c_str(), current_skill_target_type_);
+                        continue;
                     }
+                    const double dx = c.ned_x - wp2_n_outer;
+                    const double dy = c.ned_y - wp2_nwu_y_outer;
+                    const double dist_sq = dx*dx + dy*dy;
+                    if (dist_sq < closest_dist_sq) {
+                        closest_dist_sq = dist_sq;
+                        closest = &c;
+                    }
+                }
+                if (closest != nullptr &&
+                    closest_dist_sq < kWp2SanityRange * kWp2SanityRange) {
+                    primary = closest;
+                    used_wp2_fallback = true;
+                    ROS_INFO_THROTTLE(2.0,
+                        "[TargetClusterer] Primary fallback: closest-to-WP2 cluster_id=%lu "
+                        "label=%s (dist=%.1fm, WP2 lat=%.7f lon=%.7f)",
+                        closest->id, closest->label.c_str(), std::sqrt(closest_dist_sq),
+                        attack_wp2_gps_.latitude, attack_wp2_gps_.longitude);
+                } else {
+                    ROS_WARN_THROTTLE(5.0,
+                        "[TargetClusterer] No cluster within %.0fm of Attack WP2 GPS "
+                        "(or all label-filtered out by target_type=0x%x), "
+                        "falling back to highest-confidence",
+                        kWp2SanityRange, current_skill_target_type_);
                 }
             }
             if (primary == nullptr) {
@@ -1586,6 +1647,25 @@ private:
         if ((known & 0x02u) && isVehicleLabelForFilter(label)) return true;
         return false;
     }
+
+    // === 2026-10-10: YOLO back-projection-based primary selection ===
+    //   跟踪最近 N 条 YOLO 检测的 back-projection (cluster_id, ground_x, ground_y, stamp)。
+    //   Primary 选择: 找 ground 投影离 WP2 最近的 → 鲁棒于 cluster stale 排除。
+    //   原因: closest-to-WP2 在 cluster 2 失 YOLO > 3s 时被 stale filter 排除,
+    //   cluster 15 仍 fresh 选上, 错锁错目标。YOLO raw back-projection 不受 stale 影响。
+    //
+    // 线程模型: 写者 = processSingleDetection (持 clusters_mtx_ 期间), 读者 =
+    // statesTimerCb Step 1.5 (无锁)。deque 不是 map, 没有 rehash 失效问题,
+    // 但仍需独立 mutex 保护 push/pop_front/iteration 不被并发读写撕裂。
+    std::mutex recent_yolo_back_proj_mtx_;
+    struct RecentYoloBackProj {
+        uint64_t cluster_id;
+        double gx, gy;       // ground NWU x/y (back-projected from bbox)
+        ros::Time stamp;
+    };
+    std::deque<RecentYoloBackProj> recent_yolo_back_proj_;
+    // 最大保留时长 (秒), 超过的 entry 在 push 时 trim
+    double yolo_back_proj_window_sec_ = 1.5;
 
     uint64_t primary_cluster_id_ = 0;   // 0 = mission 未指定, 回退最高置信度
 

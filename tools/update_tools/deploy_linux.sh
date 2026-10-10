@@ -4,6 +4,7 @@
 # 用法:
 #   ./deploy_linux.sh <target_ip>                  # 自动选最新的 tzs_ws_bundle_*.tar.gz
 #   ./deploy_linux.sh <target_ip> <bundle.tar.gz>  # 显式指定 bundle
+#   ./deploy_linux.sh query [target_ip]            # 只查板子版本(不部署)
 #
 # 可调环境变量:
 #   SSH_USER=rpdzkj               SSH 用户名（默认 rpdzkj）
@@ -13,8 +14,8 @@
 #
 # 前置:
 #   - 调试员机器能 SSH 到板子
-#   - 当前目录有 tzs_ws_bundle_*.tar.gz（脚本默认在当前目录找）
-#   - SSH 用户能 sudo（stop / restart 服务用）
+#   - 当前目录有 tzs_ws_bundle_*.tar.gz（脚本默认在当前目录找,query 模式不需要）
+#   - SSH 用户能 sudo（stop / restart 服务用,query 模式不需要）
 #
 # 注意:
 #   本脚本不在目标板上跑 catkin，纯二进制覆盖。
@@ -23,25 +24,93 @@
 
 set -euo pipefail
 
-if [ "$#" -lt 1 ]; then
-    cat <<EOF
-Usage: $0 <target_ip> [bundle.tar.gz]
+SSH_USER="${SSH_USER:-root}"
+TGT_BASE="${TGT_BASE:-/home/rpdzkj/tzs_ws}"
+PKG_NAME="multi_uav_strike"
+PKG_XML="$TGT_BASE/src/$PKG_NAME/package.xml"
+DEVEL_XML="$TGT_BASE/devel/share/$PKG_NAME/package.xml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCAL_XML="$SCRIPT_DIR/../../package.xml"
 
-Env vars (optional):
-  SSH_USER=root                 SSH user (default root)
-  TGT_BASE=/home/rpdzkj/tzs_ws  Workspace root on target board
-  NO_RESTART=0                  Set to 1 to skip stop/restart
-  SERVICES="tzs_ws-multi tzs_ws-payload"   Services to bounce
+# === 入口: 0 arg / 1 arg = 交互菜单(对齐 deploy_windows.bat),2 arg = 旧直 deploy ===
+#   ./deploy_linux.sh                       # 问 IP → 问 D/Q
+#   ./deploy_linux.sh <ip>                  # IP 预填 → 问 D/Q
+#   ./deploy_linux.sh <ip> <bundle.tar.gz>  # 直 deploy(无菜单,保留旧调用方式)
+if [ "$#" -lt 2 ]; then
+    if [ "$#" -lt 1 ]; then
+        read -r -p "Target board IP [192.168.1.151]: " TGT_IP_INPUT
+        TGT_IP="${TGT_IP_INPUT:-192.168.1.151}"
+    else
+        TGT_IP="$1"
+    fi
+    echo
+    echo "What do you want to do on $TGT_IP ?"
+    read -r -p "  [D]eploy (default)  /  [Q]uery version: " ACTION_CHOICE
+    case "$ACTION_CHOICE" in
+        [Qq])
+            echo "============================================================"
+            echo "Querying $PKG_NAME version on $SSH_USER@$TGT_IP"
+            echo "============================================================"
 
-Example:
-  $0 192.168.1.151
-  $0 192.168.1.151 tzs_ws_bundle_192.168.1.151_20260827_120000.tar.gz
-EOF
-    exit 1
+            if ! ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+                "$SSH_USER@$TGT_IP" "true" 2>/dev/null; then
+                echo "ERROR: cannot SSH to $SSH_USER@$TGT_IP"
+                exit 1
+            fi
+
+            REMOTE_VER=""
+            REMOTE_VER_FOUND=0
+            REMOTE_VER=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
+                "grep -oP '(?<=<version>)[^<]+' '$PKG_XML' 2>/dev/null \
+                 || grep -oP '(?<=<version>)[^<]+' '$DEVEL_XML' 2>/dev/null" 2>/dev/null | head -1 || true)
+            if [ -n "$REMOTE_VER" ]; then
+                REMOTE_VER_FOUND=1
+            else
+                if ! ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    -o LogLevel=ERROR "$SSH_USER@$TGT_IP" \
+                    "test -f '$PKG_XML' -o -f '$DEVEL_XML'" 2>/dev/null; then
+                    REMOTE_VER="NOT_FOUND"
+                fi
+            fi
+
+            LOCAL_VER=""
+            if [ -f "$LOCAL_XML" ]; then
+                LOCAL_VER=$(grep -oP '(?<=<version>)[^<]+' "$LOCAL_XML" 2>/dev/null | head -1 || true)
+            fi
+
+            echo
+            if [ "$REMOTE_VER_FOUND" = "1" ]; then
+                echo "Board version  : $REMOTE_VER"
+            elif [ "$REMOTE_VER" = "NOT_FOUND" ]; then
+                echo "Board version  : NOT FOUND"
+                echo "                 checked: $PKG_XML"
+                echo "                          $DEVEL_XML"
+            else
+                echo "Board version  : NOT FOUND <version> tag missing in package.xml"
+            fi
+
+            if [ -n "$LOCAL_VER" ]; then
+                echo "Local dev ver  : $LOCAL_VER"
+            else
+                echo "Local dev ver  : <not found at $LOCAL_XML>"
+            fi
+
+            echo
+            echo "Inspection path : $SSH_USER@$TGT_IP:$PKG_XML"
+            echo "============================================================"
+            exit 0
+            ;;
+        *)
+            # deploy 模式: IP 已知,继续走下面 deploy 主体
+            BUNDLE=""
+            ;;
+    esac
+else
+    TGT_IP="$1"
+    BUNDLE="$2"
 fi
-
-TGT_IP="$1"
-BUNDLE="${2:-}"
 
 SSH_USER="${SSH_USER:-root}"
 TGT_BASE="${TGT_BASE:-/home/rpdzkj/tzs_ws}"

@@ -55,7 +55,7 @@
       <arg name="gcs_url" value="udp://:14551@192.168.1.10:14550"/>
     </include>
     <rosparam param="/uav0/mavros/plugin_blacklist">[]</rosparam>
-    <rosparam param="/uav0/mavros/plugin_whitelist">['sys_status', 'sys_time', 'global_position', 'local_position', 'setpoint_position', 'setpoint_velocity', 'setpoint_raw', 'setpoint_trajectory', 'setpoint_attitude', 'home_position', 'imu', 'param', 'waypoint', 'command', 'gps_status', 'rc_io']</rosparam>
+    <rosparam param="/uav0/mavros/plugin_whitelist">['sys_status', 'sys_time', 'global_position', 'local_position', 'setpoint_position', 'setpoint_velocity', 'setpoint_raw', 'setpoint_trajectory', 'setpoint_attitude', 'home_position', 'imu', 'param', 'waypoint', 'command', 'gps_status', 'rc_io', 'manual_control']</rosparam>
   </group>
 
   <!-- ====================================================================== -->

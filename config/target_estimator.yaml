@@ -85,6 +85,12 @@ kf_r_meas: 2.0                       # YOLO 世界投影测量噪声 std (m)
 uav_velocity_lpf_alpha: 0.5          # UAV 速度缓存 LPF alpha (一阶 IIR)
 kf_predict_freq: 50.0                # KF 高频 predict timer 频率 (Hz, 应 >> YOLO 频率)
 cluster_stale_freeze_sec: 3.0        # cluster 多久无观测 → reset velocity 强制 STATIC (秒)
+# === 2026-10-10: YOLO back-projection-based primary selection ===
+#   在 attack 阶段优先于 closest-to-WP2 fallback, 解决 cluster stale filter
+#   把正确目标排除后, fresh 但远的 cluster 抢占 primary 的 bug
+#   (12-00-54 bag cluster 2 失 YOLO 3s+ 后, cluster 15 (sim id=17) 抢占)
+#   window 1.5s 兼容 10Hz YOLO + 偶发漏帧, 不留太老避免 stale back-projection
+yolo_back_proj_window_sec: 1.5
 
 # ---- 图像/位姿时间对齐 ----
 # camera/pose 按时间缓存；每条 YoloDetection 使用与 stamp_us 时间差最小的样本。
