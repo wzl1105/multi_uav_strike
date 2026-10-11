@@ -404,6 +404,11 @@ public:
         //   YOLO 反复 skip → cluster 1.5s STALE → primary 跳 WP2 fallback →
         //   target switched jump=8.4m,CHASE 直接退出 → pilot override。
         //   进 strike 后 yaw_rate 旁路放行,waypoint/SEARCH 阶段保留门控。
+        // === 2026-10-11: STRIKE 内 chase zone 同样由 is_attack_active_ 覆盖 ===
+        //   multi_uav_flight_2_0.bag (179-200s chase 22s 卡死): chase 期间 yaw 抖动
+        //   触发 image_age > 0.4s → terminal_no_image_hold_latched_, 跟本行 yaw_rate
+        //   bypass 无关 (chase 时 is_attack_active_=true, 此条早返 = 不 skip)。本修复
+        //   通过 terminal_no_image_hold_max_sec=5.0 自动 unlatch + smoke 重试治本。
         if (!manual_recognition_active_ &&
             !guidance_mode_is_track_ && !is_attack_active_ &&
             std::fabs(matched_yaw_rate.yaw_rate_rad_s) >

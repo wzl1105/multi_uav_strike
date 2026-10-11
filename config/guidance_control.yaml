@@ -28,7 +28,11 @@ attack_max_speed: 40.0
 image_confirm_frames: 1
 # 锁定目标图像观测超过此时间视为不可见，转世界坐标纯追踪；长时丢失仍由
 # mission_manager 的 target_lost_hold_sec 进入 TARGET_LOST_HOVER。
-image_visible_timeout_sec: 0.4
+# === 2026-10-11: image_visible_timeout 0.4 → 0.7 (治本 chase 高速 yaw 抖丢帧) ===
+#   multi_uav_flight_2_0.bag: chase 进入 0.5s sticky latch 过期后 image_age=0.415s >
+#   0.4s 触发 TERMINAL NO-IMAGE GUARD latched, 22s 卡死。chase 高速 yaw 期间
+#   YOLO 跟丢 1-2 帧是正常 (10Hz 下 4 帧 = 0.4s 太严), 放宽到 0.7s = 7 帧缓冲。
+image_visible_timeout_sec: 0.7
 # IMAGE/GEO 两种速度源切换时的线性混合时间。
 image_reacquire_blend_sec: 0.7
 #========速度修改========
@@ -52,10 +56,21 @@ strike_terminal_image_chase_latch_sec: 0.5
 # 进入上述图像导引区时，如果图像已超过 image_visible_timeout_sec，立即锁存
 # 当前 position setpoint。该悬停不是最终打击保护，不会触发拉烟。
 strike_terminal_no_image_hold_enabled: true
+# === 2026-10-11: latched 自动解除超时 (治本 22s 卡死) ===
+#   修前: TERMINAL NO-IMAGE GUARD latched 后永远 hold (L1960 无 unlock 路径)。
+#   修后: elapsed > max_sec (5s) 自动 unlatch, 释放 chase 让 GEO/PN 重试。
+#   5s 留足 chase sticky 0.5s + bbox 抖动 1-2 帧 + 重试窗口, 避免过短导致
+#   chase 抖动循环 unlatch/re-latch。覆盖范围 < 5s 是设计意图 (短时 hold 让
+#   chase 重试 1-2 次再 fall through 到 GEO/PN)。
+strike_terminal_no_image_hold_max_sec: 5.0
 # chase 用更宽的居中死区 (vs image_center_deadband 0.03),17-43-21 bag 在 horiz=1.37m
 # 时 bbox 漂出 0.06 带导致 chase 提前退出,放大到 0.10 允许更大波动,让 chase
 # 能覆盖到命中圈边缘。ray 在 ~1m 内仍可信任,过宽反而引入错误方向。
-strike_terminal_image_chase_center_band: 0.4
+# === 2026-10-11: 0.4 → 0.45 (治本 chase 擦边进入又跳出) ===
+#   multi_uav_flight_2_0.bag (t=178.60): center=(0.465, 0.395) 擦边进入 (y=0.395 临界),
+#   0.2s 后 (t=178.77) y=0.456 跳出 0.4 阈值 → chase 立即退出 + TERMINAL NO-IMAGE
+#   GUARD latched, 22s 卡死。放宽到 0.45 让 chase 进入后能更稳定维持。
+strike_terminal_image_chase_center_band: 0.45
 
 # //=============打击保护bbox=========//
 # 测试模式：使用归一化 bbox 等效边长 sqrt(width * height)，不依赖图像分辨率。

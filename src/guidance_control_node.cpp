@@ -382,6 +382,15 @@ private:
     bool terminal_no_image_hold_enabled_ = true;
     bool terminal_no_image_hold_latched_ = false;
     geometry_msgs::PoseStamped terminal_no_image_hold_pose_;
+    // === 2026-10-11: TERMINAL NO-IMAGE GUARD latched 自动解除 (治本卡死) ===
+    //   旧 bug: latched 后永远 hold, chase 期间 yaw 抖动导致 image_age > 0.4s 触发 latch,
+    //   再也不解除 → 22s 卡死, 没 strike commit, 没拉烟 (multi_uav_flight_2_0.bag)。
+    //   修法: latch_time_ 记下 latch 起始, publishTerminalNoImageHold 每帧检查
+    //         elapsed > max_sec 自动 unlatch, 允许重新进 chase / 重新 position_seek。
+    //   同时调 maybeTriggerStrikeTestSmoke (跟 STRIKE TEST GUARD 一致), 不再
+    //   "故意不调" — latched 期间到达 strike_commit_radius 也能拉烟。
+    ros::Time terminal_no_image_hold_latch_time_;
+    double terminal_no_image_hold_max_sec_ = 5.0;  // 5s 后自动解锁, 留足 chase sticky 0.5s
     //=====没有图像不打击=====//
     // 本次 Attack 一旦得到有效世界坐标便锁存；图像或 cluster 后续消失时
     // GEO 继续使用该坐标，直到 guidance 被明确关闭。
@@ -763,6 +772,11 @@ public:
         //=====没有图像不打击=====//
         nh_private_.param<bool>("strike_terminal_no_image_hold_enabled",
                                 terminal_no_image_hold_enabled_, true);
+        // === 2026-10-11: latched 自动解除超时 (治本卡死) ===
+        nh_private_.param<double>("strike_terminal_no_image_hold_max_sec",
+                                 terminal_no_image_hold_max_sec_, 5.0);
+        terminal_no_image_hold_max_sec_ =
+            std::max(0.5, terminal_no_image_hold_max_sec_);  // 至少留 chase sticky 0.5s
         //=====没有图像不打击=====//
         strike_terminal_image_chase_min_horiz_m_ =
             std::max(strike_terminal_image_chase_min_horiz_m_, 0.0);
@@ -1419,6 +1433,8 @@ public:
             //=====没有图像不打击=====//
             terminal_no_image_hold_latched_ = false;
             terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            // === 2026-10-11: 清 latch_time_ 防止新 strike 误用旧 time 触发秒级 unlock ===
+            terminal_no_image_hold_latch_time_ = ros::Time();
             //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
@@ -1534,6 +1550,8 @@ public:
             //=====没有图像不打击=====//
             terminal_no_image_hold_latched_ = false;
             terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            // === 2026-10-11: 清 latch_time_ 防止新 strike 误用旧 time 触发秒级 unlock ===
+            terminal_no_image_hold_latch_time_ = ros::Time();
             //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
@@ -1571,6 +1589,8 @@ public:
             //=====没有图像不打击=====//
             terminal_no_image_hold_latched_ = false;
             terminal_no_image_hold_pose_ = geometry_msgs::PoseStamped();
+            // === 2026-10-11: 清 latch_time_ 防止新 strike 误用旧 time 触发秒级 unlock ===
+            terminal_no_image_hold_latch_time_ = ros::Time();
             //=====没有图像不打击=====//
 
             //=============打击保护bbox=========//
@@ -1993,15 +2013,42 @@ public:
         terminal_no_image_hold_pose_.pose.orientation.z = std::sin(0.5 * output_yaw);
         terminal_no_image_hold_pose_.pose.orientation.w = std::cos(0.5 * output_yaw);
         terminal_no_image_hold_latched_ = true;
+        // === 2026-10-11: 记 latch 时间, publishTerminalNoImageHold 检查超时自动 unlatch ===
+        terminal_no_image_hold_latch_time_ = ros::Time::now();
         terminal_image_chase_active_ = false;
         ROS_ERROR("[TERMINAL NO-IMAGE GUARD] POSITION HOLD LATCHED: "
-                  "horiz=%.2fm threshold=%.2fm image_age=%.3fs; smoke disabled for this hold",
-                  horizontal_distance_m, strike_terminal_image_chase_min_horiz_m_, image_age);
+                  "horiz=%.2fm threshold=%.2fm image_age=%.3fs; "
+                  "max_hold=%.1fs, then auto-unlatch + smoke retry",
+                  horizontal_distance_m, strike_terminal_image_chase_min_horiz_m_, image_age,
+                  terminal_no_image_hold_max_sec_);
         return true;
     }
 
     void publishTerminalNoImageHold() {
         if (!terminal_no_image_hold_latched_) return;
+
+        // === 2026-10-11: max_sec 超时自动 unlatch (治本 22s 卡死) ===
+        //   multi_uav_flight_2_0.bag 修前: latched 后永远 hold, chase 期间 yaw 抖动
+        //   触发 image_age > 0.4s → latch → 永远不解除 → strike commit 不触发 + 不拉烟。
+        //   修后: latch_time_ 记下起始, elapsed > max_sec (5s 默认) 自动 unlatch,
+        //   释放 chase 让 GEO/PN 重新尝试; 5s 留足 chase sticky 0.5s + bbox 抖动 1-2 帧
+        //   + 重试窗口, 避免过短导致 chase 抖动循环 unlatch/re-latch。
+        const double latch_elapsed =
+            (ros::Time::now() - terminal_no_image_hold_latch_time_).toSec();
+        if (latch_elapsed > terminal_no_image_hold_max_sec_) {
+            ROS_WARN("[TERMINAL NO-IMAGE GUARD] auto-unlatch after %.2fs "
+                     "(max=%.2fs); releasing chase to retry",
+                     latch_elapsed, terminal_no_image_hold_max_sec_);
+            terminal_no_image_hold_latched_ = false;
+            // === 治本 latched 后允许重新触发拉烟 (跟 STRIKE TEST GUARD 一致) ===
+            //   修前 L2015 "故意不调" — latched 期间永远不调 smoke。
+            //   修后: 跟 publishStrikeTestPositionHold (L1937) 行为对齐, latched 也调
+            //   maybeTriggerStrikeTestSmoke, 允许 horiz ≤ strike_commit_radius 时拉烟。
+            //   strike_test_smoke_request_attempted_ 仍 latch 防 50Hz 死磕 YX 板 (3 次重试)。
+            strike_test_smoke_request_attempted_ = false;
+            return;
+        }
+
         terminal_no_image_hold_pose_.header.stamp = ros::Time::now();
         strike_test_position_hold_pub_.publish(terminal_no_image_hold_pose_);
         if (use_sim_) {
@@ -2012,9 +2059,17 @@ public:
         std_msgs::Bool active;
         active.data = true;
         velocity_active_pub_.publish(active);
-        // 这里故意不调用 maybeTriggerStrikeTestSmoke()：无图悬停不是命中保护。
+        // === 2026-10-11: latched 期间也调 smoke (跟 STRIKE TEST GUARD 一致) ===
+        //   修前 L2015 "故意不调" — bag 显示 latched 22s, 永远不触发拉烟。
+        //   修后: 跟 publishStrikeTestPositionHold (L1937) 行为一致,
+        //   strike_test_position_hold_latched_ (altitude/bbox) 和 terminal_no_image_hold_latched_
+        //   都是 "已在命中区附近", 允许拉烟。strike_commit_radius_=3m 是触发距离门,
+        //   实际 horiz 大时 gate 自然 fail 不发。
+        maybeTriggerStrikeTestSmoke();
         ROS_WARN_THROTTLE(1.0,
-            "[TERMINAL NO-IMAGE GUARD] publishing latched position hold");
+            "[TERMINAL NO-IMAGE GUARD] publishing latched position hold "
+            "(elapsed=%.1fs/%.1fs, will auto-unlatch)",
+            latch_elapsed, terminal_no_image_hold_max_sec_);
     }
     //=====没有图像不打击=====//
 
