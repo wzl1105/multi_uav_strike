@@ -4023,6 +4023,17 @@ public:
     //===========rc识别=============
     void processManualRecognitionClusters(
         const multi_uav_strike::ClusterState::ConstPtr& msg) {
+        // === 2026-10-11: Attack 期间 manual_recognition 静默 type=3 ===
+        //   用户原话 (multi_uav_flight_1054.bag): "打击无论是否成功, 都不要再乱发目标了,
+        //   只有打击的那一下发一个特殊的目标这个好像已经有了, 别的任何目标都不发了"
+        //   跟非-manual recognition 路径 (L4405 shouldSuppressPostAttackDetectPublish) 对称,
+        //   work_mode=SEARCH_STRIKE (skill 105 IN_TASK) 一律不发 type=3, 让飞手专心打。
+        //   飞手接管 (is_fcu_overridden_) + 已 commit strike (session latch) 已被
+        //   clusterStatesCallback L4078 shouldSuppressAllDetectAfterStrike 兜底,
+        //   这里只需要补 attack 阶段闸, 跟现有 pattern 一致。
+        if (shouldSuppressPostAttackDetectPublish()) {
+            return;
+        }
         const uint64_t now_us = ros::Time::now().toNSec() / 1000ULL;
         const double dedup_radius_sq = report_dedup_radius_m_ * report_dedup_radius_m_;
 
