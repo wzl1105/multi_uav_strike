@@ -728,6 +728,14 @@ private:
     ros::Time takeoff_start_time_;
     ros::Time setpoint_start_time_;   // setpoint publisher 线程真正开始发包的时刻（用于 OFFBOARD 请求前的稳定等待）
     int setpoint_publish_count_;      // setpoint publisher 已发包计数（调试用：>0 证明 mavros 在转）
+    // === 2026-10-11: takeover 期间独立原子计数, 不依赖 setpoint_publish_count_ ===
+    //   startSetpointPublisher() 入口把 setpoint_publish_count_ 清 0, 跟 takeover 旧版
+    //   "capture-before-reset" 的 bug 叠加产生负数 (multi_uav_flight_2_0.bag:
+    //   "OFFBOARD takeover aborted: only -2248 setpoints published")。
+    //   治本:独立 atomic 计数器, takeover 入口 store(0), publisher 线程每发一帧
+    //   fetch_add(1), prestream 末直接 load 读出 "本次 takeover 实际喂给 mavros 的帧数"，
+    //   跟全局 setpoint_publish_count_ 状态彻底解耦, 即使后者被 race / reset 也无关。
+    std::atomic<int> takeover_pub_count_{0};
     mavros_msgs::State current_mavros_state_;
     geometry_msgs::PoseStamped takeoff_setpoint_; // 起飞位置 setpoint
     std::atomic<bool> setpoint_running_{false};
@@ -6203,6 +6211,11 @@ public:
                 if (armed && position_phase) {
                     takeoff_setpoint_pub_.publish(takeoff_setpoint_);
                     setpoint_publish_count_++;
+                    // === 2026-10-11: takeover 期间独立计数 ===
+                    //   takeover 入口会 store(0), 这里 fetch_add(1),
+                    //   prestream 末直接 load 读出 "本次 takeover 实际喂了多少帧进 mavros"。
+                    //   memory_order_relaxed 即可, 不需要跟其它数据同步。
+                    takeover_pub_count_.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     ROS_DEBUG_THROTTLE(2.0,
                         "[MissionManager] Position setpoint blocked: armed=%d phase=%u",
@@ -6267,10 +6280,23 @@ public:
         suppress_recovery_ = true;
         current_phase_ = MissionPhase::PHASE_HOLDING;
 
-        const int setpoint_count_before = setpoint_publish_count_;
+        // === 2026-10-11: 修 order + 用独立 atomic 计数 (治本) ===
+        //   旧 bug: capture-before-reset 导致 published_count = -2248 (multi_uav_flight_2_0.bag)。
+        //   startSetpointPublisher() 入口 (L6170) 把 setpoint_publish_count_ 清 0,
+        //   但 capture 写在前面 → 后面算 diff 出负数 → <20 abort → drop 新 task_flow,
+        //   飞手接管后无法收回 OFFBOARD。
+        //   修法两层:
+        //     1) capture 移到 startSetpointPublisher() 之后 (简单 swap)
+        //     2) 引入独立 atomic 计数器 takeover_pub_count_, 入口 store(0),
+        //        publisher 线程 fetch_add(1) on every publish, prestream 末直接
+        //        load 读出 "本次 takeover 实际喂给 mavros 的帧数" — 跟全局
+        //        setpoint_publish_count_ 状态彻底解耦, 即使后者被 race / reset
+        //        也无关。
         if (!setpoint_running_) {
             startSetpointPublisher();
         }
+        const int setpoint_count_before = setpoint_publish_count_;
+        takeover_pub_count_.store(0, std::memory_order_relaxed);
         // startSetpointPublisher() 锁存当前 XY/航向；高度使用当前 NED 位置转 ENU。
         takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
 
@@ -6283,11 +6309,24 @@ public:
             prestream_rate.sleep();
         }
 
-        const int published_count = setpoint_publish_count_ - setpoint_count_before;
+        // 用独立 atomic 计数 (B 治本): 反映 "本次 takeover 期间实际喂给 mavros 的帧数",
+        // 跟 setpoint_publish_count_ 状态彻底解耦。
+        // setpoint_count_before 还保留给 ROS_INFO 调试日志用。
+        const int published_count =
+            takeover_pub_count_.load(std::memory_order_relaxed);
+        const int global_diff = setpoint_publish_count_ - setpoint_count_before;
         if (published_count < offboard_takeover_min_setpoint_count_) {
-            ROS_ERROR("[MissionManager] OFFBOARD takeover aborted: only %d position setpoints "
-                      "published (need >=%d), flow_id=%s",
-                      published_count, offboard_takeover_min_setpoint_count_, flow_id.c_str());
+            // === 2026-10-11: 升级日志, 同步打 takeover 独立计数 + global diff ===
+            //   published_count  = takeover 期间独立 atomic 计数 (本次 takeover 实际喂帧数)
+            //   global_diff      = setpoint_publish_count_ - capture, 调试用, 应该 >= 0
+            //   global_diff 异常 (负数/远小于 published_count) 说明全局 counter 状态混乱
+            //   (旧 -2248 bug 残留), 排查用它定位。
+            ROS_ERROR("[MissionManager] OFFBOARD takeover aborted: takeover_pub=%d "
+                      "global_diff=%d (need >=%d, before=%d now=%d), flow_id=%s",
+                      published_count, global_diff,
+                      offboard_takeover_min_setpoint_count_,
+                      setpoint_count_before, setpoint_publish_count_,
+                      flow_id.c_str());
             current_phase_ = phase_before_takeover;
             is_fcu_overridden_ = override_before_takeover;
             suppress_recovery_ = false;

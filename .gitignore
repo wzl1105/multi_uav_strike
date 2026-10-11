@@ -51,3 +51,6 @@ scripts/autostart_test_logs/
 tools/update_tools/*.tar.gz
 tools/update_tools/*.zip
 tools/update_tools/*.tgz
+
+# ROS bag files
+*.bag
