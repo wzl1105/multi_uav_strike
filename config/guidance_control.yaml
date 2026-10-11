@@ -163,6 +163,22 @@ image_yaw_rate_max: 0.5
 strike_descent_rate: 5.0
 strike_vertical_lag: 0.5
 
+# === 2026-10-11: chase zone 之前强制最低下降率 (治本"前期先降低高度") ===
+#   用户原话 (multi_uav_flight_1115.bag): "怎么让他在打击的后半段都尽量水平,
+#   也就是前期先降低高度"; "要在飞机实际高度速度下不来的话也要保证后半段也尽量水平打击"。
+#
+#   现象:bag 里 horiz=72→30m 阶段, computeSlantDescentSpeed 算 desired_vz 只有
+#   1.81→2.98 m/s (因为 down=28m / time_to_hit=14s), 实际下降到 chase zone 时 alt 还
+#   有 19.86m, 后半段必须边水平边下沉, 撞上 chase sticky 0.5s 失败导致 TERMINAL NO-IMAGE
+#   GUARD latched, 用户体验"前半段降不下来, 后半段被锁住不能水平打"。
+#
+#   修法:horiz > chase_min_horiz_(30m) 期间, commanded_vz 不能低于该值。
+#   硬件实测可到 4.95 m/s 不饱和 (bag 后半段 vz=4.95 时仍在 horiz 8m 阶段)。
+#   默认 3.0 m/s (用户选保守): 比纯数学公式 (1.8) 高 67%, 让进 chase zone 时 alt ≈ 14m
+#   而非 19m; 不激进, 留缓冲给 chase sticky 失败等异常。
+#   范围 [1.0, 10.0], 防 yaml 误设 0。
+strike_pre_chase_min_descent_mps: 3.0
+
 # PN专用目标输入滤波和陈旧目标软降速；IMAGE/GEO不使用这些滤波结果。
 pn_target_filter_min_cutoff_hz: 1.0
 pn_target_filter_beta: 0.005
@@ -170,16 +186,19 @@ pn_target_filter_d_cutoff_hz: 1.0
 pn_cluster_stale_timeout_sec: 0.5
 pn_cluster_stale_speed_scale: 0.33
 
-# === 2026-08-19: 8m → 30m ===
+# === 2026-08-19: 8m → 30m; 2026-10-11: 30m → 50m ===
 #   原 8m 内图像射线趋近垂直、水平反复换向、SEARCH_TRACK + attack_cmd 直接
 #   远距俯冲时 yaw 没追上 target bearing,IMAGE 射线 (image_ray_alpha=0.25 LPF
 #   时间常数 ~0.4s) 滞后让速度方向偏,导致 UAV 越顶 41m 后 world coord 接管再反向。
 #   把世界坐标接管半径提到 30m:水平 ≤ 30m 起就锁到稳定的 cluster 世界坐标,
 #   仅 30m 以上才用 IMAGE 射线(yaw 误差此时较小)。skill 105 ATTACK 走 attack_point
 #   waypoint 起跑距离小,这一改动对它的影响可忽略。
+#   2026-10-11: 拉到 50m 是为了让 horiz ≤ 50 阶段水平速度按 horiz/50 衰减 (L2389-2396),
+#   配合 strike_pre_chase_min_descent_mps 让 chase zone 末段水平更平。不影响 horiz > 50
+#   全速冲。
 strike_slowdown_radius_m: 10.0
 strike_horizontal_stop_radius_m: 1.0
-strike_terminal_world_direction_radius_m: 30.0
+strike_terminal_world_direction_radius_m: 50.0
 # 近目标逐渐冻结偏航，避免机头在目标正上方来回寻找像面中心。
 strike_yaw_freeze_radius_m: 3.0
 # 每次进入 STRIKE 后必须收到本轮新目标坐标，且坐标持续保持新鲜。
