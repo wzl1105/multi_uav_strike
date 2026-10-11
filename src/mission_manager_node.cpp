@@ -676,6 +676,23 @@ private:
             && is_fcu_overridden_;
     }
 
+    // === 2026-10-11: 拉烟后 session 级静默所有目标回传 ===
+    //   跟 shouldSuppressDetectOnPilotOverride 关系:
+    //     - 老 helper: 仅在 attack_phase_!=IDLE && is_fcu_overridden_ 时静默
+    //       type=1 主信号, 覆盖 L3746 attack_cmd + L4825 strike commit 两个点
+    //     - 新 helper: strike commit 后 latch true, 新 TaskFlow reset
+    //       - 覆盖: processManualRecognitionClusters 路径 (L4019) — 之前未覆盖,
+    //         manual_recognition_active_=true 时 clusterStatesCallback L4031 早退
+    //         不经 sr.attack_phase_ 检查直接发 type=3, 接管后还发 (multi_u4_bag)
+    //       - 判定用 strike_committed_this_session_ (session flag), 不依赖 sr
+    //         或 is_fcu_overridden_: "拉烟后 = 任务完成" 语义, 飞手松手也不恢复,
+    //         必须新 TaskFlow 才重置 (用户在 AskUserQuestion 中选定 session latch)。
+    //   注: 不静默 primary_target_pub_ / attack_wp2_pub_ — 这俩不是 GCS 上行通道
+    //       (primary 给 estimator 推主目标, attack_wp2 单帧一次性)。
+    inline bool shouldSuppressAllDetectAfterStrike() const {
+        return strike_committed_this_session_;
+    }
+
     // 参数
     double mission_loop_rate_;
     double target_lock_confidence_;  // 目标锁定所需置信度
@@ -770,6 +787,16 @@ private:
     //   阻止 mavrosStateCallback 在 setMode 的 spinOnce 期间按"snapshot 恢复旧 phase"
     //   那条路径跑 — 新 TaskFlow 接下来要自己从零设 phase,不能被旧 snapshot 污染。
     bool        suppress_recovery_       = false;
+    // === 2026-10-11: 拉烟后停发所有目标回传 (session latch) ===
+    //   multi_uav_flight_4_0.bag: 拉烟 (t=125.88) 后飞手接管 (t=148.44),
+    //   processManualRecognitionClusters 路径 (clusterStatesCallback L4031 早退 + L4019
+    //   无 gate) 持续发 detect_target (t=150.16/155.26/159.16) 给 GS,违反
+    //   "打击完成 = 任务完成, 不再往 GS 上行定位信息" 语义。
+    //   修法: session 级 latch, strike commit 真正生效点 (L4847 后) set true,
+    //   新 TaskFlow 进来时 reset, 中间所有 detect_target / cluster_states /
+    //   target_estimated_gps 都不发。判定不依赖 sr.attack_phase_/is_fcu_overridden_,
+    //   "松手" 不恢复 (用户原话"只有在再接到新任务的时候再看是否需要开启目标回传")。
+    bool        strike_committed_this_session_ = false;
     ros::Time   override_enter_time_;
     struct OverrideSnapshot {
         MissionPhase phase_when_overrided;
@@ -2287,6 +2314,19 @@ public:
         if (msg->skills.empty()) {
             ROS_ERROR("[MissionManager] REJECT empty TaskFlow id=%s", msg->flow_id.c_str());
             return;
+        }
+
+        // === 2026-10-11: 新 TaskFlow 重置 strike_committed latch ===
+        //   multi_uav_flight_4_0.bag 治本: 拉烟后静默所有目标回传, 飞手接管
+        //   / 松手都不恢复; 只有新 TaskFlow 进来才 "再看是否需要开启目标回传"。
+        //   这里就是新任务入口 — 跑任何 detect gate 之前先 reset, 避免上一次
+        //   拉烟的 latch 污染新任务的 clusterStatesCallback 路径。
+        //   防御性打 INFO 日志, 便于排查 "为什么新任务 cluster_state 一开始就不发"。
+        if (strike_committed_this_session_) {
+            ROS_INFO("[MissionManager] New TaskFlow reset strike_committed_this_session_ "
+                     "latch (prev strike done, now session fresh; id=%s)",
+                     msg->flow_id.c_str());
+            strike_committed_this_session_ = false;
         }
 
         // === 2026-09-09: PHASE_FAILED 状态下的新 TaskFlow 自动 reset ===
@@ -4028,6 +4068,16 @@ public:
     }
 
     void clusterStatesCallback(const multi_uav_strike::ClusterState::ConstPtr& msg) {
+        // === 2026-10-11: 拉烟后 session latch — 拦截 manual recognition 路径 ===
+        //   multi_uav_flight_4_0.bag: 拉烟 (t=125.88) 后飞手接管 (t=148.44),
+        //   manual_recognition_active_=true 期间 clusterStatesCallback 早退进
+        //   processManualRecognitionClusters → L4059 无 gate → 持续发 detect_target
+        //   给 GS (t=150.16/155.26/159.16 type=3 car)。修法: strike_commit_ 顶部
+        //   拦截 (在 manual_recognition 早退之前), 跟 shouldSuppressPostAttack
+        //   DetectPublish 一样的语义但更严格 (session latch)。
+        if (shouldSuppressAllDetectAfterStrike()) {
+            return;
+        }
         if (manual_recognition_active_) {
             processManualRecognitionClusters(msg);
             return;
@@ -4846,6 +4896,12 @@ public:
         if (sr.msg.skill_type == 105) {
             sr.direct_strike_committed_ = true;
             sr.attack_hit_sample_valid_ = false;
+            // === 2026-10-11: 拉烟后 session latch — 所有目标回传静默 ===
+            //   strike commit 真正生效点 (跟 triggerStrike 同位置), latch 持续
+            //   直到新 TaskFlow 进来 reset。飞手松手 / OVERRIDE→OFFBOARD 恢复
+            //   都不重置 (用户原话 "只有在再接到新任务的时候再看是否需要开启
+            //   目标回传")。覆盖 manual_recognition 路径 (L4019, 之前未拦住)。
+            strike_committed_this_session_ = true;
         }
         triggerStrike();
         // === 多目标: 通知 estimator 主目标 cluster_id ===
@@ -6696,6 +6752,13 @@ public:
 
         // === 2026-08-25: 同步 GS attack_cmd 接收标志给 guidance (末段 chase gate) ===
         ms.attack_cmd_received = attack_cmd_received_ ? 1 : 0;
+        // === 2026-10-11: 拉烟 session latch 同步给 target_estimator ===
+        //   target_estimator 据此停发 cluster_states / target_estimated_gps /
+        //   cluster_event / raw_detection_marker, 直到新 TaskFlow reset
+        //   (taskFlowCallback L2292 + 新 search skill new_skill_activation)。
+        //   飞手松手不回 OFFBOARD 不重置 (用户原话"只有在再接到新任务的时候
+        //   才再看是否需要开启目标回传")。
+        ms.strike_committed = strike_committed_this_session_ ? 1 : 0;
         mission_state_pub_.publish(ms);
         last_mission_state_pub_time_ = ros::Time::now();
     }

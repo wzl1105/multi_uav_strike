@@ -25,3 +25,11 @@ uint64 attack_arrival_time_us
 #   → 只有 GS 显式发攻击指令,TRACK/STRIKE 末段 chase 才下沉,避免
 #     TRACK 阶段 UAV 自己在 horiz≤22m 时往下冲。
 uint8 attack_cmd_received
+
+# === 2026-10-11: 拉烟 session latch (治本打击后飞手接管还发目标) ===
+#   0 = 本次 Attack 还没 commit (拉烟),或新 TaskFlow 已 reset;
+#   1 = 本次 Attack 已 strike commit, 拉烟触发, "任务完成" 语义;
+#       target_estimator 收到后停发 cluster_states / target_estimated_gps /
+#       cluster_event / raw_detection_marker, 直到新 skill 进来 (新 TaskFlow) 才
+#       reset。飞手松手不回 OFFBOARD 不重置 (用户原话)。
+uint8 strike_committed

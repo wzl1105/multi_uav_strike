@@ -641,6 +641,9 @@ public:
     // ClusterEvent stores the promoted target position in NWU coordinates.
     // Each cluster emits this event once, when it is first promoted.
     void emitClusterEvent(const TargetCluster& c) {
+        // === 2026-10-11: 拉烟后 session latch → 停发 cluster_event ===
+        // 飞手接管不重置, 等新 Search skill 才 reset (missionStateCallback 上方)
+        if (strike_committed_this_session_) return;
         multi_uav_strike::ClusterEvent ev;
         ev.cluster_id    = c.id;
         ev.label_hash    = c.label_hash;
@@ -965,6 +968,16 @@ public:
             activated_skill_flow_id_ = current_skill_flow_id_;
             search_area_first_waypoint_reached_ = false;
             cluster_skill_active_ = true;
+            // === 2026-10-11: 新 TaskFlow 进来 → reset 拉烟 session latch ===
+            //   用户原话: "只有再接到新任务的时候再看是否需要开启目标回传"
+            //   飞手接管松手不回 OFFBOARD 不重置, 必须等 mission_manager 下发新 skill
+            if (strike_committed_this_session_) {
+                ROS_INFO("[TargetClusterer] New Search area activated: "
+                         "reset strike_committed_this_session_ latch "
+                         "(prev Attack committed, fresh session); flow_id=%s skill_id=%s",
+                         current_skill_flow_id_.c_str(), current_skill_id_.c_str());
+                strike_committed_this_session_ = false;
+            }
             size_t cleared_count = 0;
             {
                 std::lock_guard<std::mutex> lock(clusters_mtx_);
@@ -986,6 +999,17 @@ public:
         const bool is_105       = (msg->skill_type == 105);
         const bool is_executing = (msg->state == 1 /*EXECUTING*/);
         is_attack_active_ = is_105 && is_executing;
+        // === 2026-10-11: 接收 mission_manager 的 strike_committed session latch ===
+        //   拉烟触发 → mission_manager 设 ms.strike_committed=1 → 本节点停发 cluster_states /
+        //   target_estimated_gps / cluster_event / raw_detection_marker。
+        //   飞手接管不重置, 等新 Search skill (new_skill_activation 上面) 才 reset。
+        if (msg->strike_committed != 0) {
+            if (!strike_committed_this_session_) {
+                ROS_INFO("[TargetClusterer] mission_state.strike_committed=1 → "
+                         "stop publishing cluster_states/gps/event until new skill");
+            }
+        }
+        strike_committed_this_session_ = (msg->strike_committed != 0);
         ROS_INFO_THROTTLE(5.0,
             "[TargetClusterer] mission_state: skill_type=%d state=%d phase=%d → is_attack_active=%s",
             msg->skill_type, msg->state, msg->phase, is_attack_active_ ? "true" : "false");
@@ -1175,6 +1199,9 @@ public:
 
     // 10Hz:publish 所有 alive cluster 快照 + 可视化 + primary GPS / pose
     void statesTimerCb(const ros::TimerEvent&) {
+        // === 2026-10-11: 拉烟后 session latch → 停发 cluster_states / 状态条
+        // 飞手接管不重置, 等新 Search skill (missionStateCallback new_skill_activation) 才 reset
+        if (strike_committed_this_session_) return;
         std::lock_guard<std::mutex> g(clusters_mtx_);
         if (clusters_.empty()) {
             multi_uav_strike::ClusterState empty_state;
@@ -1606,6 +1633,14 @@ private:
     bool waypoint_status_received_ = false;
     bool current_skill_executing_ = false;
     bool cluster_skill_active_ = false;
+    // === 2026-10-11: 拉烟 session latch — 拉烟后停发 cluster_states / gps / event ===
+    //   跟 mission_manager strike_committed_this_session_ 同步 (经 mission_state msg
+    //   的 strike_committed 字段)。set true 在 missionStateCallback (msg->strike_committed),
+    //   reset false 在 new_skill_activation (新 Search skill 进来)。飞手松手不回 OFFBOARD
+    //   不重置 (用户原话"只有在再接到新任务的时候再看是否需要开启目标回传")。
+    //   注: primary_image_target (内部给 guidance_control) 不 gate, 因为
+    //       guidance_disable 是 mission_manager 端做的, 这里只管 GCS 上行通道。
+    bool strike_committed_this_session_ = false;
     //===========rc识别=============
     bool manual_recognition_active_ = false;
     //===========rc识别=============
