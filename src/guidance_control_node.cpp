@@ -2648,8 +2648,13 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
         cmd.linear.x =  chase_speed * ray.x();
         cmd.linear.y = -chase_speed * ray.y();
         cmd.linear.z = -chase_speed * ray.z();
+        // === 2026-10-12: chase ray 是 NWU (x=North, y=West), terminalYawRate 解读
+        //   desired_yaw 为 NED bearing (atan2(East, North))。West→East 翻号,跟 L2549
+        //   /L2736 一致。原版用 atan2(ray.y, ray.x) 算 NWU bearing,符号反 → body
+        //   硬转 CCW -0.5 rad/s 2 秒,bbox 0.49→0.98 出 FOV → NO-IMAGE GUARD latch
+        //   (uav0_strike_2026-10-12-18-27-53_0.bag, 后台 agent 诊断)
         cmd.angular.z = terminalYawRate(
-            std::atan2(ray.y(), ray.x()), g.horizontal);
+            std::atan2(-ray.y(), ray.x()), g.horizontal);
         return true;
     }
 

@@ -57,3 +57,9 @@ The format below is intentionally minimal — one line per version, no headers.
 相对 0.0.2 的变化。
 摇杆量69 70消息测试成功
 打击状态维持原状不变
+
+## 0.0.4 (on nopic_nostrike, 2026-10-12)
+
+相对 0.0.3 的变化。
+chase 末段 body yaw 修符号 (NWU→NED bearing 翻号),bbox 不再出 FOV
+橙色大球 (target_est_marker) 移出 silence 闸,STRIKE 全程可见

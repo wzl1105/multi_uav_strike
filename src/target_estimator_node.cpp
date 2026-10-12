@@ -1201,12 +1201,22 @@ public:
     void statesTimerCb(const ros::TimerEvent&) {
         // === 2026-10-11: 拉烟后 session latch → 停发 cluster_states / 状态条
         // 飞手接管不重置, 等新 Search skill (missionStateCallback new_skill_activation) 才 reset
-        if (strike_committed_this_session_) return;
+        // === 2026-10-12: 修复 strike commit 后 guidance_control 拿不到 target_estimated_pose
+        //   之前顶部 return 让 publishPrimaryGps/Pose/Twist/ImageTarget 也不发,
+        //   guidance_control STRIKE 阶段卡在 "PN waiting fresh filtered target" 持续发 0 速度
+        //   (uav0_strike_2026-10-12-17-35-38_0.bag: 11 秒 0 速度,飞机原地不动,永远到不了
+        //   smoke trigger → strike_committed latch 永远不解锁)。
+        //   修法:strike_committed 只 gate GS 显示字段 (cluster_states / marker / empty
+        //   state / empty GPS),primary pose/twist/gps/image_target 必须持续发,让
+        //   guidance_control 在 chase zone 内仍能拿到新目标位置完成 STRIKE + smoke。
+        const bool silence_gs_publish = strike_committed_this_session_;
         std::lock_guard<std::mutex> g(clusters_mtx_);
         if (clusters_.empty()) {
-            multi_uav_strike::ClusterState empty_state;
-            cluster_states_pub_.publish(empty_state);
-            publishEmptyGps();
+            if (!silence_gs_publish) {
+                multi_uav_strike::ClusterState empty_state;
+                cluster_states_pub_.publish(empty_state);
+                publishEmptyGps();
+            }
             return;
         }
 
@@ -1251,7 +1261,15 @@ public:
                 markers.markers.push_back(buildPillar(c));
             }
         }
-        cluster_states_pub_.publish(state);
+        // === 2026-10-12: 拉烟后只静默 GS 文本字段 (cluster_states), RViz 可视化
+        //   marker (target_est_marker) 仍持续发,STRIKE 阶段 GS 需要看到 primary
+        //   橙色大球直到 smoke trigger。原版把 marker 也放 silence 闸内导致 STRIKE
+        //   一开始 (strike commit 立即 latch, mission_manager_node.cpp:4915) 橙色
+        //   大球就消失。
+        //   primary pose/twist/gps/image_target 在下面仍持续发 (chase 必须, 见顶部注释)。
+        if (!silence_gs_publish) {
+            cluster_states_pub_.publish(state);
+        }
         target_est_marker_pub_.publish(markers);
 
         // primary 选择:
@@ -1272,11 +1290,29 @@ public:
                     const double lsu_age = (now_stamp.toNSec() / 1000ULL -
                                             it->second.last_seen_us) * 1e-6;
                     if (lsu_age > cluster_stale_freeze_sec_) {
-                        ROS_WARN_THROTTLE(2.0,
-                            "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs), "
-                            "release lock and fallback to highest confidence",
-                            it->second.id, lsu_age, cluster_stale_freeze_sec_);
-                        primary_cluster_id_ = 0;  // 清掉, 让 GS 重新指定或 fallback
+                        if (is_attack_active_) {
+                            // === 2026-10-12: Attack 阶段不 release primary ===
+                            //   uav0_strike_2026-10-12-18-27-53_0.bag: chase 末段 NO-IMAGE
+                            //   GUARD 5s hold 期间 cluster 11 last_seen_us 停更, 3s 后命中
+                            //   stale_freeze, 原版 release → closest-to-WP2 fallback 选
+                            //   cluster 12 (95.2m 远) → target_estimated_pose 跳变 → 飞机
+                            //   转向别人 (用户原话"航向一旦转向别人云台就看不到要打击的目标")。
+                            //   治本: Attack 阶段 primary 是 mission_manager 显式指定 (skill 105),
+                            //   短时失目 (NO-IMAGE GUARD 设计内 5s hold) 不应切到 fallback。
+                            //   位置冻结在 last_seen 旧点, NO-IMAGE unlatch 后 chase 续上同一 primary,
+                            //   不会再"换目标"。只在非 attack 阶段保留 release 行为 (旧 SEARCH/TRACK)。
+                            ROS_WARN_THROTTLE(2.0,
+                                "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs) "
+                                "during Attack; KEEP lock (avoid chase zone fallback to wrong cluster)",
+                                it->second.id, lsu_age, cluster_stale_freeze_sec_);
+                            primary = &it->second;
+                        } else {
+                            ROS_WARN_THROTTLE(2.0,
+                                "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs), "
+                                "release lock and fallback to highest confidence",
+                                it->second.id, lsu_age, cluster_stale_freeze_sec_);
+                            primary_cluster_id_ = 0;  // 清掉, 让 GS 重新指定或 fallback
+                        }
                     } else {
                         primary = &it->second;
                     }
@@ -1319,7 +1355,18 @@ public:
         //   锁内只读 deque, 锁外查 clusters_ + label 过滤, 不构成嵌套锁, 死锁 = 0
         //   WP2 NWU 坐标 (wp2_n_outer / wp2_nwu_y_outer / wp2_coords_valid) 在 Step 2 块之前
         //   已经 hoist 算好 (L1323-1342 移上来), 这里直接复用
-        if (wp2_coords_valid) {
+        // === 2026-10-12: Step 1.5 加 primary==nullptr 守卫 (治本"chase 末段转向别人"路径 B) ===
+        //   uav0_strike_2026-10-12-18-36-48_0.bag: chase 末段 chase 几何 bug 让 bbox
+        //   漂出 FOV, YOLO 反投影命中"新生成的 cluster 14" (chase 末段才出现),
+        //   Step 1.5 直接覆盖 Step 1 选好的 primary=cluster 12 → publishPrimaryPose
+        //   跳到 cluster 14 (89.7m 远) → target_estimated_pose 跳 97.2m → "转向别人"。
+        //   治本: Step 1.5 设计意图是"Step 1 选不到 primary 时的 back-proj 兜底",
+        //   Step 1 选到了就不再 override。Attack 阶段 primary 是 mission_manager 显式
+        //   指定 (skill 105), 不需要 back-proj 兜底; chase 末段 bbox 漂出 FOV 期间
+        //   新的 back-proj 关联到"错位置的 person cluster" 是常见现象, 一定要跳过。
+        //   不动 `!is_attack_active_` 一刀切, 是为了保留非 attack 阶段 (SEARCH/TRACK)
+        //   Step 1 选不到时 back-proj 兜底的能力 (12-00-54 bag 已验证有效)。
+        if (wp2_coords_valid && primary == nullptr) {
             uint64_t best_cluster_id_bp = 0;
             double best_dist_sq_bp = std::numeric_limits<double>::infinity();
             size_t recent_size_bp = 0;

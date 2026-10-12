@@ -7844,6 +7844,16 @@ public:
         }
         ROS_WARN("[MissionManager] >>>>> phase -> %s on guidance start",
                  missionPhaseToString().c_str());
+        // === 2026-10-12: 改 phase 立即 publishMissionState ===
+        //   漏这一行, target_estimator 的 is_attack_active_ 要等 1Hz 定时器
+        //   下次 tick 才同步 (最多 1s 延迟)。期间 YOLO yaw_rate bypass 没生效 →
+        //   chase 阶段 yaw_rate 0.38 > 0.2 → 持续 skip → cluster stale → primary
+        //   锁释放 → fallback closest-to-WP2 选到 80m 远的另一个 cluster →
+        //   UAV 飞偏 (uav0_strike_2026-10-12-17-51-31_0.bag)。
+        //   修法:跟 L3837/L3843/L3897 历史改 phase 路径一样, 立即 publishMissionState
+        //   让 target_estimator 下一帧 mission_state_callback 同步 is_attack_active_=true,
+        //   YOLO yaw_rate bypass 立即生效, chase zone 持续吃 YOLO, cluster 不 stale。
+        publishMissionState();
 
         //========不要fail safe============//
         // 不在 enable 前停止 waypoint/position。guidance 实际发布首帧后会通过

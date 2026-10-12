@@ -19,8 +19,8 @@ image_height: 1080         # 图像高度（像素）
 #   gimbal_simulator 是仿真真机的相机模型, FOV 必须与 target_estimator 反投影
 #   用同一组 (真机实测 68/45.6)。否则 forward/back 几何不对应,每个 cand 偏离
 #   真目标 ~10m, 红球视觉上跟着 UAV 走。
-fov_h_deg: 66.0           # 水平 FOV（度） — 与 target_estimator.yaml 真机值同步
-fov_v_deg: 48.6           # 垂直 FOV（度），0 = 按方形像素推导 — 与 target_estimator.yaml 真机值同步
+fov_h_deg: 68.0           # 水平 FOV（度） — 与 target_estimator.yaml 真机值同步
+fov_v_deg: 45.6           # 垂直 FOV（度），0 = 按方形像素推导 — 与 target_estimator.yaml 真机值同步
 
 gimbal_p_gain: 1.0         # 云台 P 控制增益
 max_pitch_rate: 1.2        # 最大俯仰角速度（rad/s）
@@ -32,7 +32,7 @@ loop_freq: 100.0           # 控制循环频率（Hz）
 #   yolo_pub_freq 必须 ≤ loop_freq。
 yolo_pub_freq: 10.0         # yolo_results / 单条 YoloDetection 发布频率(Hz)
 image_noise_std_dev: 0.0   # 世界坐标位置噪声标准差(米)，加在云台指向控制器的目标点上（只影响 gimbal 控制，不影响 bbox/反投影）
-pixel_noise_std_dev: 3.2    # 图像像素噪声标准差(像素)，加在 u_px/v_px 上,影响 bbox 中心 + FOV 进出闪烁,下游 target_estimator 反投影会跟着抖
+pixel_noise_std_dev: 2.0    # 图像像素噪声标准差(像素)，加在 u_px/v_px 上,影响 bbox 中心 + FOV 进出闪烁,下游 target_estimator 反投影会跟着抖
 
 # === 新约定下的默认回退角 ===
 #   0    = 水平
