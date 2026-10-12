@@ -51,3 +51,9 @@ The format below is intentionally minimal — one line per version, no headers.
 ### 工具改名
 - `tools/update_tools/deploy_linux.sh` → `LN_config.sh`,
   `deploy_windows.bat` → `LN_config.bat`。旧名作为同签名 alias 仍可用。
+
+## 0.0.3 (on nopic_nostrike, 2026-10-12)
+
+相对 0.0.2 的变化。
+摇杆量69 70消息测试成功
+打击状态维持原状不变
