@@ -163,25 +163,6 @@ image_yaw_rate_max: 0.5
 strike_descent_rate: 5.0
 strike_vertical_lag: 0.5
 
-# === 2026-10-12: chase zone 之前最低下沉 floor 默认关闭 (治本闭环反馈死锁) ===
-#   旧默认 3.0 触发了 STRIKE 闭环死锁:
-#     1) computeSlantDescentSpeed 把 commanded_vz 抬到 -3.0 m/s
-#     2) PX4 / 电机饱和 → actual_vz 只给到 ~1.0 m/s
-#     3) feasibleHorizontalSpeedForDescent 用 actual_vz 反推 closed_loop_h_speed
-#        = horiz / (down/actual_vz + 0.5) → 30s 落地时间,水平压到 ~3 m/s
-#     4) 水平速度被闭环压低 → 飞机"位置几乎没动, 姿态动了一下就停了"
-#   外场飞行实测 (2026-10-11): horiz=100m down=30m 阶段, 飞机停在原地只转 yaw。
-#
-#   治本:yaml 默认 0.0 (关闭 floor),代码侧 if (... > 0.0) 守门自动跳过该段。
-#   desired_vz 走回原数学公式 (g.down / (time_to_hit + strike_vertical_lag_))。
-#   实际 vz 跟得上 → 闭环不卡 → 水平正常推进。
-#
-#   旧 commit 501c394 + c9603c2 的本意 (前期先降高) 由 PX4 的 MPC_Z_VEL_MAX_DN + 算式
-#   拉高 desired_vz 共同实现, 不再需要这个 floor 做 hack。
-#   保留参数 (不删) 作为 escape hatch: 如果以后再次出现 "降不下来" 且根因是 desired_vz
-#   太保守, 可设 1.5-2.0 启用 (2.0 是闭环安全上限, 不应超过 2.5 触发死锁)。
-strike_pre_chase_min_descent_mps: 0.0
-
 # PN专用目标输入滤波和陈旧目标软降速；IMAGE/GEO不使用这些滤波结果。
 pn_target_filter_min_cutoff_hz: 1.0
 pn_target_filter_beta: 0.005
@@ -189,19 +170,16 @@ pn_target_filter_d_cutoff_hz: 1.0
 pn_cluster_stale_timeout_sec: 0.5
 pn_cluster_stale_speed_scale: 0.33
 
-# === 2026-08-19: 8m → 30m; 2026-10-11: 30m → 50m ===
+# === 2026-08-19: 8m → 30m ===
 #   原 8m 内图像射线趋近垂直、水平反复换向、SEARCH_TRACK + attack_cmd 直接
 #   远距俯冲时 yaw 没追上 target bearing,IMAGE 射线 (image_ray_alpha=0.25 LPF
 #   时间常数 ~0.4s) 滞后让速度方向偏,导致 UAV 越顶 41m 后 world coord 接管再反向。
 #   把世界坐标接管半径提到 30m:水平 ≤ 30m 起就锁到稳定的 cluster 世界坐标,
 #   仅 30m 以上才用 IMAGE 射线(yaw 误差此时较小)。skill 105 ATTACK 走 attack_point
 #   waypoint 起跑距离小,这一改动对它的影响可忽略。
-#   2026-10-11: 拉到 50m 是为了让 horiz ≤ 50 阶段水平速度按 horiz/50 衰减 (L2389-2396),
-#   配合 strike_pre_chase_min_descent_mps 让 chase zone 末段水平更平。不影响 horiz > 50
-#   全速冲。
 strike_slowdown_radius_m: 10.0
 strike_horizontal_stop_radius_m: 1.0
-strike_terminal_world_direction_radius_m: 50.0
+strike_terminal_world_direction_radius_m: 30.0
 # 近目标逐渐冻结偏航，避免机头在目标正上方来回寻找像面中心。
 strike_yaw_freeze_radius_m: 3.0
 # 每次进入 STRIKE 后必须收到本轮新目标坐标，且坐标持续保持新鲜。

@@ -314,15 +314,6 @@ private:
     double strike_vertical_lag_ = 2.0;
     double strike_commit_radius_ = 3.0;
     double strike_min_commit_altitude_ = 2.0;
-    // === 2026-10-11: chase zone 之前强制最低下沉 (用户原话"前期先降低高度") ===
-    //   horiz > strike_terminal_image_chase_min_horiz_m_(30m) 期间, commanded_vz 不能
-    //   低于该值, 即使 computeSlantDescentSpeed 算出来 desired_vz 只有 1.8-2 m/s
-    //   (因为 horiz 还很大, time_to_hit 长, down/t 自然小)。
-    //   === 2026-10-12: 默认 3.0 → 0.0 (治本闭环反馈死锁, 详 yaml 注释) ===
-    //   旧 3.0 触发: commanded_vz=3.0 → PX4 跟 → actual_vz=1.0 → 闭环算
-    //   time_to_land=30s → closed_loop_h_speed=3 m/s → 水平压低, 飞机停在原地。
-    //   留作 escape hatch, 用 yaml 设 1.5-2.0 启用 (闭环安全上限 2.5)。
-    double strike_pre_chase_min_descent_mps_ = 0.0;
     // === 2026-08-19: STRIKE 闭环下降 ===
     //   跟踪 UAV 实际下降率 (PX4 限速 / 电机饱和时实际比 commanded 小),
     //   feasibleHorizontalSpeedForDescent 据此反推水平速度,确保水平/垂直同时到达。
@@ -733,13 +724,6 @@ public:
         nh_private_.param<double>("strike_commit_radius", strike_commit_radius_, 3.0);
         nh_private_.param<double>("strike_min_commit_altitude",
                                   strike_min_commit_altitude_, 2.0);
-        // === 2026-10-11: chase zone 之前强制最低下降率 (默认关闭, 详 yaml 注释) ===
-        nh_private_.param<double>("strike_pre_chase_min_descent_mps",
-                                  strike_pre_chase_min_descent_mps_, 0.0);
-        // === 2026-10-12: clamp 范围改为允许 0 (默认关闭); 上限收紧到 2.5 防闭环死锁 ===
-        //   旧 [1.0, 10.0] 防 yaml 误设 0 是错的, 应该防的是误设 > 2.5 触发闭环死锁。
-        strike_pre_chase_min_descent_mps_ =
-            clampValue(strike_pre_chase_min_descent_mps_, 0.0, 2.5);
         //=======高度下降===========//
         nh_private_.param<bool>("strike_slant_descent_enabled",
                                 strike_slant_descent_enabled_, true);
@@ -2395,24 +2379,19 @@ public:
         //   alt=9.9m 时 chase 仍按 8.5 m/s + descent 5.0 m/s 命令,但电机饱和,实际
         //   垂直只给 2 m/s → "无人机降不下来"。根因:水平吃满了电机拉力预算,腾不出
         //   余量给垂直下降。
-        //   修法:horiz ≤ strike_terminal_world_direction_radius_(50m, 扩区间) 时,水平速度
-        //   按 horiz/50 线性衰减,floor=0.3*requested_speed 兜底 (用户选保守, 由原 0.4 调
-        //   到 0.3)。floor=0.3 保证 chase sticky 0.5s 内不丢目标, 同时 chase zone 末段
-        //   (horiz 5m 时) 水平只吃 0.3*5.1=1.5m/s, 给 vz 留 70%+ 电机预算, 治本
-        //   "实际高度速度下不来也要保证后半段尽量水平"。horiz>50m 不缩 (中段全速冲)。
-        //   命中圈 (≤ strike_distance_threshold_) 已经在上方 early-return, 这里不再叠加。
-        //   不影响 terminal_image_chase_active_ 路径 (那段在 caller 提前 return)。
+        //   修法:horiz ≤ strike_terminal_world_direction_radius_(30m) 时,水平速度按
+        //   horiz/30 线性衰减,floor=0.4*requested_speed 兜底。floor=0.4 保证 UAV 还能
+        //   维持 chase 不丢失,但只允许用 40% 电机拉力预算,腾 60% 给 vz。horiz>30m
+        //   不缩 (中段全速冲,与 chase_active 路径分工)。命中圈 (≤ strike_distance_threshold_)
+        //   已经在上方 early-return,这里不再叠加,避免命中后还卡水平缩。
+        //   不影响 terminal_image_chase_active_ 路径 (那段在 caller 提前 return,
+        //   没机会走到 feasibleHorizontalSpeedForDescent)。
         const double horiz_scale_radius = strike_terminal_world_direction_radius_m_;
         double horiz_scaled = requested_speed;
         if (horiz_scale_radius > 1e-3 &&
             g.horizontal <= horiz_scale_radius && g.horizontal > strike_distance_threshold_) {
-            // === 2026-10-11: 固定 floor=0.3 (覆盖 yaml strike_terminal_horizontal_scale_floor=0.4) ===
-            //   治本实际 vz 跟不上的兜底, 把 chase zone 水平下限压低, 留电机余量给 vz。
-            //   不读 strike_terminal_horizontal_scale_floor_ 是因为 yaml 改 0.3 会破坏其它
-            //   路径 (PN 等), 这里局部覆盖, 只影响 STRIKE 末段水平闭环。
-            const double chase_zone_floor = 0.3;
             const double scale = clampValue(g.horizontal / horiz_scale_radius,
-                                            chase_zone_floor, 1.0);
+                                            strike_terminal_horizontal_scale_floor_, 1.0);
             horiz_scaled = requested_speed * scale;
         }
         return std::min({requested_speed, closed_loop_h_speed, horiz_scaled});
@@ -2485,26 +2464,7 @@ public:
             const double time_to_hit = horizontal_to_hit / closing_speed;
             const double desired_vz = g.down /
                 (time_to_hit + strike_vertical_lag_);
-            double vz_after_math =
-                clampValue(desired_vz, 0.0, strike_descent_rate_);
-            // === 2026-10-11: chase zone 之前强制最低下沉 (用户原话"前期先降低高度") ===
-            //   horiz > strike_terminal_image_chase_min_horiz_m_(30m) 期间, vz_after_math
-            //   不能低于 strike_pre_chase_min_descent_mps_, 防止 desired_vz 算出来 2 m/s
-            //   太保守, 让进 chase zone 前高度没下来 (用户原话 "前半段降不下来, 后半段被锁住
-            //   不能水平打")。命中圈 (horiz <= 2) + chase zone (horiz <= 30) 不动, 走原
-            //   desired_vz 数学, 让 chase zone 末端还能精细控制。
-            // === 2026-10-12: 默认 strike_pre_chase_min_descent_mps_ = 0 → 整段不进入。
-            //   旧 3.0 触发闭环反馈死锁 (详 yaml 注释): commanded_vz 抬到 3.0 → PX4 跟
-            //   → actual_vz=1.0 → 闭环算 time_to_land=30s → 水平被压到 ~3 m/s, 飞机停在原地。
-            //   留作 escape hatch: yaml 设 1.5-2.0 启用, 2.5 是闭环安全上限 (clamp)。
-            const double chase_min_horiz = std::max(
-                strike_distance_threshold_, strike_terminal_image_chase_min_horiz_m_);
-            if (g.horizontal > chase_min_horiz &&
-                strike_pre_chase_min_descent_mps_ > 0.0) {
-                vz_after_math = std::max(vz_after_math,
-                                          strike_pre_chase_min_descent_mps_);
-            }
-            return vz_after_math;
+            return clampValue(desired_vz, 0.0, strike_descent_rate_);
         }
 
         // 水平已进入2m命中圈，才允许完成剩余下降；MissionManager 仍按原三维2m
