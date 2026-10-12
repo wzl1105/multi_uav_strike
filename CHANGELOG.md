@@ -46,6 +46,7 @@ The format below is intentionally minimal — one line per version, no headers.
 - `LN_config T` (trigger smoke) hostname drift 修: 板子端 `ROS_HOSTNAME=localhost`,
   旧版 `$(hostname)` 解析到 `/etc/hosts` stale IP, echo subscriber 永远连不上
   → T 操作在这块板子上等于无效。
+- 打击后不再向地面站发送新目标，根据地面站新任务判断是否需要回传目标。
 
 ### 工具改名
 - `tools/update_tools/deploy_linux.sh` → `LN_config.sh`,

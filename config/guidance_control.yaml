@@ -163,21 +163,24 @@ image_yaw_rate_max: 0.5
 strike_descent_rate: 5.0
 strike_vertical_lag: 0.5
 
-# === 2026-10-11: chase zone 之前强制最低下降率 (治本"前期先降低高度") ===
-#   用户原话 (multi_uav_flight_1115.bag): "怎么让他在打击的后半段都尽量水平,
-#   也就是前期先降低高度"; "要在飞机实际高度速度下不来的话也要保证后半段也尽量水平打击"。
+# === 2026-10-12: chase zone 之前最低下沉 floor 默认关闭 (治本闭环反馈死锁) ===
+#   旧默认 3.0 触发了 STRIKE 闭环死锁:
+#     1) computeSlantDescentSpeed 把 commanded_vz 抬到 -3.0 m/s
+#     2) PX4 / 电机饱和 → actual_vz 只给到 ~1.0 m/s
+#     3) feasibleHorizontalSpeedForDescent 用 actual_vz 反推 closed_loop_h_speed
+#        = horiz / (down/actual_vz + 0.5) → 30s 落地时间,水平压到 ~3 m/s
+#     4) 水平速度被闭环压低 → 飞机"位置几乎没动, 姿态动了一下就停了"
+#   外场飞行实测 (2026-10-11): horiz=100m down=30m 阶段, 飞机停在原地只转 yaw。
 #
-#   现象:bag 里 horiz=72→30m 阶段, computeSlantDescentSpeed 算 desired_vz 只有
-#   1.81→2.98 m/s (因为 down=28m / time_to_hit=14s), 实际下降到 chase zone 时 alt 还
-#   有 19.86m, 后半段必须边水平边下沉, 撞上 chase sticky 0.5s 失败导致 TERMINAL NO-IMAGE
-#   GUARD latched, 用户体验"前半段降不下来, 后半段被锁住不能水平打"。
+#   治本:yaml 默认 0.0 (关闭 floor),代码侧 if (... > 0.0) 守门自动跳过该段。
+#   desired_vz 走回原数学公式 (g.down / (time_to_hit + strike_vertical_lag_))。
+#   实际 vz 跟得上 → 闭环不卡 → 水平正常推进。
 #
-#   修法:horiz > chase_min_horiz_(30m) 期间, commanded_vz 不能低于该值。
-#   硬件实测可到 4.95 m/s 不饱和 (bag 后半段 vz=4.95 时仍在 horiz 8m 阶段)。
-#   默认 3.0 m/s (用户选保守): 比纯数学公式 (1.8) 高 67%, 让进 chase zone 时 alt ≈ 14m
-#   而非 19m; 不激进, 留缓冲给 chase sticky 失败等异常。
-#   范围 [1.0, 10.0], 防 yaml 误设 0。
-strike_pre_chase_min_descent_mps: 3.0
+#   旧 commit 501c394 + c9603c2 的本意 (前期先降高) 由 PX4 的 MPC_Z_VEL_MAX_DN + 算式
+#   拉高 desired_vz 共同实现, 不再需要这个 floor 做 hack。
+#   保留参数 (不删) 作为 escape hatch: 如果以后再次出现 "降不下来" 且根因是 desired_vz
+#   太保守, 可设 1.5-2.0 启用 (2.0 是闭环安全上限, 不应超过 2.5 触发死锁)。
+strike_pre_chase_min_descent_mps: 0.0
 
 # PN专用目标输入滤波和陈旧目标软降速；IMAGE/GEO不使用这些滤波结果。
 pn_target_filter_min_cutoff_hz: 1.0

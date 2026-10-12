@@ -2,6 +2,8 @@
 # backup_to_local.sh — 在开发者笔记本上跑，把指定包的编译产物从板子取到本地并打包
 # +++ 默认排除 docs/ 目录（避免 Windows tar 解析 bundle 里的中文文件名炸掉）
 # +++ 需临时保留 docs/ 时: EXCLUDE_DOCS=0 ./backup_to_local.sh <ip>
+# +++ WITH_SRC=1 时默认排除 C++ 源码 (.cpp / .h / .hpp 等)，只保留 launch/config/msg 等
+# +++ 需保留源码时: WITH_CPP_SRC=1 WITH_SRC=1 ./backup_to_local.sh <ip>
 #
 # 用法:
 #   ./backup_to_local.sh <source_ip>                       # 备份三个常用包(默认不带 start_gimbal.sh)
@@ -17,6 +19,7 @@
 #   SSH_USER=rpdzkj               SSH 用户名（默认 rpdzkj）
 #   SRC_BASE=/home/rpdzkj/tzs_ws  板子上 workspace 根（默认）
 #   WITH_SRC=0                    设为 1 同时打包 src/<pkg>/（含 launch / config 更新）
+#   WITH_CPP_SRC=0                WITH_SRC=1 时是否保留 C++ 源码（默认 0，只留 launch/config/msg/python 等）
 #   EXCLUDE_DOCS=1                默认 1，排除 docs/；设为 0 保留 docs/
 
 set -euo pipefail
@@ -29,11 +32,13 @@ Default behavior:
   - 不传包名 → 备份 multi_uav_strike starling_bridge starling_gimbal
   - 默认不带 start_gimbal.sh （需要时 WITH_TOP=1）
   - 默认排除 docs/ （EXCLUDE_DOCS=0 保留）
+  - WITH_SRC=1 时默认排除 C++ 源码（launch / config / msg / python 仍保留）
 
 Env vars (optional):
   SSH_USER=root                 SSH user (default root)
   SRC_BASE=/home/rpdzkj/tzs_ws  Workspace root on source board
-  WITH_SRC=0                    Set to 1 to also include src/<pkg>/ (launch/config)
+  WITH_SRC=0                    Set to 1 to also include src/<pkg>/ (launch/config/msg)
+  WITH_CPP_SRC=0                WITH_SRC=1 时是否保留 C++ 源码（0=否,1=是）
   WITH_TOP=0                    Set to 1 to also include start_gimbal.sh
   TOP_SCRIPTS="start_gimbal.sh foo.sh"  Custom list of top-level scripts
   TOP_ONLY=0                    Set to 1 to skip packages, only backup top-level scripts
@@ -42,9 +47,13 @@ Env vars (optional):
 Example:
   $0 192.168.1.151
   $0 192.168.1.151 multi_uav_strike
+  # 跳过 starling_gimbal,只备份多机打击 + gimbal 桥接 (无需相机 gimbal 节点源码)
+  $0 192.168.1.151 multi_uav_strike starling_bridge
   WITH_TOP=1 $0 192.168.1.151 multi_uav_strike starling_bridge
   TOP_ONLY=1 $0 192.168.1.151
   WITH_SRC=1 $0 192.168.1.151 multi_uav_strike starling_bridge
+  # WITH_SRC=1 同时保留 C++ 源码
+  WITH_CPP_SRC=1 WITH_SRC=1 $0 192.168.1.151 multi_uav_strike starling_bridge
   EXCLUDE_DOCS=0 $0 192.168.1.151       # 保留 docs/（含中文文档）
 EOF
     exit 1
@@ -60,6 +69,7 @@ if [ "${#PKGS[@]}" -eq 0 ]; then
     PKGS=("${DEFAULT_PKGS[@]}")
     echo "[info] 未指定包名，默认备份: ${PKGS[*]}"
     echo "[info] 显式指定: $0 <ip> <pkg1> [pkg2 ...]"
+    echo "[info] 跳过 starling_gimbal: $0 <ip> multi_uav_strike starling_bridge"
     echo
 fi
 
@@ -73,6 +83,7 @@ fi
 SSH_USER="${SSH_USER:-root}"
 SRC_BASE="${SRC_BASE:-/home/rpdzkj/tzs_ws}"
 WITH_SRC="${WITH_SRC:-0}"
+WITH_CPP_SRC="${WITH_CPP_SRC:-0}"           # +++ 默认 0: WITH_SRC=1 时排除 C++ 源码
 EXCLUDE_DOCS="${EXCLUDE_DOCS:-1}"           # +++
 
 # +++ docs/ 排除项（默认启用，避免 bundle 里有中文文件名）
@@ -106,6 +117,7 @@ echo "src  : $SSH_USER@$SRC_IP:$SRC_BASE"
 echo "pkgs : ${PKGS[*]}"
 echo "out  : ./$WORK/"
 echo "WITH_SRC=$WITH_SRC  (set WITH_SRC=1 to include launch/config)"
+echo "WITH_CPP_SRC=$WITH_CPP_SRC  (only effective when WITH_SRC=1; default 0 = exclude *.cpp/*.h/*.hpp)"
 echo "EXCLUDE_DOCS=$EXCLUDE_DOCS"
 echo
 
@@ -148,16 +160,29 @@ for pkg in "${PKGS[@]}"; do
         DST_PKG="$WORK/src/${pkg}"
         if ssh -o ControlPath="$SSH_MASTER_PATH" "$SSH_USER@$SRC_IP" "test -d ${SRC_BASE}/src/${pkg}" 2>/dev/null; then
             mkdir -p "$WORK/src"
+            # +++ WITH_CPP_SRC=0 (默认) 时排除 C++ 源码,只保留 launch/config/msg/python 等
+            CPP_EXCLUDE=()
+            if [ "$WITH_CPP_SRC" != "1" ]; then
+                CPP_EXCLUDE=(
+                    --exclude='*.cpp' --exclude='*.hpp' --exclude='*.hxx' --exclude='*.cc'
+                    --exclude='*.cxx' --exclude='*.h' --exclude='*.c'
+                )
+            fi
             rsync -av --delete \
                 --exclude='__pycache__/' \
                 --exclude='build/' \
                 --exclude='.catkin_tools/' \
                 --exclude='.git/' \
                 --exclude='.vscode/' \
+                "${CPP_EXCLUDE[@]}" \
                 "${DOCS_EXCLUDE[@]}" \
                 -e "$RSYNC_SSH" \
                 "$SRC_PKG" "$DST_PKG/"                              # +++
-            echo "[OK]  src/$pkg/  (含 launch / config)"
+            if [ "$WITH_CPP_SRC" = "1" ]; then
+                echo "[OK]  src/$pkg/  (含 launch / config / C++ 源码)"
+            else
+                echo "[OK]  src/$pkg/  (含 launch / config / msg; C++ 源码已排除)"
+            fi
         else
             echo "[!!]  WITH_SRC=1 但板子上没找到 src/$pkg/"
         fi

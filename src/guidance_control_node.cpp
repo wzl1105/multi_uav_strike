@@ -317,11 +317,12 @@ private:
     // === 2026-10-11: chase zone 之前强制最低下沉 (用户原话"前期先降低高度") ===
     //   horiz > strike_terminal_image_chase_min_horiz_m_(30m) 期间, commanded_vz 不能
     //   低于该值, 即使 computeSlantDescentSpeed 算出来 desired_vz 只有 1.8-2 m/s
-    //   (因为 horiz 还很大, time_to_hit 长, down/t 自然小)。bag 里 horiz=72→30m 阶段
-    //   actual_vz 在 1.8-2 m/s, hardware 实测可 4.95 (后半段 vz=4.95 不饱和)。
-    //   抬到 3.0 (保守) 让进 chase zone 时 alt ≈ 14m 而非 19m, 后半段水平匀速覆盖。
-    //   命中圈 (horiz <= 2) + chase zone (horiz <= 30) 不动, 走原 desired_vz 数学。
-    double strike_pre_chase_min_descent_mps_ = 3.0;
+    //   (因为 horiz 还很大, time_to_hit 长, down/t 自然小)。
+    //   === 2026-10-12: 默认 3.0 → 0.0 (治本闭环反馈死锁, 详 yaml 注释) ===
+    //   旧 3.0 触发: commanded_vz=3.0 → PX4 跟 → actual_vz=1.0 → 闭环算
+    //   time_to_land=30s → closed_loop_h_speed=3 m/s → 水平压低, 飞机停在原地。
+    //   留作 escape hatch, 用 yaml 设 1.5-2.0 启用 (闭环安全上限 2.5)。
+    double strike_pre_chase_min_descent_mps_ = 0.0;
     // === 2026-08-19: STRIKE 闭环下降 ===
     //   跟踪 UAV 实际下降率 (PX4 限速 / 电机饱和时实际比 commanded 小),
     //   feasibleHorizontalSpeedForDescent 据此反推水平速度,确保水平/垂直同时到达。
@@ -732,11 +733,13 @@ public:
         nh_private_.param<double>("strike_commit_radius", strike_commit_radius_, 3.0);
         nh_private_.param<double>("strike_min_commit_altitude",
                                   strike_min_commit_altitude_, 2.0);
-        // === 2026-10-11: chase zone 之前强制最低下降率 ===
+        // === 2026-10-11: chase zone 之前强制最低下降率 (默认关闭, 详 yaml 注释) ===
         nh_private_.param<double>("strike_pre_chase_min_descent_mps",
-                                  strike_pre_chase_min_descent_mps_, 3.0);
+                                  strike_pre_chase_min_descent_mps_, 0.0);
+        // === 2026-10-12: clamp 范围改为允许 0 (默认关闭); 上限收紧到 2.5 防闭环死锁 ===
+        //   旧 [1.0, 10.0] 防 yaml 误设 0 是错的, 应该防的是误设 > 2.5 触发闭环死锁。
         strike_pre_chase_min_descent_mps_ =
-            clampValue(strike_pre_chase_min_descent_mps_, 1.0, 10.0);  // 至少 1.0, 防 yaml 误设 0
+            clampValue(strike_pre_chase_min_descent_mps_, 0.0, 2.5);
         //=======高度下降===========//
         nh_private_.param<bool>("strike_slant_descent_enabled",
                                 strike_slant_descent_enabled_, true);
@@ -2490,6 +2493,10 @@ public:
             //   太保守, 让进 chase zone 前高度没下来 (用户原话 "前半段降不下来, 后半段被锁住
             //   不能水平打")。命中圈 (horiz <= 2) + chase zone (horiz <= 30) 不动, 走原
             //   desired_vz 数学, 让 chase zone 末端还能精细控制。
+            // === 2026-10-12: 默认 strike_pre_chase_min_descent_mps_ = 0 → 整段不进入。
+            //   旧 3.0 触发闭环反馈死锁 (详 yaml 注释): commanded_vz 抬到 3.0 → PX4 跟
+            //   → actual_vz=1.0 → 闭环算 time_to_land=30s → 水平被压到 ~3 m/s, 飞机停在原地。
+            //   留作 escape hatch: yaml 设 1.5-2.0 启用, 2.5 是闭环安全上限 (clamp)。
             const double chase_min_horiz = std::max(
                 strike_distance_threshold_, strike_terminal_image_chase_min_horiz_m_);
             if (g.horizontal > chase_min_horiz &&
