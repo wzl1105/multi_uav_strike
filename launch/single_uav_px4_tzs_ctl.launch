@@ -193,7 +193,7 @@
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" respawn="true" output="screen">
       <!-- 地面站 IP 和端口 -->
       <!-- Waydroid 容器地址；可在启动前用 TZS_GCS_IP 覆盖。 -->
-      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.3.90)" />
+      <param name="gcs_ip" value="$(optenv TZS_GCS_IP 192.168.43.5)" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-1)" />

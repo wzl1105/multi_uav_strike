@@ -404,11 +404,6 @@ public:
         //   YOLO 反复 skip → cluster 1.5s STALE → primary 跳 WP2 fallback →
         //   target switched jump=8.4m,CHASE 直接退出 → pilot override。
         //   进 strike 后 yaw_rate 旁路放行,waypoint/SEARCH 阶段保留门控。
-        // === 2026-10-11: STRIKE 内 chase zone 同样由 is_attack_active_ 覆盖 ===
-        //   multi_uav_flight_2_0.bag (179-200s chase 22s 卡死): chase 期间 yaw 抖动
-        //   触发 image_age > 0.4s → terminal_no_image_hold_latched_, 跟本行 yaw_rate
-        //   bypass 无关 (chase 时 is_attack_active_=true, 此条早返 = 不 skip)。本修复
-        //   通过 terminal_no_image_hold_max_sec=5.0 自动 unlatch + smoke 重试治本。
         if (!manual_recognition_active_ &&
             !guidance_mode_is_track_ && !is_attack_active_ &&
             std::fabs(matched_yaw_rate.yaw_rate_rad_s) >
@@ -1291,16 +1286,16 @@ public:
                                             it->second.last_seen_us) * 1e-6;
                     if (lsu_age > cluster_stale_freeze_sec_) {
                         if (is_attack_active_) {
-                            // === 2026-10-12: Attack 阶段不 release primary ===
-                            //   uav0_strike_2026-10-12-18-27-53_0.bag: chase 末段 NO-IMAGE
-                            //   GUARD 5s hold 期间 cluster 11 last_seen_us 停更, 3s 后命中
-                            //   stale_freeze, 原版 release → closest-to-WP2 fallback 选
-                            //   cluster 12 (95.2m 远) → target_estimated_pose 跳变 → 飞机
-                            //   转向别人 (用户原话"航向一旦转向别人云台就看不到要打击的目标")。
-                            //   治本: Attack 阶段 primary 是 mission_manager 显式指定 (skill 105),
-                            //   短时失目 (NO-IMAGE GUARD 设计内 5s hold) 不应切到 fallback。
-                            //   位置冻结在 last_seen 旧点, NO-IMAGE unlatch 后 chase 续上同一 primary,
-                            //   不会再"换目标"。只在非 attack 阶段保留 release 行为 (旧 SEARCH/TRACK)。
+                            // === 攻击阶段不 release primary ===
+                            //   chase 末段 NO-IMAGE GUARD hold 期间 cluster last_seen_us
+                            //   停更, 命中 stale_freeze 时原 release → closest-to-WP2 fallback
+                            //   选远 cluster → target_estimated_pose 跳变 → 飞机转向别人
+                            //   (用户原话"航向一旦转向别人云台就看不到要打击的目标")。
+                            //   治本: Attack 阶段 primary 是 mission_manager 显式指定
+                            //   (skill 105), 短时失目 (NO-IMAGE GUARD 设计内 hold) 不应
+                            //   切到 fallback; 位置冻结在 last_seen 旧点, NO-IMAGE unlatch
+                            //   后 chase 续上同一 primary, 不会再"换目标"。
+                            //   只在非 attack 阶段保留 release 行为 (旧 SEARCH/TRACK)。
                             ROS_WARN_THROTTLE(2.0,
                                 "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs) "
                                 "during Attack; KEEP lock (avoid chase zone fallback to wrong cluster)",
@@ -1355,11 +1350,16 @@ public:
         //   锁内只读 deque, 锁外查 clusters_ + label 过滤, 不构成嵌套锁, 死锁 = 0
         //   WP2 NWU 坐标 (wp2_n_outer / wp2_nwu_y_outer / wp2_coords_valid) 在 Step 2 块之前
         //   已经 hoist 算好 (L1323-1342 移上来), 这里直接复用
-        // === 2026-10-12: Step 1.5 加 primary==nullptr 守卫 (治本"chase 末段转向别人"路径 B) ===
-        //   uav0_strike_2026-10-12-18-36-48_0.bag: chase 末段 chase 几何 bug 让 bbox
-        //   漂出 FOV, YOLO 反投影命中"新生成的 cluster 14" (chase 末段才出现),
-        //   Step 1.5 直接覆盖 Step 1 选好的 primary=cluster 12 → publishPrimaryPose
-        //   跳到 cluster 14 (89.7m 远) → target_estimated_pose 跳 97.2m → "转向别人"。
+        // === 2026-10-10: YOLO back-projection primary override (Step 1.5) ===
+        //   优先于 closest-to-WP2 fallback, 因为 raw back-projection 不受 stale filter 影响
+        //   (cluster 2 失 YOLO 期间, 之前帧的 back-projection 仍指向 sim id=1, 12-00-54 bag)
+        //   锁内只读 deque, 锁外查 clusters_ + label 过滤, 不构成嵌套锁, 死锁 = 0
+        //   WP2 NWU 坐标 (wp2_n_outer / wp2_nwu_y_outer / wp2_coords_valid) 在 Step 2 块之前
+        //   已经 hoist 算好 (L1323-1342 移上来), 这里直接复用
+        // === Step 1.5 加 primary==nullptr 守卫 (治本"chase 末段转向别人"路径 B) ===
+        //   chase 末段 chase 几何 bug 让 bbox 漂出 FOV, YOLO 反投影命中"新生成的
+        //   cluster" (chase 末段才出现), Step 1.5 直接覆盖 Step 1 选好的 primary →
+        //   publishPrimaryPose 跳到远 cluster → target_estimated_pose 跳变 → "转向别人"。
         //   治本: Step 1.5 设计意图是"Step 1 选不到 primary 时的 back-proj 兜底",
         //   Step 1 选到了就不再 override。Attack 阶段 primary 是 mission_manager 显式
         //   指定 (skill 105), 不需要 back-proj 兜底; chase 末段 bbox 漂出 FOV 期间
