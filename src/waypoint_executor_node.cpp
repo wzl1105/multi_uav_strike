@@ -835,6 +835,21 @@ public:
                 current_mission_phase_ == 5) {  // GUIDANCE_STRIKE
                 return true;
             }
+            // === 2026-10-14 修 (uav0_strike_2026-10-13-23-28-49_0.bag, t=123.49s
+            //   第二次 AUTO.LAND failsafe, setpoint 真空 ~1s):
+            //   SEARCH_TRACK(102) 跟丢后 phase=11 (PHASE_TARGET_LOST_HOVER),
+            //   用户发新 TaskFlow → taskFlowCallback 调 pushCurrentSkillToExecutor
+            //   把 segment_phase_=ARRIVE 抢在 mission_state.phase 从 11 切到 3/4/5 之前。
+            //   期间 canPublishVelocitySetpoint 因 phase=11 不在 {3,4,5,6} → false,
+            //   同时 L1000-1005 的"不在 ARRIVE/SKILL_AREA 才发 0"兜底因 segment_phase_
+            //   =ARRIVE 也不命中 → publishVelocityCommandWithYaw 在 L1819-1833 二次闸门
+            //   block → 0 vel 停发 + mission_manager 不发 position → 1s 真空 → failsafe。
+            //   修法:phase 11 (TARGET_LOST_HOVER) + !guidance_has_control_ 是
+            //   "SEARCH_TRACK 跟丢 + 新 TaskFlow 衔接过渡态", 必须发 0 vel 保活 OFFBOARD
+            //   等 mission_state.phase 切到 3/4/5 后正常接管。其它 phase 行为不动。
+            if (current_mission_phase_ == 11) {  // PHASE_TARGET_LOST_HOVER
+                return true;
+            }
         }
 
         return current_mission_phase_ == 3 ||  // WAYPOINT_FOLLOW

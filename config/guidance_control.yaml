@@ -140,7 +140,13 @@ strike_slant_min_horizontal_distance_m: 1.0
 image_center_deadband: 0.03
 image_ray_alpha: 0.25
 image_yaw_kp: 0.6
-image_yaw_rate_max: 0.5
+# === 2026-10-13: chase 动目标 yaw 裕度 (uav0_strike_2026-10-13-23-28-49_0.bag) ===
+#   0.5 rad/s = 28.6°/s, 跟不上 chase 末段目标转向峰值 30°/s (跟丢根因).
+#   实际 gimbal 物理上限 ~0.4 rad/s (servo 机械), PX4 内部 MAVLINK_RATE_LIMIT
+#   兜底, 算法层面给 0.8 rad/s (45.8°/s) 让 desired_yaw_rate 跟 ray 角速度同步,
+#   避免 body_yaw 跟 image_ray 错位累积超 80° → bbox 出 FOV 失锁.
+#   仍是 saturate, 真追不上时 gimbal 物理卡 0.4, 算法不会暴冲.
+image_yaw_rate_max: 0.8
 
 # === 2026-08-19: STRIKE 闭环下降 (替代原半开环 strike_descent_rate=2.0) ===
 #   computeSlantDescentSpeed 算 desired_vz = g.down / (time_to_hit + strike_vertical_lag_),

@@ -211,6 +211,12 @@ private:
     //   **解耦**:滤波只针对 chase 函数,不传给 STRIKE PN(PN 已有自己的 pn_target_filter)。
     multi_uav_strike::OneEuroFilter1D chase_target_vel_filter_x_;
     multi_uav_strike::OneEuroFilter1D chase_target_vel_filter_y_;
+    // === 2026-10-14: chase yaw 专用 OneEuro 旁路 vel_filter_yaw_ (治本 23-28-49 跟丢) ===
+    //   vel_filter_yaw_ 全局 (cutoff=0.5Hz, beta=0.001) 把 chase 段高频 yaw_rate
+    //   抖到 0.1 rad/s 范围, 跟不上动目标 22-45°/s ray 角速度 → 累积 body↔ray 错位
+    //   失锁. 新增 chase_target_vel_filter_yaw_ 用 chase 专用参数 (1.0/0.005),
+    //   chase 路径单独用, 不影响 STRIKE PN 路径 (那条用 vel_filter_yaw_ 老逻辑).
+    multi_uav_strike::OneEuroFilter1D chase_target_vel_filter_yaw_;
     // === 2026-08-24: chase OneEuro dt 缓存 — 之前传 now().toSec() 当 dt,filter 冻结 ===
     ros::Time chase_filter_last_time_;
     //===================制导修改====================
@@ -662,6 +668,11 @@ public:
         chase_target_vel_filter_x_ = multi_uav_strike::OneEuroFilter1D(
             chase_vel_min_cutoff, chase_vel_beta, chase_vel_d_cutoff);
         chase_target_vel_filter_y_ = multi_uav_strike::OneEuroFilter1D(
+            chase_vel_min_cutoff, chase_vel_beta, chase_vel_d_cutoff);
+        // === 2026-10-14: chase yaw 专用 OneEuro — 跟 chase x/y 同参数 (1.0/0.005) ===
+        //   默认 vel_smooth_beta=0.001 太重, 跟丢动目标; chase 路径需要更快跟踪
+        //   才能让 body_yaw 跟 image_ray 错位不累积超 80° → bbox 出 FOV 失锁.
+        chase_target_vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(
             chase_vel_min_cutoff, chase_vel_beta, chase_vel_d_cutoff);
         chase_vel_filter_min_cutoff_hz_ = chase_vel_min_cutoff;
         chase_vel_filter_beta_           = chase_vel_beta;
@@ -3266,7 +3277,20 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
         vel_cmd.linear.x  = vel_filter_x_.filter(vel_cmd.linear.x,  te);
         vel_cmd.linear.y  = vel_filter_y_.filter(vel_cmd.linear.y,  te);
         vel_cmd.linear.z  = vel_filter_z_.filter(vel_cmd.linear.z,  te);
-        vel_cmd.angular.z = vel_filter_yaw_.filter(vel_cmd.angular.z, te);
+        // === 2026-10-14: chase 段用独立 chase_target_vel_filter_yaw_ 旁路 vel_filter_yaw_ ===
+        //   治本 23-28-49 跟丢: vel_filter_yaw_ (cutoff 0.5Hz beta 0.001) 把 chase
+        //   段高频 yaw_rate 抖到 0.1 rad/s, 跟不上动目标 22-45°/s ray 角速度 →
+        //   累积 body↔ray 错位失锁. chase 路径用专用 OneEuro (cutoff 1.0Hz beta
+        //   0.005) 跟踪更高频 yaw_rate, 不影响 STRIKE PN 路径 (那仍用
+        //   vel_filter_yaw_ 老逻辑保稳定).
+        //   terminal_image_chase_active_ 跟 chase_target_vel_filter_x_ 同步管理,
+        //   chase 退出时 chase_target_vel_filter_yaw_ 跟 vel_filter_yaw_ 都冻
+        //   在上一次值, 下次 chase 进入时由 cmd.angular.z 当前值平滑过渡.
+        if (terminal_image_chase_active_) {
+            vel_cmd.angular.z = chase_target_vel_filter_yaw_.filter(vel_cmd.angular.z, te);
+        } else {
+            vel_cmd.angular.z = vel_filter_yaw_.filter(vel_cmd.angular.z, te);
+        }
 
         // === 2026-07-16: Debug — raw vs filtered 速度 ===
         //   用 rqt_plot 看 vel_raw - vel_filtered 的 residual,
