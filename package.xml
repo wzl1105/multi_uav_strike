@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>multi_uav_strike</name>
-  <version>0.0.4</version>
+  <version>0.0.5</version>
   <description>Multi-UAV strike system with gimbal target localization and guidance (ROS1)</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
   <license>MIT</license>
