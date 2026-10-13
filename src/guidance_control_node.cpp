@@ -2623,8 +2623,15 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
         cmd.linear.x =  chase_speed * ray.x();
         cmd.linear.y = -chase_speed * ray.y();
         cmd.linear.z = -chase_speed * ray.z();
+        // === 2026-10-13: chase yaw 计算角度反向 ===
+        //   修前: atan2(ray.y, ray.x) 给 NWU bearing,但 currentYawNed() 返回
+        //         -yaw_nwu,导致 yaw_error 反向,plane 转向与 target 相反方向
+        //         (09-42-52 bag chase 进入时 yaw 偏 176°)。改成 -atan2(ray.y, ray.x)
+        //         抵消 currentYawNed() 里的负号,让 yaw_error 方向正确。
+        //   注: 同步检查 L2256-2262 currentYawNed() 里的 -yaw_nwu,若 chase 修完
+        //         仍反向,需要把那边符号也修正。
         cmd.angular.z = terminalYawRate(
-            std::atan2(ray.y(), ray.x()), g.horizontal);
+            -std::atan2(ray.y(), ray.x()), g.horizontal);
         return true;
     }
 
