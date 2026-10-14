@@ -108,6 +108,10 @@ strike_test_bbox_trigger_max_altitude_m: 10.0
 # 不依赖 bbox、目标距离或近区布防；低于或等于 4m 立即锁存悬停。
 strike_test_altitude_guard_enabled: true
 strike_test_min_altitude_m: 4.0
+# === 2026-10-14: 4m 高度 hold 只在 target 5m 内生效 (用户口径 "再近一点") ===
+#   远距离入场 (e.g. 30m+) 拉低到 4m 不应 hold,让 chase 继续推进。
+#   只在 target 5m 内 4m hold 才触发 = 真正接近目标时的最后兜底。
+strike_test_altitude_guard_max_horizontal_m: 10.0
 # 0.50 覆盖整个归一化画面，避免近距离目标偏到画面边缘时保护失效；
 # primary_image_target、visible 和 confidence 仍负责筛除非主目标及低置信度检测。
 strike_test_bbox_center_band: 0.50

@@ -424,6 +424,10 @@ private:
     double strike_test_bbox_active_threshold_ = 0.18;
     bool strike_test_altitude_guard_enabled_ = true;
     double strike_test_min_altitude_m_ = 4.0;
+    // === 2026-10-14: 4m 高度 hold 只在 target 5m 内生效 (用户口径 "再近一点") ===
+    //   远距离入场 (e.g. 30m+) 拉低到 4m 不应 hold,让 chase 继续推进。
+    //   horizontal_distance_m > 此值 → 跳过 4m hold (return false)。
+    double strike_test_altitude_guard_max_horizontal_m_ = 10.0;
     double strike_test_bbox_center_band_ = 0.25;
     double strike_test_bbox_min_confidence_ = 0.70;
     int strike_test_bbox_confirm_frames_ = 5;
@@ -810,6 +814,9 @@ public:
                                 strike_test_altitude_guard_enabled_, true);
         nh_private_.param<double>("strike_test_min_altitude_m",
                                   strike_test_min_altitude_m_, 4.0);
+        // === 2026-10-14: 4m hold 水平距离门 (远距离入场不 hold) ===
+        nh_private_.param<double>("strike_test_altitude_guard_max_horizontal_m",
+                                  strike_test_altitude_guard_max_horizontal_m_, 5.0);
         nh_private_.param<bool>("strike_test_smoke_enabled",
                                 strike_test_smoke_enabled_, false);
         nh_private_.param<std::string>("strike_test_smoke_service",
@@ -2059,10 +2066,17 @@ public:
     }
     //=====没有图像不打击=====//
 
-    bool maybeLatchStrikeTestAltitudeGuard() {
+    bool maybeLatchStrikeTestAltitudeGuard(double horizontal_distance_m) {
         if (!strike_test_guard_enabled_ || current_mode_ != "strike" ||
             strike_test_position_hold_latched_ ||
             !strike_test_altitude_guard_enabled_ || !is_uav_pose_received_) {
+            return false;
+        }
+        // === 2026-10-14: 4m hold 只在 target 5m 内生效 (用户口径 "再近一点") ===
+        //   远距离入场 (e.g. 30m+) 拉低到 4m 不应 hold,让 chase 继续推进。
+        //   NaN / 超阈值 → 跳过,不 latch。NaN 跟原 "目标丢失不绕过保护" 对称安全。
+        if (!std::isfinite(horizontal_distance_m) ||
+            horizontal_distance_m > strike_test_altitude_guard_max_horizontal_m_) {
             return false;
         }
 
@@ -2087,7 +2101,7 @@ public:
             return false;
         }
 
-        if (maybeLatchStrikeTestAltitudeGuard()) {
+        if (maybeLatchStrikeTestAltitudeGuard(horizontal_distance_m)) {
             cmd_ned = geometry_msgs::Twist();
             last_strike_cmd_ned_ = cmd_ned;
             last_strike_cmd_valid_ = true;
@@ -2902,7 +2916,15 @@ bool maybeApplyTerminalImageChase(geometry_msgs::Twist& cmd,
 
         //=============打击保护bbox=========//
         // 高度硬保护在目标有效性检查之前执行，目标突然丢失也不会绕过 4m 保护。
-        maybeLatchStrikeTestAltitudeGuard();
+        // === 2026-10-14: 4m hold 只在 target 5m 内生效 (用户口径) ===
+        //   距离非有限 → 跳过 hold (安全,不 latch); 远距离入场 → 跳过。
+        const double guard_horiz_early = is_target_pose_received_
+            ? std::hypot(current_target_pose_.pose.position.x -
+                         current_uav_pose_.pose.position.x,
+                         current_target_pose_.pose.position.y -
+                         current_uav_pose_.pose.position.y)
+            : std::numeric_limits<double>::quiet_NaN();
+        maybeLatchStrikeTestAltitudeGuard(guard_horiz_early);
         // 一旦位置保持锁存，目标后续丢失或跳变都不能重新进入速度制导。
         // 这里只发布位置 setpoint，避免与 velocity setpoint 混流。
         if (strike_test_guard_enabled_ && strike_test_position_hold_latched_ &&
