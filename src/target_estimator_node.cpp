@@ -242,6 +242,19 @@ public:
         //   Step 1.5 override 用最近 yolo_back_proj_window_sec 内的 back-projection
         //   选 primary, 兼容 10Hz YOLO + 偶发漏帧, 不留太老避免 stale back-projection
         p.param<double>("yolo_back_proj_window_sec", yolo_back_proj_window_sec_, 1.5);
+        // === 2026-10-14: chase 状态判定 + primary release 阈值 (治本 16_0.bag 死 cluster) ===
+        //   16_0.bag 复盘: chase 末段 cluster[36] YOLO 漏报, primary_cluster_id_ 锁死,
+        //   Step 1 KEEP 旧行为 + Step 1.5 没 lsu_age 过滤, 飞机持续追冻结位置 → 错过目标。
+        //   修法: chase 状态下 (attack + plane 距 last_primary < chase_distance_threshold_m)
+        //   lsu_age > primary_release_lsu_age_sec 时 release primary, 让 Step 1.5/2 选
+        //   fresh cluster 替换。chase_recently_active_window_sec 是 chase 退出后的 grace
+        //   period, 防止 chase 短时退出 → 再进入时 latch 还没更新导致误 release。
+        p.param<double>("chase_distance_threshold_m",
+                        chase_distance_threshold_m_, 30.0);
+        p.param<double>("chase_recently_active_window_sec",
+                        chase_recently_active_window_sec_, 1.5);
+        p.param<double>("primary_release_lsu_age_sec",
+                        primary_release_lsu_age_sec_, 3.0);
         // marker 颜色
         p.param<double>("est_marker_r", est_marker_r_, 1.0);
         p.param<double>("est_marker_g", est_marker_g_, 1.0);
@@ -1273,6 +1286,35 @@ public:
 //      (替代旧的"最高置信度" — bag 02-11-07 实测 3 cluster 时挑错,
 //       因为最高置信度可能不是 GS 推的 WP2 处那个)
 //   3) 其他情况:最高置信度 (旧行为)
+
+        // === 2026-10-14: chase 状态判定 (Step 1/1.5 stale gate 的总开关) ===
+        //   is_chase_engaged_now_: attack + plane 距 last_primary < threshold
+        //   is_chase_recently_engaged_: 当前 engaged OR latch 窗口内 (window 秒 grace)
+        //   关键设计: latch 用 `now_us < chase_engaged_until_us_` 而不是 `engaged_within_last_window`
+        //   计数, 避免 chase 状态频繁 toggle 引起的窗口重置, 也避免 chase 退出再立刻进入时
+        //   "is_chase_recently_engaged" 边界条件错乱 (用户约束 "不能太早, 要在接 chase 时判断")。
+        //   用 1Hz tick 算距离, 1s 误差对 30m 阈值可忽略; primary release 用 3.0s lsu_age
+        //   阈值, 比 chase 进/退抖动慢得多, 不会因 chase 状态瞬变误 release。
+        {
+            const uint64_t now_us_chase = now_stamp.toNSec() / 1000ULL;
+            is_chase_engaged_now_ = false;
+            if (is_attack_active_ && last_primary_stamp_us_ != 0 &&
+                !current_uav_pose_.header.stamp.isZero()) {
+                const double dx = current_uav_pose_.pose.position.x - last_primary_nwu_x_;
+                const double dy = current_uav_pose_.pose.position.y - last_primary_nwu_y_;
+                const double dz = current_uav_pose_.pose.position.z - last_primary_nwu_z_;
+                const double dist_sq = dx*dx + dy*dy + dz*dz;
+                if (dist_sq < chase_distance_threshold_m_ * chase_distance_threshold_m_) {
+                    is_chase_engaged_now_ = true;
+                }
+            }
+            if (is_chase_engaged_now_) {
+                chase_engaged_until_us_ = now_us_chase +
+                    static_cast<uint64_t>(chase_recently_active_window_sec_ * 1e6);
+            }
+            is_chase_recently_engaged_ = (now_us_chase < chase_engaged_until_us_);
+        }
+
         const TargetCluster* primary = nullptr;
         if (primary_cluster_id_ != 0) {
             auto it = clusters_.find(primary_cluster_id_);
@@ -1285,8 +1327,26 @@ public:
                     const double lsu_age = (now_stamp.toNSec() / 1000ULL -
                                             it->second.last_seen_us) * 1e-6;
                     if (lsu_age > cluster_stale_freeze_sec_) {
-                        if (is_attack_active_) {
-                            // === 攻击阶段不 release primary ===
+                        if (is_attack_active_ && is_chase_recently_engaged_) {
+                            // === 2026-10-14: chase 状态 stale primary 释放 (治本 16_0.bag 死 cluster) ===
+                            //   16_0.bag 复盘: chase 末段 cluster[36] YOLO 漏报, primary_cluster_id_
+                            //   锁死 dead cluster → 飞机持续追冻结位置 → 错过真实目标。原 KEEP
+                            //   设计是为了"NO-IMAGE GUARD hold 期间不切", 但 chase 末段 YOLO 真
+                            //   漏报 (非 NO-IMAGE 短时 hold) 时, KEEP 反而锁死 dead cluster。
+                            //   修法: 区分两个场景
+                            //     - NO-IMAGE GUARD hold (UAV 不在 chase zone, is_chase_recently_engaged_
+                            //       = false): KEEP 旧行为, 不切
+                            //     - chase 末段 YOLO 真漏报 (UAV 在 chase zone): RELEASE, 让
+                            //       Step 1.5/2 选 fresh cluster 替换 → 解锁
+                            //   用户口径: "触发时间不能太早, 要在接 chase 的时候判断" — 正是
+                            //   is_chase_recently_engaged_ 闸控, 不在 chase 时不触发, 不会提前换。
+                            ROS_WARN_THROTTLE(2.0,
+                                "[TargetClusterer] Primary cluster %lu stale (age=%.1fs > %.1fs) "
+                                "during chase; RELEASE lock, let Step 1.5/2 pick fresh",
+                                it->second.id, lsu_age, primary_release_lsu_age_sec_);
+                            primary_cluster_id_ = 0;  // release, 让 GS 重新指定或 fallback
+                        } else if (is_attack_active_) {
+                            // === 攻击阶段不 release primary (NO-IMAGE GUARD hold 期间) ===
                             //   chase 末段 NO-IMAGE GUARD hold 期间 cluster last_seen_us
                             //   停更, 命中 stale_freeze 时原 release → closest-to-WP2 fallback
                             //   选远 cluster → target_estimated_pose 跳变 → 飞机转向别人
@@ -1366,7 +1426,15 @@ public:
         //   新的 back-proj 关联到"错位置的 person cluster" 是常见现象, 一定要跳过。
         //   不动 `!is_attack_active_` 一刀切, 是为了保留非 attack 阶段 (SEARCH/TRACK)
         //   Step 1 选不到时 back-proj 兜底的能力 (12-00-54 bag 已验证有效)。
-        if (wp2_coords_valid && primary == nullptr) {
+        // === 2026-10-14: chase 阶段跳过 Step 1.5 (用户口径 "看距离 WP2 最近的活的 cluster") ===
+        //   16_0.bag 复盘: chase 末段 cluster[36] YOLO 漏报, recent_yolo_back_proj_ 仍残留
+        //   1.5s 内的 back-projection 关联到 dead cluster → Step 1.5 选错 target。lsu_age
+        //   过滤治标 (已经加), 治本是 chase 阶段彻底跳过 back-proj, 直接走 Step 2 closest-to-WP2
+        //   cluster center (KF 收敛位置, 跟 YOLO 几何抖动解耦)。
+        //   保留非 chase 阶段 Step 1.5 (SEARCH/TRACK 时 Step 1 选不到时的 back-proj 兜底,
+        //   12-00-54 bag 已验证有效)。is_chase_recently_engaged_ 闸控确保只在 chase 阶段
+        //   跳过, attack pre-chase (飞机飞向 WP2) 仍可走 Step 1.5。
+        if (wp2_coords_valid && primary == nullptr && !is_chase_recently_engaged_) {
             uint64_t best_cluster_id_bp = 0;
             double best_dist_sq_bp = std::numeric_limits<double>::infinity();
             size_t recent_size_bp = 0;
@@ -1389,12 +1457,32 @@ public:
                 auto it_bp = clusters_.find(best_cluster_id_bp);
                 if (it_bp != clusters_.end() && it_bp->second.is_promoted &&
                     labelMatchesCachedTargetType(it_bp->second.label)) {
-                    primary = &it_bp->second;
-                    ROS_INFO_THROTTLE(2.0,
-                        "[TargetClusterer] Primary: YOLO back-projection closest-to-WP2 "
-                        "cluster_id=%lu label=%s (back_proj_dist=%.1fm to WP2, %zu recent)",
-                        primary->id, primary->label.c_str(),
-                        std::sqrt(best_dist_sq_bp), recent_size_bp);
+                    // === 2026-10-14: Step 1.5 加 lsu_age 过滤 (治本 16_0.bag 死 cluster 死锁) ===
+                    //   原版 Step 1.5 无 lsu_age 检查, chase 末段 YOLO 漏报但 recent_yolo_back_proj_
+                    //   仍残留 1.5s 内的 back-projection → Step 1.5 选 dead cluster → 飞机飞
+                    //   向冻结位置。lsu_age 门禁要求 cluster 仍在被 YOLO 持续命中 (last_seen
+                    //   距 now < primary_release_lsu_age_sec), 死的 cluster 选不到。
+                    //   last_seen_us==0 的 cluster 跳过 (从未被 YOLO 命中, back-proj 关联存疑)。
+                    bool bp_lsu_ok = true;
+                    if (it_bp->second.last_seen_us != 0) {
+                        const double lsu_age_bp = (now_stamp.toNSec() / 1000ULL -
+                                                   it_bp->second.last_seen_us) * 1e-6;
+                        if (lsu_age_bp > primary_release_lsu_age_sec_) {
+                            bp_lsu_ok = false;
+                            ROS_WARN_THROTTLE(2.0,
+                                "[TargetClusterer] Step 1.5 back-projection target cluster %lu "
+                                "stale (age=%.1fs > %.1fs); skip, let Step 2 closest-to-WP2 pick",
+                                it_bp->second.id, lsu_age_bp, primary_release_lsu_age_sec_);
+                        }
+                    }
+                    if (bp_lsu_ok) {
+                        primary = &it_bp->second;
+                        ROS_INFO_THROTTLE(2.0,
+                            "[TargetClusterer] Primary: YOLO back-projection closest-to-WP2 "
+                            "cluster_id=%lu label=%s (back_proj_dist=%.1fm to WP2, %zu recent)",
+                            primary->id, primary->label.c_str(),
+                            std::sqrt(best_dist_sq_bp), recent_size_bp);
+                    }
                 }
             }
         }
@@ -1513,6 +1601,13 @@ public:
             //===================制导修改====================
             publishPrimaryImageTarget(*primary);
             //===================制导修改====================
+            // === 2026-10-14: 缓存 last primary NWU, 供 chase 状态判定用 ===
+            //   注意: primary 被 release (primary==nullptr) 时不更新, last_primary 保留
+            //   旧 dead cluster 位置; chase 距离检查仍然有效 (UAV 在 chase zone 移动慢)。
+            last_primary_nwu_x_    = primary->ned_x;
+            last_primary_nwu_y_    = primary->ned_y;
+            last_primary_nwu_z_    = primary->ned_alt;
+            last_primary_stamp_us_ = now_stamp.toNSec() / 1000ULL;
         }
     }
 
@@ -1597,6 +1692,13 @@ private:
     double kf_predict_freq_ = 50.0;
     //   stale_freeze 阈值 (lsu_age > sec → 强制 STATIC + reset velocity)
     double cluster_stale_freeze_sec_ = 3.0;
+    // === 2026-10-14: chase 状态判定 (治本 16_0.bag 死 cluster 死锁) ===
+    //   plane 距 last_primary < chase_distance_threshold_m → chase 激活, latch 到
+    //   chase_recently_active_window_sec 之后。primary_release_lsu_age_sec 是
+    //   chase 状态下 release stale primary 的 lsu_age 阈值。
+    double chase_distance_threshold_m_        = 30.0;
+    double chase_recently_active_window_sec_  = 1.5;
+    double primary_release_lsu_age_sec_       = 3.0;
 
     // 相机几何
     int    image_width_  = 1920;
@@ -1688,6 +1790,20 @@ private:
     //   注: primary_image_target (内部给 guidance_control) 不 gate, 因为
     //       guidance_disable 是 mission_manager 端做的, 这里只管 GCS 上行通道。
     bool strike_committed_this_session_ = false;
+    // === 2026-10-14: chase 状态机 + last primary 缓存 (治本 16_0.bag 死 cluster 死锁) ===
+    //   last_primary_*_ 是上一 tick 成功 publish 的 primary NWU 坐标, 用来算
+    //   plane-to-target 距离, 判定 is_chase_engaged_now_。chase_engaged_until_us_
+    //   是 latch 时间戳, 1Hz tick 进入 chase 状态时更新到 now + window, 退出
+    //   chase 后 window 秒内仍算 "recently engaged" (给 chase 短时退出留 grace)。
+    //   primary 释放后 last_primary_*_ 不更新, 距离用旧 dead cluster 位置, 仍然
+    //   能反映 UAV 在 chase 区域 (chase zone 内 UAV 移动慢, 距离变化小)。
+    double    last_primary_nwu_x_       = 0.0;
+    double    last_primary_nwu_y_       = 0.0;
+    double    last_primary_nwu_z_       = 0.0;
+    uint64_t  last_primary_stamp_us_    = 0;  // 0 = 从未 publish
+    uint64_t  chase_engaged_until_us_   = 0;  // 0 = 从未 chase
+    bool      is_chase_engaged_now_     = false;
+    bool      is_chase_recently_engaged_= false;
     //===========rc识别=============
     bool manual_recognition_active_ = false;
     //===========rc识别=============
