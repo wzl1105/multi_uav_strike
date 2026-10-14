@@ -1498,8 +1498,19 @@ public:
             "mission/status", 10);
 
         //===========rc识别=============
+        // 2026-10-14: publisher latch 改 false,治本启动时 ROS master 残留的
+        //   老 publisher (上一轮节点留下的 connection) 把 True latch 进来的问题。
+        //   现场复现:21_0.bag 启动 t=0.0s latch=True,整段 flight
+        //   manual_recognition_active_=true,clusterStatesCallback 早退,work_mode
+        //   走切换模式的语义被废。
+        //   注:ROS1 latch 是 publisher 端属性 (advertise 第 3 参数),不是
+        //   subscriber 端。publisher 标 latch=true 后,任何后续 subscriber 连接
+        //   都会立即收到这个 publisher 的最新一条。改 false 后 publisher 只往
+        //   topic history 写消息,不主动推送 latch;新节点订阅也不会自动收到
+        //   老消息,默认 manual_recognition_active_=false (L941),直到 RC 拉低
+        //   或显式 publish True 才能开启。
         manual_recognition_pub_ = nh_.advertise<std_msgs::Bool>(
-            "recognition/manual_enable", 1, true);
+            "recognition/manual_enable", 1, false);
         std_msgs::Bool manual_initial;
         manual_initial.data = false;
         manual_recognition_pub_.publish(manual_initial);
@@ -1628,6 +1639,27 @@ public:
     }
 
     void targetEstPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        // === 2026-10-14: target_estimated_pose 持续到来 → 停 WP2 fallback (治本 20_0.bag flap) ===
+        //   20_0.bag 复盘: target_estimator 已在 145-150s 持续 publish target_estimated_pose
+        //   (Step 2 closest-to-WP2 fallback 选 cluster 6, 20Hz), 但 mission_manager 端
+        //   locked_cluster_id_ 仍是 0 (processSearchStrikeStrike 因 attack_best 或
+        //   tracked_target_.is_valid 路径未命中而未调, 参见 L4310/L4747), wp2_fallback
+        //   从 enterGuidanceForAttackWp1toWp2 启动 (131.94s) 一直 10Hz 喂 WP2 位置。
+        //   → wp2FallbackTargetCallback (L1329) 和 targetEstPoseCallback (L1164) 抢
+        //     pn_filtered_target_pose_ 写入, 50Hz 一拍一切 (cluster / WP2), desired_yaw
+        //     在 +12° / +113° / -180° 反复跳, OneEuro 来不及收敛 → 飞机剧烈晃动 + 飞过头。
+        //   修法: target_estimated_pose 收到即视为"target_estimator 已锁定 primary",
+        //   跟 L4329/L4835 锁成功后调 stopWp2Fallback 等价语义, 但触发条件更宽
+        //   (不依赖 mission_manager 端 lock 路径, 不依赖 tracked_target_.is_valid,
+        //   不依赖 processSearchStrikeStrike 是否被调)。stopWp2Fallback 内部幂等
+        //   (检查 wp2_fallback_active_, 不重复 stop), 重复调安全。
+        if (is_guidance_active_ && wp2_fallback_active_ &&
+            std::isfinite(msg->pose.position.x) &&
+            std::isfinite(msg->pose.position.y) &&
+            std::isfinite(msg->pose.position.z)) {
+            stopWp2Fallback("target_estimated_pose stream active");
+        }
+
         // === 2026-08-24 fix: TRACK 锁定也要喂 current_target_.pose ===
         //   原版只检查 current_target_.is_locked (只在 triggerStrike() 设 true),
         //   SEARCH_TRACK 锁目标 (tracked_target_.is_valid + lock_state==LOCKED_WAIT_CONFIRM)
@@ -4089,9 +4121,22 @@ public:
         if (shouldSuppressAllDetectAfterStrike()) {
             return;
         }
+        // === 2026-10-14: manual_recognition 不再是 dispatch 屏障 ===
+        //   原行为:manual_recognition_active_=true 时 clusterStatesCallback 早退,
+        //     只走 processManualRecognitionClusters (发 type=3, 不锁 cluster),
+        //     跳过 work_mode 派发 (SEARCH_TRACK 不锁 / SEARCH_STRIKE 不 strike)。
+        //   现场复现:21_0.bag 启动 latch=True → 整段 flight work_mode=SEARCH_TRACK
+        //     永远不进 PHASE_GUIDANCE_TRACK,plane 沿航点飞不跟踪。
+        //   新行为:manual_recognition 期间仍发 type=3 (手动识别语义保留),
+        //     同时 fall through 到下方 work_mode 派发,允许 dispatch 锁 cluster /
+        //     trigger strike (work_mode 才是切换开关,manual_recognition 是识别模式)。
+        //   副作用:SEARCH_ONLY + manual_recognition 期间 type=3 会双发 (一次来自
+        //     processManualRecognitionClusters,一次来自 SEARCH_ONLY dispatch);
+        //     type=1 (locked) 不会被 processManualRecognitionClusters 发,所以
+        //     锁阶段 type=1 仍只有 dispatch 一份,不重复。
         if (manual_recognition_active_) {
             processManualRecognitionClusters(msg);
-            return;
+            // 不 return — 继续走下方 work_mode 派发
         }
         //===========rc识别=============
         if (current_work_mode_ == WorkMode::IDLE) {
@@ -4835,6 +4880,21 @@ public:
         locked_cluster_id_            = cluster.cluster_id;
         locked_cluster_time_          = ros::Time::now();
         locked_cluster_last_seen_us_  = cluster.last_seen_us;
+        // === 2026-10-14: Attack(105) cluster lock 后停 WP2 fallback (治本 20_0.bag 来回跳变) ===
+        //   20_0.bag 复盘: L4329 stopWp2Fallback("cluster locked") 门控是 SEARCH_TRACK
+        //   && tracked_target_.is_valid, Attack(105) 是 SEARCH_STRIKE 模式 +
+        //   没 GCS 推过 detect_target → 该条件永远不命中 → wp2_fallback 从
+        //   enterGuidanceForAttackWp1toWp2 启动后 (131.94s) 到 strike 结束都没停,
+        //   10Hz 持续喂 WP2 位置给 guidance_control 的 wp2FallbackTargetCallback (L1329),
+        //   跟 targetEstPoseCallback (L1164) 抢 pn_filtered_target_pose_ 写入。
+        //   50Hz 一拍切一次 (cluster / WP2), desired_yaw 在 +12° / +113° / -180°
+        //   反复跳, OneEuro 来不及收敛, filtered_velocity_ned 衰减到 0.5m/s,
+        //   commanded 方向每 20ms 翻一次 → PX4 跟着乱动 → "剧烈高频晃动"。
+        //   顺带: PN 用 WP2 位置当目标, 但真实 cluster 在 uav 正下方 (hdist 0.45m),
+        //   飞机朝 WP2 飞, 直接从目标头顶掠过 → "飞过头"。
+        //   修法: processSearchStrikeStrike 锁成功的同一 tick 停 wp2_fallback,
+        //   跟 L4329 风格一致, 不引入新 timer/publisher, 不动 016f8d8 治本保留。
+        stopWp2Fallback("cluster locked (attack)");
 
         // === Attack(105) formation=1/2:strike gating ===
         //   sequential:等前一架 partner 进 GUIDANCE_STRIKE
