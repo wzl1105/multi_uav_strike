@@ -255,6 +255,9 @@ public:
                         chase_recently_active_window_sec_, 1.5);
         p.param<double>("primary_release_lsu_age_sec",
                         primary_release_lsu_age_sec_, 3.0);
+        // === 2026-10-14: SEARCH_TRACK sticky primary 锁定时长 ===
+        p.param<double>("min_primary_hold_sec",
+                        min_primary_hold_sec_, 3.0);
         // marker 颜色
         p.param<double>("est_marker_r", est_marker_r_, 1.0);
         p.param<double>("est_marker_g", est_marker_g_, 1.0);
@@ -993,6 +996,13 @@ public:
                 clusters_.clear();
                 primary_cluster_id_ = 0;
             }
+            // === 2026-10-14: 新 TaskFlow 进来 → reset sticky primary lock ===
+            //   跟 primary_cluster_id_ 同步清, 避免上一 TaskFlow 的 sticky 把这次
+            //   search 的 primary 锁住. clusters_ 已经 clear, sticky 检查会在
+            //   下 tick 把"locked cluster 不在 clusters_"分支走 accept new 路径,
+            //   但这里先 reset 更直观, 也方便日志调试.
+            sticky_primary_cluster_id_   = 0;
+            sticky_primary_locked_at_us_ = 0;
             multi_uav_strike::ClusterState empty_state;
             cluster_states_pub_.publish(empty_state);
             publishEmptyGps();
@@ -1374,6 +1384,17 @@ public:
                 } else {
                     primary = &it->second;
                 }
+                // === 2026-10-14: GS-specified primary 主动切换时 reset sticky lock ===
+                //   飞手/GS 显式下发 primary_cluster_id_ 是"用户主动切换"语义,
+                //   应该立即生效, 不能被 SEARCH_TRACK sticky hold 锁住. Step 1 选
+                //   中的 primary 直接覆盖 sticky (用 lock_at=now, 重新计时), 不影响
+                //   hold 逻辑: 新的 GS-specified primary 立刻被 publish, 等到下一次
+                //   还想换时再走 sticky 检查. 这跟 Step 1 在 attack / search 都可能
+                //   命中无关 — 只要是 GS 显式指定, 用户意图优先.
+                if (sticky_primary_cluster_id_ != primary_cluster_id_) {
+                    sticky_primary_cluster_id_   = primary_cluster_id_;
+                    sticky_primary_locked_at_us_ = now_stamp.toNSec() / 1000ULL;
+                }
             }
         }
 
@@ -1594,6 +1615,65 @@ public:
             }
         }
         if (primary != nullptr) {
+            // === 2026-10-14: SEARCH_TRACK sticky primary gate (治本 YOLO 抖动跳目标) ===
+            //   仅在 !is_attack_active_ 生效 (skill 102 SEARCH_TRACK 阶段);
+            //   Attack (105) 走原 closest-to-WP2 / 显式 primary 逻辑, 不动.
+            //   锁定窗口内, 旧 primary cluster 还活着 → 一律保持; 死了 / hold 到期
+            //   → 接受新选择. 锁定时长 min_primary_hold_sec_ (默认 3s, 远大于 YOLO
+            //   典型抖动 0.1~0.3s). GS-specified primary 已经在 Step 1 reset 过
+            //   sticky lock, 这里不会跟 GS 切换冲突.
+            if (!is_attack_active_) {
+                const uint64_t now_us = now_stamp.toNSec() / 1000ULL;
+                if (sticky_primary_cluster_id_ == 0) {
+                    // 首次选中 → 锁定, hold 计时从现在起
+                    sticky_primary_cluster_id_   = primary->id;
+                    sticky_primary_locked_at_us_ = now_us;
+                } else if (sticky_primary_cluster_id_ != primary->id) {
+                    // 选中的跟锁定的不一样 → 看是否要切换
+                    auto it_lock = clusters_.find(sticky_primary_cluster_id_);
+                    bool locked_alive = (it_lock != clusters_.end() &&
+                                         it_lock->second.is_promoted);
+                    bool locked_stale = true;  // 默认 stale, locked_alive 时再看 lsu_age
+                    if (locked_alive && it_lock->second.last_seen_us != 0) {
+                        const double lsu_age_locked = (now_us -
+                            it_lock->second.last_seen_us) * 1e-6;
+                        // last_seen 距今 < primary_release_lsu_age_sec_ 算 fresh
+                        locked_stale = (lsu_age_locked > primary_release_lsu_age_sec_);
+                    }
+                    const double held_for = (now_us - sticky_primary_locked_at_us_) * 1e-6;
+                    const bool hold_expired = (held_for >= min_primary_hold_sec_);
+                    if (!locked_alive || locked_stale || hold_expired) {
+                        // 任一条件触发 → 接受新选择, 重新计时
+                        if (hold_expired) {
+                            ROS_INFO_THROTTLE(2.0,
+                                "[TargetClusterer] SEARCH_TRACK sticky hold expired "
+                                "(%.1fs >= %.1fs); switch primary %lu → %lu",
+                                held_for, min_primary_hold_sec_,
+                                sticky_primary_cluster_id_, primary->id);
+                        } else if (locked_stale) {
+                            ROS_INFO_THROTTLE(2.0,
+                                "[TargetClusterer] SEARCH_TRACK sticky locked cluster %lu "
+                                "stale; switch to %lu",
+                                sticky_primary_cluster_id_, primary->id);
+                        } else {
+                            ROS_INFO_THROTTLE(2.0,
+                                "[TargetClusterer] SEARCH_TRACK sticky locked cluster %lu "
+                                "dead (TTL/erase); switch to %lu",
+                                sticky_primary_cluster_id_, primary->id);
+                        }
+                        sticky_primary_cluster_id_   = primary->id;
+                        sticky_primary_locked_at_us_ = now_us;
+                    } else {
+                        // 锁定 cluster 还活着 + fresh + 未到期 → 保持, 忽略新选择
+                        ROS_INFO_THROTTLE(2.0,
+                            "[TargetClusterer] SEARCH_TRACK sticky hold keeps primary %lu "
+                            "(held %.1fs, %lu would override)",
+                            sticky_primary_cluster_id_, held_for, primary->id);
+                        primary = &it_lock->second;
+                    }
+                }
+                // else: sticky_primary_cluster_id_ == primary->id, 无需操作
+            }
             publishPrimaryGps(*primary);
             publishPrimaryPose(*primary);
             // === 2026-08-23: KF 速度 (动目标 lead pose 配套) ===
@@ -1699,6 +1779,28 @@ private:
     double chase_distance_threshold_m_        = 30.0;
     double chase_recently_active_window_sec_  = 1.5;
     double primary_release_lsu_age_sec_       = 3.0;
+
+    // === 2026-10-14: SEARCH_TRACK sticky primary (用户口径 "如何尽量选择第一个目标
+    //   而不跳", "让跟踪持续一段") ===
+    //   搜索跟踪阶段 cluster confidence 受 YOLO 抖动影响会瞬时翻转: cluster A 漏报
+    //   1~2 帧 (0.1~0.3s) confidence 下降, cluster B 顶上来变 primary → 飞机转向 B;
+    //   几帧后 A 又恢复, 但飞机已经偏离, 再回去代价大 (用户观察的现象).
+    //   修法: SEARCH_TRACK (skill 102, is_attack_active_=false) 阶段, 一旦 primary
+    //   被选定, sticky_primary_cluster_id_ 锁定该 primary 持续 min_primary_hold_sec_
+    //   秒. 锁定期间若新 selection 不同:
+    //     - 锁定 cluster 还在 clusters_ + is_promoted + last_seen fresh + 未到 hold
+    //       到期 → 一律保持锁定 cluster, 忽略新选择
+    //     - 锁定 cluster 死了 (TTL 过期 / is_promoted 变 false / lsu_age > release
+    //       阈值) → 解锁, 接受新选择
+    //     - hold 时间到 → 解锁, 接受新选择
+    //   不影响 Attack 阶段 (skill 105, is_attack_active_=true): 原 closest-to-WP2 /
+    //   GS-specified / manual_recognition 路径不变. GS-specified primary 主动
+    //   切换时通过 Step 1 直接覆盖 sticky lock, 飞手/GS 可立即换目标.
+    //   也不影响 strike_committed session latch / new_skill_activation 的 cluster 清空
+    //   逻辑: new_skill_activation 同步 reset sticky lock, 飞手接管不重置.
+    uint64_t sticky_primary_cluster_id_   = 0;   // 0 = 未锁定
+    uint64_t sticky_primary_locked_at_us_ = 0;   // 锁定时刻 (now_us)
+    double   min_primary_hold_sec_        = 3.0; // 锁定时长 (秒)
 
     // 相机几何
     int    image_width_  = 1920;

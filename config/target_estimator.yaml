@@ -89,6 +89,16 @@ kf_r_meas: 2.0                       # YOLO 世界投影测量噪声 std (m)
 uav_velocity_lpf_alpha: 0.5          # UAV 速度缓存 LPF alpha (一阶 IIR)
 kf_predict_freq: 50.0                # KF 高频 predict timer 频率 (Hz, 应 >> YOLO 频率)
 cluster_stale_freeze_sec: 3.0        # cluster 多久无观测 → reset velocity 强制 STATIC (秒)
+
+# === 2026-10-14: SEARCH_TRACK sticky primary 锁定时长 (治本 YOLO 抖动跳目标) ===
+#   搜索跟踪阶段 (skill 102) 选中一个 primary 后, 锁定该 cluster min_primary_hold_sec
+#   秒. 期间若新 selection 不同, 但锁定 cluster 还活着 + fresh + 未到期 → 保持, 忽
+#   略新选择. 治本 YOLO 漏报 1~2 帧 (0.1~0.3s) 引起的 primary 翻转 → 飞机转向错目标.
+#   3s 远大于典型抖动 (0.3s), 又短到能及时切换真新目标.
+#   释放条件 (任一): 锁定 cluster TTL 过期 / lsu_age > primary_release_lsu_age_sec /
+#   hold 时间到 / GS 显式下发新 primary_cluster_id (Step 1 reset).
+#   Attack 阶段 (skill 105) 不生效, 走原 closest-to-WP2 / 显式 primary 逻辑.
+min_primary_hold_sec: 3.0
 # === 2026-10-10: YOLO back-projection-based primary selection ===
 #   在 attack 阶段优先于 closest-to-WP2 fallback, 解决 cluster stale filter
 #   把正确目标排除后, fresh 但远的 cluster 抢占 primary 的 bug
