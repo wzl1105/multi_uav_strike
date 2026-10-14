@@ -70,3 +70,10 @@ chase 末段 body yaw 修符号 (NWU→NED bearing 翻号),bbox 不再出 FOV
 chase 阶段 yaw 控制指令反向,进入 chase 后不再 180° 反向转向
 (09-42-52 bag, `guidance_control_node.cpp:2627` `atan2(ray.y,ray.x)` → `-atan2(...)`,
 抵消 `currentYawNed()` 里的 `-yaw_nwu` 负号)
+
+## 0.0.6 (on nopic_nostrike, 2026-10-14)
+
+相对 0.0.5 的变化。
+chase 阶段取消latch，选择目标点最近的活目标，降低误识别率
+修复搜索跟踪内部的latch限制
+打击的高度保护在10m范围内再考虑4m
