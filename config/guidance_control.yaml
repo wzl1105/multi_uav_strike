@@ -86,7 +86,11 @@ strike_terminal_no_image_hold_max_sec: 5.0
 #   → 走 PN P-control 撞 atan2 bearing 边界震荡。0.7 让 bbox 偏离更远仍算"对准",
 #   chase 维持时间更长, 不切回 PN。代码 clamp 只有下限 (image_center_deadband 0.03),
 #   0.7 实际等同"整图都算对准" (center 0.5, edge 距 0.5, 0.7 已 > edge), 文档化意图。
-strike_terminal_image_chase_center_band: 0.7
+# === 2026-10-14 第二次放宽: 0.7 → 0.85 (用户口径 "再大一点点") ===
+#   0.85 进一步把"对准"容忍度推到接近画面边缘, 几乎 100% 时间算对准。
+#   副作用: chase 几何下沉主要靠速度/高度, 不再靠 bbox 偏离触发 P-control,
+#   末段 strike 行为更接近纯 GNSS chase。视现场再调。
+strike_terminal_image_chase_center_band: 0.85
 
 # //=============打击保护bbox=========//
 # 测试模式：使用归一化 bbox 等效边长 sqrt(width * height)，不依赖图像分辨率。

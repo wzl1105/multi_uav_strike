@@ -28,8 +28,8 @@ manual_recognition_rc_timeout_sec: 1.0
 #   非 0       → 飞用户指定的固定点（适合"试验场角落集合点"场景）。
 # 高度语义：相对 PX4 Home 的高度（米），不是海拔高度。
 gcs_lost_return_enabled: true
-gcs_lost_return_latitude: 0
-gcs_lost_return_longitude: 0
+gcs_lost_return_latitude: 32.50412
+gcs_lost_return_longitude: 118.10213
 gcs_lost_return_altitude_m: 40.0
 gcs_lost_return_radius_m: 3.0
 # === 2026-09-13: GS 失联 grace 计时 ===
