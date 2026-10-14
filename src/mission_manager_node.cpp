@@ -8335,15 +8335,17 @@ public:
                 current_gimbal_pitch_ = computePitchDegToWp2(sr);
                 // === CODEX DIRECT-LOOK END ===
             } else if (sr.state == SkillState::IN_TASK && sr.msg.skill_type == 105) {
-                const ros::Time now = ros::Time::now();
+                // === 2026-10-14: 105 IN_TASK 期间云台始终朝目标 ===
+                //   STRIKE 触发前朝 WP2 (skill_area_path.poses.back()),让 gimbal 从
+                //   接到 105 那一拍就指向目标,不再等 WP1 + 2s delay (用户口径
+                //   "接到 105 立刻指向目标, 云台始终指向目标")。STRIKE 触发后
+                //   切到 primary cluster (computePitchDegToPrimaryCluster 几何更准)。
+                //   computePitchDegToWp2 在 GPS 未到 / skill_area 空时 fallback 到
+                //   attack_gimbal_look_default_pitch_deg_ (默认 0° 水平),安全。
                 if (attack_strike_phase_active_) {
                     current_gimbal_pitch_ = computePitchDegToPrimaryCluster();
-                } else if (attack_wp1_reached_ &&
-                           !attack_wp1_reached_time_.isZero() &&
-                           (now - attack_wp1_reached_time_).toSec() >= attack_wp2_look_delay_sec_) {
-                    current_gimbal_pitch_ = computePitchDegToWp2(sr);
                 } else {
-                    current_gimbal_pitch_ = attack_gimbal_look_default_pitch_deg_;
+                    current_gimbal_pitch_ = computePitchDegToWp2(sr);
                 }
             } else if (sr.state == SkillState::IN_TASK && sr.msg.skill_type == 102) {
                 // === 2026-08-24: TRACK 模式持续朝 primary cluster ===

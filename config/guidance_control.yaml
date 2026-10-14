@@ -105,9 +105,9 @@ strike_test_smoke_service: "/trigger_smoke"
 #   里,不必再额外配。
 # 两路入口互不影响,可独立开关,内部 1.0s 最小间隔防连发。
 # 默认 rc_enabled=false(topic 路径默认开),用户用 topic 按钮或后续硬件触发。
-manual_smoke_rc_enabled: false
+manual_smoke_rc_enabled: true
 # 通道号按遥控器界面从 1 开始,先用 rostopic echo /uav0/mavros/rc/in 确认。
-manual_smoke_rc_channel: 9
+manual_smoke_rc_channel: 5
 # 高/低阈值形成迟滞,中间区间不响应,避免 PWM 抖动反复触发。
 manual_smoke_rc_on_pwm: 1600
 manual_smoke_rc_off_pwm: 1700
