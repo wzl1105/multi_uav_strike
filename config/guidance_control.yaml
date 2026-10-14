@@ -28,7 +28,13 @@ attack_max_speed: 40.0
 image_confirm_frames: 1
 # 锁定目标图像观测超过此时间视为不可见，转世界坐标纯追踪；长时丢失仍由
 # mission_manager 的 target_lost_hold_sec 进入 TARGET_LOST_HOVER。
-image_visible_timeout_sec: 0.4
+#
+# === 2026-10-14: 放宽 0.4 → 1.0 治本 chase bbox 抖动 (multi_uav_flight_13_0.bag) ===
+#   13_0.bag: chase 3.67m/s + yaw 0.5rad/s 让 bbox 1s 内漂出, 0.4s timeout 太严
+#   image 切到 GEO_FALLBACK 频繁, 飞机看着像 "卡顿"。放宽到 1.0s 让 image 容忍更久
+#   再切 GEO, 跟 strike_terminal_no_image_hold_enabled=false (关 LATCH) 配合
+#   让 chase 持续飞不卡。
+image_visible_timeout_sec: 1.0
 # IMAGE/GEO 两种速度源切换时的线性混合时间。
 image_reacquire_blend_sec: 0.7
 #========速度修改========
@@ -48,10 +54,23 @@ strike_terminal_speed_schedule_enabled: true
 #   不在 chase/GEO 之间反复切. 超过 latch 仍 image_ready 才允许退出.
 strike_terminal_image_chase_enabled: true
 strike_terminal_image_chase_min_horiz_m: 30.0
-strike_terminal_image_chase_latch_sec: 0.5
+# === 2026-10-14: 放宽 0.5 → 2.0 让 chase sticky 更长 (13_0.bag) ===
+#   13_0.bag: chase 几何让 bbox 抖动, 0.5s sticky 太短 → 频繁 image→GEO 切换
+#   放宽到 2.0s 容忍 bbox 抖动 1-2s, 让 chase 不切走
+strike_terminal_image_chase_latch_sec: 2.0
 # 进入上述图像导引区时，如果图像已超过 image_visible_timeout_sec，立即锁存
 # 当前 position setpoint。该悬停不是最终打击保护，不会触发拉烟。
-strike_terminal_no_image_hold_enabled: true
+#
+# === 2026-10-14: 关 LATCH 让 chase 继续飞 (multi_uav_flight_13_0.bag 治本) ===
+#   13_0.bag 复盘: chase 几何 (3.67m/s + yaw 0.5rad/s) 让 bbox 1s 内漂出 FOV →
+#   LATCH 立即触发 (5s hold) → 5s 后 auto-unlatch → chase 重启 → image 又丢 →
+#   LATCH 立即再触发。5s hold + 1-2s chase 循环震荡, 永远到不了 15m arm 距离。
+#   用户口径"丢了也要继续前进, 不要 hold"。改 false 后:
+#     - LATCH 永远不触发 → chase 持续飞 → 不用 5s 5s 等待
+#     - strike commit 用 target_estimated_pose (GNSS) 不依赖 image,
+#       接近 15m GNSS 几何就会 commit, 真正"盲打"靠 GNSS
+#   风险: 目标移动可能打空。需在真机用静态目标验证, 移动目标建议保留 LATCH。
+strike_terminal_no_image_hold_enabled: false
 # === latched 自动解除 (治本 NO-IMAGE GUARD 死锁) ===
 #   修前: latched 后永远 hold → 22s 卡死, 没 strike commit, 没拉烟 (09-09-36 bag)。
 #   修后: elapsed > max_sec (5s 默认) 自动 unlatch, 释放 chase 让 GEO/PN 重新尝试。
@@ -61,7 +80,11 @@ strike_terminal_no_image_hold_max_sec: 5.0
 # chase 用更宽的居中死区 (vs image_center_deadband 0.03),17-43-21 bag 在 horiz=1.37m
 # 时 bbox 漂出 0.06 带导致 chase 提前退出,放大到 0.10 允许更大波动,让 chase
 # 能覆盖到命中圈边缘。ray 在 ~1m 内仍可信任,过宽反而引入错误方向。
-strike_terminal_image_chase_center_band: 0.4
+#
+# === 2026-10-14: 放宽 0.4 → 0.5 治本 chase 几何 (13_0.bag) ===
+#   13_0.bag: chase 几何让 bbox 漂到 0.9+ (出 0.4 死区), 提前退出 chase 切 GEO
+#   0.4 → 0.5 (代码 clamp 上限) 让 bbox 偏离更多仍算"对准", 减少 image→GEO 切换
+strike_terminal_image_chase_center_band: 0.5
 
 # //=============打击保护bbox=========//
 # 测试模式：使用归一化 bbox 等效边长 sqrt(width * height)，不依赖图像分辨率。
